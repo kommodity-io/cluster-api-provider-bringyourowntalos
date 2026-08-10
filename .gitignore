@@ -1,0 +1,5 @@
+bin/
+*.test
+coverage.out
+.idea/
+.vscode/

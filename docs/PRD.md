@@ -1,0 +1,86 @@
+# PRD: cluster-api-provider-bringyourowntalos (byot)
+
+Ticket: [PLA-6443](https://linear.app/corti/issue/PLA-6443/create-new-infra-provider-to-adopt-talos-machine-based-on-byoh)
+
+## Problem
+
+Kommodity deploys sovereign Kubernetes clusters via Cluster API. Some target
+environments (Gefion DC bare metal, pre-provisioned Scaleway instances) deliver
+machines that already run Talos Linux in **maintenance mode**. No cloud API
+owns these machines, so no existing infrastructure provider can manage them.
+
+## Goal
+
+A Cluster API infrastructure provider that **adopts** a Talos machine in
+maintenance mode, identified by its public IP, by applying the
+CABPT-generated machine configuration over the Talos machine API. After apply,
+the machine installs with encrypted volumes (network KMS via Kommodity) and
+joins the cluster.
+
+Inspired by
+[BYOH](https://github.com/vmware-tanzu/cluster-api-provider-bringyourownhost)
+(unmaintained), minus the host agent: Talos in maintenance mode already exposes
+everything needed over its API.
+
+## Non-goals (v1)
+
+- Machine reset / wipe on deletion (no-op delete). Follow-up: authenticated
+  Talos Reset to return host to maintenance mode, plus a configurable
+  `cleanupPolicy`.
+- Host pools / automatic claiming. Adoption is direct-reference only.
+- Network provisioning, load balancers, or cluster-level reconciliation beyond
+  reporting readiness.
+
+## Decisions
+
+| #   | Decision                                                 | Rationale                                                                                        |
+| --- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 1   | Adopt pre-provisioned bare metal (Gefion DC)             | Machines provisioned outside CAPI; Kommodity owns config + encryption                            |
+| 2   | Direct reference matching                                | `ByotMachine.spec.publicIP` set explicitly per machine; no agent, no pool                        |
+| 3   | Machineconfig from CABPT bootstrap secret, applied as-is | Disk encryption (network KMS → Kommodity) configured in Talos templates, provider does not patch |
+| 4   | Readiness = apply success                                | CAPI + Talos control plane provider already gate on node join; avoid duplicate node-watching     |
+| 5   | No-op deletion v1                                        | Reset requires cluster talosconfig and has hairy edge cases; deferred                            |
+| 6   | Library module, controllers run in-process in Kommodity  | Matches all-in-one Kommodity architecture (no standalone manager)                                |
+
+## API (group `infrastructure.cluster.x-k8s.io/v1alpha1`)
+
+- `ByotCluster`: `spec.controlPlaneEndpoint`; `status.ready=true` (no
+  provisioning to wait for).
+- `ByotMachine`: `spec.publicIP` (immutable identity); spec/status follow the
+  CAPI v1beta1 infrastructure machine contract (`providerID`, `ready`,
+  `addresses`, failure fields, conditions).
+- `ByotMachineTemplate`: template wrapper of `ByotMachine` spec.
+
+## Adoption reconcile flow (`ByotMachine`)
+
+1. Deletion timestamp set → remove finalizer, return (no-op delete).
+2. Ensure finalizer.
+3. Resolve owner `Machine`; wait if missing.
+4. Wait for `Machine.spec.bootstrap.dataSecretName`.
+5. Read bootstrap secret (`value` key) → Talos machineconfig bytes.
+6. If `status.ready` (already applied) → done.
+7. Dial `<publicIP>:50000` with maintenance client
+   (`client.WithTLSConfig(InsecureSkipVerify)`), send
+   `ApplyConfiguration` with mode `AUTO`.
+8. On success: `providerID = byot://<publicIP>`, `status.addresses` from
+   `publicIP`, `status.ready = true` (idempotent on requeue).
+
+Failure handling: transient errors requeue with backoff; bootstrap-data-missing
+is a normal waiting state.
+
+## Compatibility
+
+- Cluster API **v1.10.x**, contract `v1beta1`.
+- Talos machinery client **v1.13.x** (test target: Talos v1.13.8 on Scaleway,
+  image `talos-scaleway-v1.13.8`, zone `prd-par02`).
+
+## Test plan
+
+1. Provision Scaleway instance from `talos-scaleway-v1.13.8` (sbx project,
+   `prd-par02`), stays in maintenance mode with public IP.
+2. Run Kommodity locally with `byot` enabled in
+   `KOMMODITY_INFRASTRUCTURE_PROVIDERS`.
+3. Apply Cluster + TalosControlPlane + Machine referencing a `ByotMachine`
+   with the instance IP.
+4. Verify: machine leaves maintenance mode, installs, encrypts STATE/EPHEMERAL,
+   node joins.
