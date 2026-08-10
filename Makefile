@@ -14,6 +14,14 @@ build: ## Build all packages.
 test: ## Run unit tests.
 	go test ./...
 
+.PHONY: release-assets
+release-assets: generate ## Build the infrastructure-components.yaml release asset consumed by Kommodity.
+	mkdir -p dist
+	rm -f dist/infrastructure-components.yaml
+	for f in config/crd/*.yaml; do \
+		cat "$$f" >> dist/infrastructure-components.yaml; \
+	done
+
 .PHONY: lint
 lint: ## Run golangci-lint.
 	$(GOLANGCI_LINT) run
