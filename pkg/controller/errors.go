@@ -10,4 +10,9 @@ var (
 	// ErrBootstrapDataEmpty indicates the bootstrap data secret exists but
 	// carries no machine configuration payload.
 	ErrBootstrapDataEmpty = errors.New("bootstrap data secret is empty")
+
+	// ErrClusterTalosConfigNotReady indicates the talosconfig secret needed
+	// for authenticated access is missing or incomplete; reconciliation
+	// should be retried later.
+	ErrClusterTalosConfigNotReady = errors.New("talosconfig secret not ready")
 )

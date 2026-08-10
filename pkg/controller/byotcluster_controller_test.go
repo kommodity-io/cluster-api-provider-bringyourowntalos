@@ -5,6 +5,7 @@ import (
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -17,6 +18,9 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	scheme := runtime.NewScheme()
 
 	err := infrav1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	err = corev1.AddToScheme(scheme)
 	require.NoError(t, err)
 
 	return scheme

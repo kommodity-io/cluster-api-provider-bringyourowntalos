@@ -36,7 +36,9 @@ everything needed over its API.
 | #   | Decision                                                 | Rationale                                                                                        |
 | --- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | 1   | Adopt pre-provisioned bare metal (Gefion DC)             | Machines provisioned outside CAPI; Kommodity owns config + encryption                            |
-| 2   | Direct reference matching                                | `ByotMachine.spec.publicIP` set explicitly per machine; no agent, no pool                        |
+| 2 | Direct reference matching | `ByotMachine.spec.publicIP` set explicitly per machine; no agent, no pool |
+| 7 | Authenticated adoption | `spec.talosConfigSecretRef` supplies the CURRENT talosconfig for foreign (already-configured) machines; machines we applied are reached via the cluster's own `<cluster>-talosconfig` secret |
+| 8 | Config drift handling | `status.lastAppliedConfigSHA` tracks the applied machineconfig hash; changed bootstrap data is re-applied over mTLS |
 | 3   | Machineconfig from CABPT bootstrap secret, applied as-is | Disk encryption (network KMS → Kommodity) configured in Talos templates, provider does not patch |
 | 4   | Readiness = apply success                                | CAPI + Talos control plane provider already gate on node join; avoid duplicate node-watching     |
 | 5   | No-op deletion v1                                        | Reset requires cluster talosconfig and has hairy edge cases; deferred                            |
@@ -57,13 +59,18 @@ everything needed over its API.
 2. Ensure finalizer.
 3. Resolve owner `Machine`; wait if missing.
 4. Wait for `Machine.spec.bootstrap.dataSecretName`.
-5. Read bootstrap secret (`value` key) → Talos machineconfig bytes.
-6. If `status.ready` (already applied) → done.
-7. Dial `<publicIP>:50000` with maintenance client
-   (`client.WithTLSConfig(InsecureSkipVerify)`), send
-   `ApplyConfiguration` with mode `AUTO`.
-8. On success: `providerID = byot://<publicIP>`, `status.addresses` from
-   `publicIP`, `status.ready = true` (idempotent on requeue).
+5. Read bootstrap secret (`value` key) → Talos machineconfig bytes; hash it.
+6. If `status.ready` and hash unchanged → done.
+7. Resolve auth:
+   - Not ready + `spec.talosConfigSecretRef` set → mTLS with that talosconfig
+     (foreign machine takeover).
+   - Not ready + no secretRef → maintenance client, unverified TLS (machine in
+     maintenance mode).
+   - Ready + hash changed → mTLS with `<clusterName>-talosconfig` secret
+     (re-application on our own machine).
+8. Send `ApplyConfiguration` with mode `AUTO` to `<publicIP>:50000`.
+9. On success: `providerID = byot://<publicIP>`, `status.addresses` from
+   `publicIP`, `status.ready = true`, `status.lastAppliedConfigSHA` = hash.
 
 Failure handling: transient errors requeue with backoff; bootstrap-data-missing
 is a normal waiting state.
