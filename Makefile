@@ -5,6 +5,10 @@ GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v
 generate: ## Generate deepcopy methods and CRDs.
 	$(CONTROLLER_GEN) object paths="./api/..."
 	$(CONTROLLER_GEN) crd paths="./api/..." output:crd:artifacts:config=config/crd
+	@# CAPI contract label: CRD version v1alpha1 implements the v1beta1 contract.
+	for f in config/crd/infrastructure.cluster.x-k8s.io_*.yaml; do \
+		yq -i '.metadata.labels."cluster.x-k8s.io/v1beta1" = "v1alpha1"' "$$f"; \
+	done
 
 .PHONY: build
 build: ## Build all packages.
