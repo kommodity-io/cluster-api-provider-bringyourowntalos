@@ -1,0 +1,23 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    - depguard
+    # Too noisy for Kubernetes API objects and controller-runtime types.
+    - exhaustruct
+    # Deprecated linters.
+    - wsl
+    # Kubernetes objects are all interface based
+    - ireturn
+    # Verbose wrapping with little value on generated-style getters.
+    - wrapcheck
+  exclusions:
+    rules:
+      # Kubebuilder-style API packages require globals, init registration and
+      # long marker lines.
+      - path: "api/"
+        linters: [gochecknoglobals, gochecknoinits, lll, tagliatelle]
+      # Tests intentionally exercise unexported behavior (finalizer names).
+      - path: '_test\.go'
+        linters: [testpackage]
