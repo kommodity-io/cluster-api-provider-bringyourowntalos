@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"testing"
-	"time"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
@@ -189,7 +188,7 @@ func TestByotMachineReconcileRequeuesWhenClusterTalosConfigMissing(t *testing.T)
 	assert.Equal(t, requeueAfterBootstrap, result.RequeueAfter)
 }
 
-func TestByotMachineReconcileDeleteIsNoOp(t *testing.T) {
+func TestByotMachineReconcileDeleteBlocksUntilResetSucceeds(t *testing.T) {
 	t.Parallel()
 
 	scheme := newTestScheme(t)
@@ -197,7 +196,9 @@ func TestByotMachineReconcileDeleteIsNoOp(t *testing.T) {
 	err := clusterv1.AddToScheme(scheme)
 	require.NoError(t, err)
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	// 127.0.0.1 refuses the Talos API connection immediately: the reset
+	// fails fast and deletion must stay blocked with the finalizer retained.
+	byotMachine := newByotMachine("test-machine", "default", "127.0.0.1")
 	byotMachine.Finalizers = []string{byotMachineFinalizer}
 
 	client := fake.NewClientBuilder().
@@ -215,10 +216,96 @@ func TestByotMachineReconcileDeleteIsNoOp(t *testing.T) {
 		NamespacedName: clusterKey(byotMachine),
 	})
 	require.NoError(t, err)
-	assert.Equal(t, time.Duration(0), result.RequeueAfter)
+	assert.Equal(t, requeueAfterResetIssued, result.RequeueAfter)
 
-	// The finalizer is removed without touching the host, so the object is gone.
-	deleted := &infrav1.ByotMachine{}
-	getErr := client.Get(t.Context(), clusterKey(byotMachine), deleted)
-	assert.Error(t, getErr)
+	// Deletion is blocked: the object still carries the finalizer.
+	preserved := &infrav1.ByotMachine{}
+	err = client.Get(t.Context(), clusterKey(byotMachine), preserved)
+	require.NoError(t, err)
+	assert.Contains(t, preserved.Finalizers, byotMachineFinalizer)
+}
+
+func TestResetCredentialCandidatesOrder(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine.Spec.TalosConfigSecretRef = &infrav1.LocalObjectReference{Name: "foreign-creds"}
+
+	foreign := newTalosConfigSecret("foreign-creds", "default", []byte("foreign"))
+	cluster := newTalosConfigSecret("test-cluster-talosconfig", "default", []byte("cluster"))
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, foreign, cluster).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+
+	candidates, err := reconciler.resetCredentialCandidates(t.Context(), byotMachine)
+	require.NoError(t, err)
+	require.Len(t, candidates, 3)
+	assert.Equal(t, []byte("foreign"), candidates[0])
+	assert.Equal(t, []byte("cluster"), candidates[1])
+	assert.Nil(t, candidates[2])
+}
+
+func TestResetCredentialCandidatesInsecureOnly(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+
+	candidates, err := reconciler.resetCredentialCandidates(t.Context(), byotMachine)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	assert.Nil(t, candidates[0])
+}
+
+func TestWithoutInsecure(t *testing.T) {
+	t.Parallel()
+
+	creds := [][]byte{[]byte("a"), []byte("b"), nil}
+	trimmed := withoutInsecure(creds)
+	assert.Len(t, trimmed, 2)
+
+	noTrailing := [][]byte{[]byte("a")}
+	assert.Len(t, withoutInsecure(noTrailing), 1)
+
+	assert.Empty(t, withoutInsecure([][]byte{nil}))
+}
+
+func TestAttemptResetWithoutCredentials(t *testing.T) {
+	t.Parallel()
+
+	err := attemptReset(t.Context(), [][]byte{}, "203.0.113.10")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNoResetCredentials)
+}
+
+func newTalosConfigSecret(name string, namespace string, data []byte) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Data: map[string][]byte{
+			talosConfigSecretDataKey: data,
+		},
+	}
 }

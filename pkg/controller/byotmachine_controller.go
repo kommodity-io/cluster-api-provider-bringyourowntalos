@@ -11,6 +11,7 @@ import (
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
@@ -42,11 +43,26 @@ const (
 
 	// requeueAfterBootstrap is the delay used while waiting for bootstrap data.
 	requeueAfterBootstrap = 10 * time.Second
+
+	// requeueAfterResetIssued is the delay used while waiting for a machine
+	// to come back in maintenance mode after a reset.
+	requeueAfterResetIssued = 10 * time.Second
+
+	// resetRateLimitWindow is the minimum delay between two reset issues
+	// against the same machine.
+	resetRateLimitWindow = 90 * time.Second
+
+	// clusterNameLabel is the CAPI label carrying the owning cluster name.
+	clusterNameLabel = "cluster.x-k8s.io/cluster-name"
 )
 
 // MachineAdoptedCondition reports whether the machine configuration has been
 // applied to the adopted machine.
 const MachineAdoptedCondition clusterv1.ConditionType = "MachineAdopted"
+
+// ResetPerformedCondition reports the state of a machine reset requested via
+// spec.forceReset or executed during deletion.
+const ResetPerformedCondition clusterv1.ConditionType = "ResetPerformed"
 
 // ByotMachineReconciler reconciles a ByotMachine object.
 type ByotMachineReconciler struct {
@@ -99,16 +115,7 @@ func (r *ByotMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if !byotMachine.DeletionTimestamp.IsZero() {
-		// Adoption is a one-way operation in v1: nothing to undo on the host.
-		// Authenticated reset back to maintenance mode is a planned follow-up.
-		if controllerutil.RemoveFinalizer(byotMachine, byotMachineFinalizer) {
-			err = r.Client.Update(ctx, byotMachine)
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from ByotMachine %s: %w", req.NamespacedName, err)
-			}
-		}
-
-		return ctrl.Result{}, nil
+		return r.reconcileDelete(ctx, byotMachine)
 	}
 
 	_, err = finalizers.EnsureFinalizer(ctx, r.Client, byotMachine, byotMachineFinalizer)
@@ -125,8 +132,6 @@ func (r *ByotMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 }
 
 func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.ByotMachine) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
 	patchHelper, err := patch.NewHelper(byotMachine, r.Client)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to create patch helper: %w", err)
@@ -146,6 +151,32 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 	if configUnchanged(byotMachine, configHash) {
 		return ctrl.Result{}, nil
 	}
+
+	if byotMachine.Spec.ForceReset && !byotMachine.Status.Ready {
+		result, handled, err := r.ensureForceReset(ctx, patchHelper, byotMachine)
+		if err != nil {
+			return result, err
+		}
+
+		if handled {
+			return result, nil
+		}
+	}
+
+	return r.applyAndMarkAdopted(ctx, patchHelper, machine, byotMachine, machineConfig, configHash)
+}
+
+// applyAndMarkAdopted resolves authentication, applies the machine
+// configuration, and marks the ByotMachine adopted.
+func (r *ByotMachineReconciler) applyAndMarkAdopted(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	machine *clusterv1.Machine,
+	byotMachine *infrav1.ByotMachine,
+	machineConfig []byte,
+	configHash string,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
 	talosConfig, result, err := r.resolveTalosConfig(ctx, machine, byotMachine)
 	if err != nil {
@@ -171,6 +202,212 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
 
 	return ctrl.Result{}, nil
+}
+
+// reconcileDelete resets the machine back to a clean state (wiping the STATE
+// and EPHEMERAL volumes) before releasing it. Deletion blocks until the reset
+// succeeds, guaranteeing machines leave the cluster wiped.
+func (r *ByotMachineReconciler) reconcileDelete(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if !controllerutil.ContainsFinalizer(byotMachine, byotMachineFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	err := r.resetWithResolvedAuth(ctx, byotMachine)
+	if err != nil {
+		logger.Info("Reset on delete failed, retrying",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP,
+			"error", err.Error())
+
+		return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, nil
+	}
+
+	if controllerutil.RemoveFinalizer(byotMachine, byotMachineFinalizer) {
+		err = r.Client.Update(ctx, byotMachine)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from ByotMachine %s: %w", byotMachine.Name, err)
+		}
+	}
+
+	logger.Info("Machine reset and released", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
+
+	return ctrl.Result{}, nil
+}
+
+// resetWithResolvedAuth resets the machine using the first working
+// credential, in order: spec.talosConfigSecretRef, the cluster's own
+// talosconfig, then an insecure client for machines still in maintenance mode.
+func (r *ByotMachineReconciler) resetWithResolvedAuth(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+) error {
+	publicIP := byotMachine.Spec.PublicIP
+
+	candidates, err := r.resetCredentialCandidates(ctx, byotMachine)
+	if err != nil {
+		return err
+	}
+
+	return attemptReset(ctx, candidates, publicIP)
+}
+
+// attemptReset tries each credential candidate (a nil candidate selects the
+// insecure maintenance client) and returns the last error if all fail.
+func attemptReset(ctx context.Context, candidates [][]byte, publicIP string) error {
+	var lastErr error
+
+	for _, candidate := range candidates {
+		err := resetMachine(ctx, publicIP, candidate)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("failed to reset machine %s with any available credentials: %w", publicIP, lastErr)
+	}
+
+	return fmt.Errorf("%w: %s", ErrNoResetCredentials, publicIP)
+}
+
+// resetCredentialCandidates returns talosconfig candidates for the reset, in
+// priority order, terminated by a nil entry which selects the insecure
+// (maintenance) client.
+func (r *ByotMachineReconciler) resetCredentialCandidates(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+) ([][]byte, error) {
+	candidates := [][]byte{}
+
+	if byotMachine.Spec.TalosConfigSecretRef != nil {
+		talosConfig, err := r.referencedTalosConfig(ctx, byotMachine.Spec.TalosConfigSecretRef.Name, byotMachine.Namespace)
+		if err != nil && !errors.Is(err, ErrClusterTalosConfigNotReady) {
+			return nil, fmt.Errorf("failed to load referenced talosconfig: %w", err)
+		}
+
+		if err == nil {
+			candidates = append(candidates, talosConfig)
+		}
+	}
+
+	clusterName := byotMachine.Labels[clusterNameLabel]
+	if clusterName != "" {
+		talosConfig, err := r.clusterTalosConfig(ctx, clusterName, byotMachine.Namespace)
+		if err != nil && !errors.Is(err, ErrClusterTalosConfigNotReady) {
+			return nil, fmt.Errorf("failed to load cluster talosconfig: %w", err)
+		}
+
+		if err == nil {
+			candidates = append(candidates, talosConfig)
+		}
+	}
+
+	return append(candidates, nil), nil
+}
+
+// ensureForceReset performs the pre-adoption reset when spec.forceReset is
+// set. handled is true when the caller must return the given result instead
+// of proceeding to the configuration apply.
+func (r *ByotMachineReconciler) ensureForceReset(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+) (ctrl.Result, bool, error) {
+	logger := log.FromContext(ctx)
+
+	if probeMaintenance(ctx, byotMachine.Spec.PublicIP) {
+		// The machine is in maintenance mode: any previously applied
+		// configuration is gone.
+		byotMachine.Status.LastAppliedConfigSHA = ""
+
+		conditions.MarkTrue(byotMachine, ResetPerformedCondition)
+
+		err := patchHelper.Patch(ctx, byotMachine)
+		if err != nil {
+			return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after reset confirmation: %w", err)
+		}
+
+		logger.Info("Reset confirmed, machine in maintenance mode", "byotMachine", byotMachine.Name)
+
+		return ctrl.Result{}, false, nil
+	}
+
+	if lastReset := byotMachine.Status.LastResetAt; lastReset != nil && time.Since(lastReset.Time) < resetRateLimitWindow {
+		return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, true, nil
+	}
+
+	candidates, err := r.resetCredentialCandidates(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+
+	resetErr := attemptReset(ctx, withoutInsecure(candidates), byotMachine.Spec.PublicIP)
+	if resetErr != nil {
+		return ctrl.Result{}, true, r.recordResetFailure(ctx, patchHelper, byotMachine, resetErr)
+	}
+
+	now := metav1.Now()
+	byotMachine.Status.LastResetAt = &now
+
+	conditions.MarkFalse(
+		byotMachine,
+		ResetPerformedCondition,
+		"ResetInProgress",
+		clusterv1.ConditionSeverityInfo,
+		"reset issued, waiting for maintenance mode",
+	)
+
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after reset issued: %w", err)
+	}
+
+	logger.Info("Reset issued to machine", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
+
+	return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, true, nil
+}
+
+// withoutInsecure drops the trailing nil (insecure maintenance) candidate: a
+// configured machine must be reset via authenticated credentials before
+// adoption.
+func withoutInsecure(candidates [][]byte) [][]byte {
+	if len(candidates) > 0 && candidates[len(candidates)-1] == nil {
+		return candidates[:len(candidates)-1]
+	}
+
+	return candidates
+}
+
+// recordResetFailure marks the reset condition false, persists it, and
+// returns the reset error as the reconcile failure.
+func (r *ByotMachineReconciler) recordResetFailure(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	resetErr error,
+) error {
+	conditions.MarkFalse(
+		byotMachine,
+		ResetPerformedCondition,
+		"ResetFailed",
+		clusterv1.ConditionSeverityWarning,
+		"%s",
+		resetErr.Error(),
+	)
+
+	err := patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return fmt.Errorf("failed to patch ByotMachine after reset failure: %w", err)
+	}
+
+	return resetErr
 }
 
 // adoptionInputs resolves the owner Machine and its bootstrap data. A non-nil

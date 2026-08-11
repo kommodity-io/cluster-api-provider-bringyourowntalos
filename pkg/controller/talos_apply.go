@@ -19,6 +19,18 @@ const (
 
 	// applyTimeout bounds a single ApplyConfiguration attempt.
 	applyTimeout = 2 * time.Minute
+
+	// resetTimeout bounds a single Reset attempt.
+	resetTimeout = 30 * time.Second
+
+	// probeTimeout bounds a maintenance-mode probe attempt.
+	probeTimeout = 10 * time.Second
+
+	// talosLabelState is the STATE system-volume label wiped on reset.
+	talosLabelState = "STATE"
+
+	// talosLabelEphemeral is the EPHEMERAL system-volume label wiped on reset.
+	talosLabelEphemeral = "EPHEMERAL"
 )
 
 // applyMachineConfig applies the given Talos machine configuration to the
@@ -93,4 +105,62 @@ func authenticatedClient(ctx context.Context, publicIP string, talosConfig []byt
 	}
 
 	return client, nil
+}
+
+// probeMaintenance reports whether the machine at publicIP answers the Talos
+// machine API in maintenance mode (unverified TLS, no client authentication).
+func probeMaintenance(ctx context.Context, publicIP string) bool {
+	client, err := maintenanceClient(ctx, publicIP)
+	if err != nil {
+		return false
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	defer cancel()
+
+	_, err = client.Version(probeCtx)
+
+	return err == nil
+}
+
+// resetMachine wipes the machine's STATE and EPHEMERAL system volumes and
+// reboots it into maintenance mode. When talosConfig is nil, an unverified
+// TLS client is used (maintenance mode); otherwise the machine's current
+// configuration credentials authenticate the request.
+func resetMachine(ctx context.Context, publicIP string, talosConfig []byte) error {
+	var (
+		client *talosclient.Client
+		err    error
+	)
+
+	if talosConfig != nil {
+		client, err = authenticatedClient(ctx, publicIP, talosConfig)
+	} else {
+		client, err = maintenanceClient(ctx, publicIP)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	resetCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), resetTimeout)
+	defer cancel()
+
+	err = client.ResetGeneric(resetCtx, &machineapi.ResetRequest{
+		Graceful: false,
+		Reboot:   true,
+		SystemPartitionsToWipe: []*machineapi.ResetPartitionSpec{
+			{Label: talosLabelState, Wipe: true},
+			{Label: talosLabelEphemeral, Wipe: true},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to reset machine %s: %w", publicIP, err)
+	}
+
+	return nil
 }

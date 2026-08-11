@@ -69,6 +69,14 @@ spec:
                 failureDomain:
                   description: FailureDomain is the unique name of the failure domain the machine is placed in.
                   type: string
+                forceReset:
+                  description: |-
+                    ForceReset requests a machine reset (wiping the STATE and EPHEMERAL
+                    system volumes) before the machine configuration is applied. It is a
+                    pre-adoption latch: it only takes effect while no configuration has
+                    been applied yet (status.lastAppliedConfigSHA empty). Use it when
+                    adopting a machine that may carry stale state from a previous cluster.
+                  type: boolean
                 providerID:
                   description: ProviderID is set by the controller once the machine has been adopted.
                   type: string
@@ -182,6 +190,14 @@ spec:
                     LastAppliedConfigSHA records the SHA256 hash of the last machine
                     configuration applied. When the bootstrap data changes, the controller
                     re-applies the new configuration over the authenticated Talos API.
+                    The hash is cleared once a reset has been confirmed (the machine no
+                    longer carries the applied configuration).
+                  type: string
+                lastResetAt:
+                  description: |-
+                    LastResetAt records when a machine reset was last issued. Used to
+                    rate-limit reset attempts while the machine reboots.
+                  format: date-time
                   type: string
                 ready:
                   description: |-

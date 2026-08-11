@@ -55,8 +55,16 @@ Disk encryption (network KMS against Kommodity) is configured in the Talos
 machine configuration templates themselves; byot applies the configuration
 untouched.
 
-Deletion is a no-op in v1 (the host keeps running). Resetting a host back to
-maintenance mode is a planned follow-up.
+### Machine reset
+
+- **Adopt-time wipe**: set `spec.forceReset: true` when the machine may carry
+  stale state from a previous cluster. The controller resets the machine
+  (wipes STATE + EPHEMERAL, reboots to maintenance) before applying the
+  configuration. Auth uses `spec.talosConfigSecretRef`; on failure adoption is
+  blocked. The flag is a pre-adoption latch: once adopted it has no effect.
+- **Delete-time wipe**: deleting a `ByotMachine` always resets the machine
+  (STATE + EPHEMERAL) and releases the finalizer only after the reset
+  succeeds. Teardown blocks until the host is wiped.
 
 ## Development
 

@@ -31,6 +31,14 @@ type ByotMachineSpec struct {
 	// +optional
 	TalosConfigSecretRef *LocalObjectReference `json:"talosConfigSecretRef,omitempty"`
 
+	// ForceReset requests a machine reset (wiping the STATE and EPHEMERAL
+	// system volumes) before the machine configuration is applied. It is a
+	// pre-adoption latch: it only takes effect while no configuration has
+	// been applied yet (status.lastAppliedConfigSHA empty). Use it when
+	// adopting a machine that may carry stale state from a previous cluster.
+	// +optional
+	ForceReset bool `json:"forceReset,omitempty"`
+
 	// ProviderID is set by the controller once the machine has been adopted.
 	// +optional
 	ProviderID *string `json:"providerID,omitempty"`
@@ -50,8 +58,15 @@ type ByotMachineStatus struct {
 	// LastAppliedConfigSHA records the SHA256 hash of the last machine
 	// configuration applied. When the bootstrap data changes, the controller
 	// re-applies the new configuration over the authenticated Talos API.
+	// The hash is cleared once a reset has been confirmed (the machine no
+	// longer carries the applied configuration).
 	// +optional
 	LastAppliedConfigSHA string `json:"lastAppliedConfigSHA,omitempty"`
+
+	// LastResetAt records when a machine reset was last issued. Used to
+	// rate-limit reset attempts while the machine reboots.
+	// +optional
+	LastResetAt *metav1.Time `json:"lastResetAt,omitempty"`
 
 	// Addresses contains the machine's addresses.
 	// +optional

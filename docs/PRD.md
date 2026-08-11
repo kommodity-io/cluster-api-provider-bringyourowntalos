@@ -24,9 +24,8 @@ everything needed over its API.
 
 ## Non-goals (v1)
 
-- Machine reset / wipe on deletion (no-op delete). Follow-up: authenticated
-  Talos Reset to return host to maintenance mode, plus a configurable
-  `cleanupPolicy`.
+- Configurable reset wipe scope: deletion and `forceReset` always wipe both
+  STATE and EPHEMERAL; a `spec.resetLabels` field may come later if demanded.
 - Host pools / automatic claiming. Adoption is direct-reference only.
 - Network provisioning, load balancers, or cluster-level reconciliation beyond
   reporting readiness.
@@ -41,7 +40,7 @@ everything needed over its API.
 | 8 | Config drift handling | `status.lastAppliedConfigSHA` tracks the applied machineconfig hash; changed bootstrap data is re-applied over mTLS |
 | 3   | Machineconfig from CABPT bootstrap secret, applied as-is | Disk encryption (network KMS → Kommodity) configured in Talos templates, provider does not patch |
 | 4   | Readiness = apply success                                | CAPI + Talos control plane provider already gate on node join; avoid duplicate node-watching     |
-| 5   | No-op deletion v1                                        | Reset requires cluster talosconfig and has hairy edge cases; deferred                            |
+| 5   | Deletion resets the machine (STATE+EPHEMERAL, reboot) and blocks until the reset succeeds | Machines released from the cluster must rejoin clean; stale etcd/PKI breaks subsequent adoptions (CA split, encryption-at-rest key mismatch) |
 | 6   | Library module, controllers run in-process in Kommodity  | Matches all-in-one Kommodity architecture (no standalone manager)                                |
 
 ## API (group `infrastructure.cluster.x-k8s.io/v1alpha1`)
@@ -55,7 +54,13 @@ everything needed over its API.
 
 ## Adoption reconcile flow (`ByotMachine`)
 
-1. Deletion timestamp set → remove finalizer, return (no-op delete).
+0. Deletion timestamp set → reset machine via `talosctl reset`
+   (graceful=false, reboot=true, wipe STATE+EPHEMERAL), trying credentials in
+   order: `spec.talosConfigSecretRef`, `<cluster>-talosconfig`, insecure
+   (maintenance). Finalizer blocks deletion until a reset succeeds.
+0bis. If `spec.forceReset` and not yet adopted: probe maintenance mode; if
+   configured, issue authenticated reset (blocks adoption on failure), wait
+   for maintenance, clear `status.lastAppliedConfigSHA`, then proceed.
 2. Ensure finalizer.
 3. Resolve owner `Machine`; wait if missing.
 4. Wait for `Machine.spec.bootstrap.dataSecretName`.

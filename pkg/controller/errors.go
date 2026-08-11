@@ -15,4 +15,8 @@ var (
 	// for authenticated access is missing or incomplete; reconciliation
 	// should be retried later.
 	ErrClusterTalosConfigNotReady = errors.New("talosconfig secret not ready")
+
+	// ErrNoResetCredentials indicates no usable talosconfig exists to
+	// authenticate a machine reset.
+	ErrNoResetCredentials = errors.New("no credential candidates available to reset machine")
 )
