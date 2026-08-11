@@ -544,6 +544,14 @@ func (r *ByotMachineReconciler) resolveTalosConfig(
 ) ([]byte, *ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
+	// A force-reset machine confirmed in maintenance mode has no PKI: apply
+	// with the insecure client, ignoring spec.talosConfigSecretRef.
+	if byotMachine.Spec.ForceReset &&
+		!byotMachine.Status.Ready &&
+		conditions.IsTrue(byotMachine, ResetPerformedCondition) {
+		return nil, nil, nil
+	}
+
 	// Re-application on an already-configured machine: use the cluster's own
 	// talosconfig (the machine carries our PKI since its first apply).
 	if byotMachine.Status.Ready {
