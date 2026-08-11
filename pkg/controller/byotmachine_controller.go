@@ -61,8 +61,13 @@ const (
 const MachineAdoptedCondition clusterv1.ConditionType = "MachineAdopted"
 
 // ResetPerformedCondition reports the state of a machine reset requested via
-// spec.forceReset or executed during deletion.
+// spec.joinPolicy=Reset or executed during deletion.
 const ResetPerformedCondition clusterv1.ConditionType = "ResetPerformed"
+
+// JoinPreflightCondition reports the outcome of the join preflight: whether
+// the machine is safe to adopt with spec.joinPolicy=None, i.e. it is in
+// maintenance mode or already carries this cluster's PKI bundle.
+const JoinPreflightCondition clusterv1.ConditionType = "JoinPreflight"
 
 // ByotMachineReconciler reconciles a ByotMachine object.
 type ByotMachineReconciler struct {
@@ -152,8 +157,8 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 		return ctrl.Result{}, nil
 	}
 
-	if byotMachine.Spec.ForceReset && !byotMachine.Status.Ready {
-		result, handled, err := r.ensureForceReset(ctx, patchHelper, byotMachine)
+	if byotMachine.Spec.JoinPolicy == infrav1.MachinePolicyReset && !byotMachine.Status.Ready {
+		result, handled, err := r.ensureJoinReset(ctx, patchHelper, byotMachine)
 		if err != nil {
 			return result, err
 		}
@@ -178,7 +183,7 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 ) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	talosConfig, result, err := r.resolveTalosConfig(ctx, machine, byotMachine)
+	talosConfig, result, err := r.resolveApplyAuth(ctx, patchHelper, machine, byotMachine)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -204,9 +209,11 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	return ctrl.Result{}, nil
 }
 
-// reconcileDelete resets the machine back to a clean state (wiping the STATE
-// and EPHEMERAL volumes) before releasing it. Deletion blocks until the reset
-// succeeds, guaranteeing machines leave the cluster wiped.
+// reconcileDelete releases the machine. With spec.splitPolicy=None (default)
+// the machine is only removed from management and keeps its configuration and
+// datastore intact. With spec.splitPolicy=Reset the machine is wiped (STATE
+// and EPHEMERAL volumes) before being released; deletion blocks until the
+// reset succeeds, guaranteeing the machine leaves the cluster wiped.
 func (r *ByotMachineReconciler) reconcileDelete(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
@@ -217,24 +224,30 @@ func (r *ByotMachineReconciler) reconcileDelete(
 		return ctrl.Result{}, nil
 	}
 
-	err := r.resetWithResolvedAuth(ctx, byotMachine)
-	if err != nil {
-		logger.Info("Reset on delete failed, retrying",
-			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Spec.PublicIP,
-			"error", err.Error())
+	if byotMachine.Spec.SplitPolicy == infrav1.MachinePolicyReset {
+		err := r.resetWithResolvedAuth(ctx, byotMachine)
+		if err != nil {
+			logger.Info("Reset on delete failed, retrying",
+				"byotMachine", byotMachine.Name,
+				"publicIP", byotMachine.Spec.PublicIP,
+				"error", err.Error())
 
-		return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, nil
+			return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, nil
+		}
+
+		logger.Info("Machine reset and released", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
+	} else {
+		logger.Info("Machine released without reset (splitPolicy None)",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP)
 	}
 
 	if controllerutil.RemoveFinalizer(byotMachine, byotMachineFinalizer) {
-		err = r.Client.Update(ctx, byotMachine)
+		err := r.Client.Update(ctx, byotMachine)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from ByotMachine %s: %w", byotMachine.Name, err)
 		}
 	}
-
-	logger.Info("Machine reset and released", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
 
 	return ctrl.Result{}, nil
 }
@@ -312,10 +325,10 @@ func (r *ByotMachineReconciler) resetCredentialCandidates(
 	return append(candidates, nil), nil
 }
 
-// ensureForceReset performs the pre-adoption reset when spec.forceReset is
-// set. handled is true when the caller must return the given result instead
+// ensureJoinReset performs the pre-adoption reset when spec.joinPolicy is
+// Reset. handled is true when the caller must return the given result instead
 // of proceeding to the configuration apply.
-func (r *ByotMachineReconciler) ensureForceReset(
+func (r *ByotMachineReconciler) ensureJoinReset(
 	ctx context.Context,
 	patchHelper *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
@@ -534,50 +547,165 @@ func (r *ByotMachineReconciler) bootstrapData(
 	return data, nil
 }
 
-// resolveTalosConfig picks the talosconfig to authenticate with, and returns
-// nil for machines still in maintenance mode. A non-nil result signals the
-// reconcile should requeue while the needed secret becomes available.
-func (r *ByotMachineReconciler) resolveTalosConfig(
+// resolveApplyAuth picks the talosconfig to authenticate the configuration
+// apply with, and returns nil for machines in maintenance mode. A non-nil
+// result signals the reconcile should requeue while a needed secret becomes
+// available.
+//
+// For machines not yet adopted, it first runs the join preflight, which
+// determines whether the machine is maintenance-mode, carries this cluster's
+// PKI bundle, or carries a foreign bundle (in which case adoption fails).
+func (r *ByotMachineReconciler) resolveApplyAuth(
 	ctx context.Context,
+	patchHelper *patch.Helper,
 	machine *clusterv1.Machine,
 	byotMachine *infrav1.ByotMachine,
 ) ([]byte, *ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	// A force-reset machine confirmed in maintenance mode has no PKI: apply
-	// with the insecure client, ignoring spec.talosConfigSecretRef.
-	if byotMachine.Spec.ForceReset &&
+	// A reset machine confirmed in maintenance mode has no PKI: apply with
+	// the insecure client, ignoring spec.talosConfigSecretRef.
+	if byotMachine.Spec.JoinPolicy == infrav1.MachinePolicyReset &&
 		!byotMachine.Status.Ready &&
 		conditions.IsTrue(byotMachine, ResetPerformedCondition) {
 		return nil, nil, nil
 	}
 
-	// Re-application on an already-configured machine: use the cluster's own
+	// Re-application on an already-adopted machine: use the cluster's own
 	// talosconfig (the machine carries our PKI since its first apply).
 	if byotMachine.Status.Ready {
-		talosConfig, err := r.clusterTalosConfig(ctx, machine.Spec.ClusterName, byotMachine.Namespace)
-		if errors.Is(err, ErrClusterTalosConfigNotReady) {
-			logger.Info("Waiting for cluster talosconfig", "byotMachine", byotMachine.Name)
-
-			return nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
-		}
-
-		return talosConfig, nil, err
+		return r.awaitClusterTalosConfig(ctx, machine.Spec.ClusterName, byotMachine)
 	}
 
-	// Foreign machine takeover: use the talosconfig of its CURRENT setup.
-	if byotMachine.Spec.TalosConfigSecretRef != nil {
-		talosConfig, err := r.referencedTalosConfig(ctx, byotMachine.Spec.TalosConfigSecretRef.Name, byotMachine.Namespace)
-		if errors.Is(err, ErrClusterTalosConfigNotReady) {
-			logger.Info("Waiting for referenced talosconfig secret", "byotMachine", byotMachine.Name)
+	return r.preflightJoin(ctx, patchHelper, machine, byotMachine)
+}
 
-			return nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
-		}
+// awaitClusterTalosConfig loads the cluster's own talosconfig, requeueing
+// while the bootstrap provider has not generated it yet.
+func (r *ByotMachineReconciler) awaitClusterTalosConfig(
+	ctx context.Context,
+	clusterName string,
+	byotMachine *infrav1.ByotMachine,
+) ([]byte, *ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
-		return talosConfig, nil, err
+	talosConfig, err := r.clusterTalosConfig(ctx, clusterName, byotMachine.Namespace)
+	if errors.Is(err, ErrClusterTalosConfigNotReady) {
+		logger.Info("Waiting for cluster talosconfig", "byotMachine", byotMachine.Name)
+
+		return nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
 	}
 
-	return nil, nil, nil
+	return talosConfig, nil, err
+}
+
+// preflightJoin determines whether a machine being adopted for the first time
+// is in maintenance mode or carries this cluster's PKI bundle, and returns the
+// matching authentication. A machine that answers the Talos API with a foreign
+// bundle fails the preflight instead of being silently misconfigured (see
+// PLA-6479).
+func (r *ByotMachineReconciler) preflightJoin(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	machine *clusterv1.Machine,
+	byotMachine *infrav1.ByotMachine,
+) ([]byte, *ctrl.Result, error) {
+	publicIP := byotMachine.Spec.PublicIP
+
+	if probeMaintenance(ctx, publicIP) {
+		conditions.Set(byotMachine, &clusterv1.Condition{
+			Type:   JoinPreflightCondition,
+			Status: corev1.ConditionTrue,
+			Reason: "MaintenanceMode",
+		})
+
+		return nil, nil, nil
+	}
+
+	talosConfig, err := r.clusterTalosConfig(ctx, machine.Spec.ClusterName, byotMachine.Namespace)
+	if errors.Is(err, ErrClusterTalosConfigNotReady) {
+		logger := log.FromContext(ctx)
+		logger.Info("Waiting for cluster talosconfig", "byotMachine", byotMachine.Name)
+
+		return nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if probeAuthenticated(ctx, publicIP, talosConfig) {
+		conditions.Set(byotMachine, &clusterv1.Condition{
+			Type:   JoinPreflightCondition,
+			Status: corev1.ConditionTrue,
+			Reason: "BundleMatch",
+		})
+
+		return talosConfig, nil, nil
+	}
+
+	return r.preflightForeignMachine(ctx, patchHelper, byotMachine)
+}
+
+// preflightForeignMachine handles a machine that is neither in maintenance
+// mode nor accepting the cluster's own talosconfig. When the machine provably
+// answers with a referenced foreign talosconfig, the join preflight fails
+// with a bundle mismatch; otherwise the referenced config (if any) is used
+// for the apply attempt, preserving the previous behavior for unreachable
+// machines.
+func (r *ByotMachineReconciler) preflightForeignMachine(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+) ([]byte, *ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	if byotMachine.Spec.TalosConfigSecretRef == nil {
+		// Configured machine without credentials: treat it as a bundle
+		// mismatch, it cannot be joined without resetting it first.
+		return nil, nil, r.recordPreflightFailure(ctx, patchHelper, byotMachine, "NoCredentials", ErrJoinNoCredentials)
+	}
+
+	talosConfig, err := r.referencedTalosConfig(ctx, byotMachine.Spec.TalosConfigSecretRef.Name, byotMachine.Namespace)
+	if errors.Is(err, ErrClusterTalosConfigNotReady) {
+		logger.Info("Waiting for referenced talosconfig secret", "byotMachine", byotMachine.Name)
+
+		return nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if probeAuthenticated(ctx, byotMachine.Spec.PublicIP, talosConfig) {
+		return nil, nil, r.recordPreflightFailure(ctx, patchHelper, byotMachine, "BundleMismatch", ErrJoinBundleMismatch)
+	}
+
+	return talosConfig, nil, nil
+}
+
+// recordPreflightFailure marks the join preflight condition false, persists
+// it, and returns the preflight error as the reconcile failure.
+func (r *ByotMachineReconciler) recordPreflightFailure(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	reason string,
+	preflightErr error,
+) error {
+	conditions.MarkFalse(
+		byotMachine,
+		JoinPreflightCondition,
+		reason,
+		clusterv1.ConditionSeverityError,
+		"%s",
+		preflightErr.Error(),
+	)
+
+	err := patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return fmt.Errorf("failed to patch ByotMachine after join preflight failure: %w", err)
+	}
+
+	return preflightErr
 }
 
 // clusterTalosConfig loads the talosconfig generated by the bootstrap provider

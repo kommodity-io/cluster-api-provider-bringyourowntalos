@@ -9,9 +9,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -200,6 +202,7 @@ func TestByotMachineReconcileDeleteBlocksUntilResetSucceeds(t *testing.T) {
 	// fails fast and deletion must stay blocked with the finalizer retained.
 	byotMachine := newByotMachine("test-machine", "default", "127.0.0.1")
 	byotMachine.Finalizers = []string{byotMachineFinalizer}
+	byotMachine.Spec.SplitPolicy = infrav1.MachinePolicyReset
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -223,6 +226,92 @@ func TestByotMachineReconcileDeleteBlocksUntilResetSucceeds(t *testing.T) {
 	err = client.Get(t.Context(), clusterKey(byotMachine), preserved)
 	require.NoError(t, err)
 	assert.Contains(t, preserved.Finalizers, byotMachineFinalizer)
+}
+
+func TestByotMachineReconcileDeleteReleasesWithoutReset(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	// splitPolicy=None (the CRD default; fake client does not apply CRD
+	// defaults, so the zero value takes the None path): deletion releases
+	// the machine without touching it.
+	byotMachine := newByotMachine("test-machine", "default", "127.0.0.1")
+	byotMachine.Finalizers = []string{byotMachineFinalizer}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine).
+		WithStatusSubresource(byotMachine).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+
+	err = client.Delete(t.Context(), byotMachine)
+	require.NoError(t, err)
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	// Finalizer removed: the object is gone.
+	deleted := &infrav1.ByotMachine{}
+	err = client.Get(t.Context(), clusterKey(byotMachine), deleted)
+	assert.True(t, apierrors.IsNotFound(err))
+}
+
+func TestByotMachineReconcileJoinPreflightFailsWithoutCredentials(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	// 127.0.0.1 refuses every Talos API connection: the machine is neither
+	// in maintenance mode nor verifiable against the cluster talosconfig,
+	// and no foreign talosconfig reference exists. The join preflight must
+	// fail with NoCredentials instead of blindly applying configuration.
+	byotMachine := newByotMachine("test-machine", "default", "127.0.0.1")
+	byotMachine.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "Machine",
+			Name:       "test-machine",
+			UID:        "machine-uid",
+		},
+	}
+	machine := newOwningMachine("test-machine", "default", "test-bootstrap")
+	secret := newBootstrapSecret("test-bootstrap", "default", []byte("new-config"))
+	cluster := newTalosConfigSecret("test-cluster-talosconfig", "default", []byte("cluster"))
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, secret, cluster).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+
+	_, err = reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.ErrorIs(t, err, ErrJoinNoCredentials)
+
+	updated := &infrav1.ByotMachine{}
+	err = client.Get(t.Context(), clusterKey(byotMachine), updated)
+	require.NoError(t, err)
+	assert.False(t, updated.Status.Ready)
+
+	condition := conditions.Get(updated, JoinPreflightCondition)
+	require.NotNil(t, condition)
+	assert.Equal(t, corev1.ConditionFalse, condition.Status)
+	assert.Equal(t, "NoCredentials", condition.Reason)
 }
 
 func TestResetCredentialCandidatesOrder(t *testing.T) {

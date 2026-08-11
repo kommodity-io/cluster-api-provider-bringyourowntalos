@@ -125,6 +125,26 @@ func probeMaintenance(ctx context.Context, publicIP string) bool {
 	return err == nil
 }
 
+// probeAuthenticated reports whether the machine at publicIP answers the
+// Talos machine API using the credentials from the given talosconfig. Used by
+// the join preflight to determine which PKI bundle a configured machine
+// carries.
+func probeAuthenticated(ctx context.Context, publicIP string, talosConfig []byte) bool {
+	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+	if err != nil {
+		return false
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	defer cancel()
+
+	_, err = client.Version(probeCtx)
+
+	return err == nil
+}
+
 // resetMachine wipes the machine's STATE and EPHEMERAL system volumes and
 // reboots it into maintenance mode. When talosConfig is nil, an unverified
 // TLS client is used (maintenance mode); otherwise the machine's current

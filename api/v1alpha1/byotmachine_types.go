@@ -8,6 +8,24 @@ import (
 // ProviderIDPrefix is the scheme prefix of provider IDs assigned to adopted machines.
 const ProviderIDPrefix = "byot://"
 
+// MachinePolicy declares the lifecycle stance taken when a machine joins or
+// leaves the cluster's management.
+type MachinePolicy string
+
+const (
+	// MachinePolicyNone takes no action against the machine's running state.
+	// On join, a machine carrying state from a different cluster fails the
+	// preflight instead of being wiped. On split, the machine keeps running
+	// with its configuration and datastore intact.
+	MachinePolicyNone MachinePolicy = "None"
+
+	// MachinePolicyReset wipes the machine's STATE and EPHEMERAL system
+	// volumes via a Talos reset, returning it to maintenance mode. On join
+	// the wipe happens before configuration is applied; on split it happens
+	// before the machine is released.
+	MachinePolicyReset MachinePolicy = "Reset"
+)
+
 // LocalObjectReference contains enough information to locate a resource in the same namespace.
 type LocalObjectReference struct {
 	// Name of the referent.
@@ -31,13 +49,29 @@ type ByotMachineSpec struct {
 	// +optional
 	TalosConfigSecretRef *LocalObjectReference `json:"talosConfigSecretRef,omitempty"`
 
-	// ForceReset requests a machine reset (wiping the STATE and EPHEMERAL
-	// system volumes) before the machine configuration is applied. It is a
-	// pre-adoption latch: it only takes effect while no configuration has
-	// been applied yet (status.lastAppliedConfigSHA empty). Use it when
-	// adopting a machine that may carry stale state from a previous cluster.
+	// JoinPolicy defines what to do when adopting the machine. "None" (the
+	// default) adopts the machine only if it is in maintenance mode or already
+	// carries this cluster's PKI bundle; a machine carrying a different
+	// cluster's state fails the join preflight instead of being wiped.
+	// "Reset" wipes the machine's STATE and EPHEMERAL system volumes before
+	// the machine configuration is applied. Reset is a pre-adoption latch: it
+	// only takes effect while no configuration has been applied yet
+	// (status.lastAppliedConfigSHA empty).
 	// +optional
-	ForceReset bool `json:"forceReset,omitempty"`
+	// +kubebuilder:validation:Enum=None;Reset
+	// +kubebuilder:default=None
+	JoinPolicy MachinePolicy `json:"joinPolicy,omitempty"`
+
+	// SplitPolicy defines what to do when the machine is removed from the
+	// cluster's management. "None" (the default) removes the ByotMachine
+	// object only: the machine keeps running with its configuration and
+	// datastore intact and can be re-adopted without any changes. "Reset"
+	// wipes the machine's STATE and EPHEMERAL system volumes before it is
+	// released, returning it to maintenance mode for reuse elsewhere.
+	// +optional
+	// +kubebuilder:validation:Enum=None;Reset
+	// +kubebuilder:default=None
+	SplitPolicy MachinePolicy `json:"splitPolicy,omitempty"`
 
 	// ProviderID is set by the controller once the machine has been adopted.
 	// +optional
