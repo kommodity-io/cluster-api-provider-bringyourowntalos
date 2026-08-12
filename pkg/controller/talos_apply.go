@@ -145,6 +145,29 @@ func probeAuthenticated(ctx context.Context, publicIP string, talosConfig []byte
 	return err == nil
 }
 
+// restartService restarts the given Talos service on the machine, using the
+// given talosconfig credentials. Used after bundle-match re-adoption: when a
+// node was split with splitPolicy=None, Cluster API deletes its Node object
+// in the workload cluster, and a restarted kubelet is what re-registers it.
+func restartService(ctx context.Context, publicIP string, talosConfig []byte, serviceID string) error {
+	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+	if err != nil {
+		return err
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	restartCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), resetTimeout)
+	defer cancel()
+
+	_, err = client.ServiceRestart(restartCtx, serviceID)
+	if err != nil {
+		return fmt.Errorf("failed to restart service %s on %s: %w", serviceID, publicIP, err)
+	}
+
+	return nil
+}
+
 // resetMachine wipes the machine's STATE and EPHEMERAL system volumes and
 // reboots it into maintenance mode. When talosConfig is nil, an unverified
 // TLS client is used (maintenance mode); otherwise the machine's current
