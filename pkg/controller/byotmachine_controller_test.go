@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"testing"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
@@ -397,4 +399,76 @@ func newTalosConfigSecret(name string, namespace string, data []byte) *corev1.Se
 			talosConfigSecretDataKey: data,
 		},
 	}
+}
+
+var errTestKubeletNotDefined = errors.New(`service "kubelet" not defined`)
+
+func TestNudgeKubeletAfterSplitReadoptFailsNonFatal(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+
+	// bundleMatch on a not-yet-ready ByotMachine with a failing restart (the
+	// machine rebooting after its first apply, kubelet service not yet
+	// defined): the nudge records a warning but never reverts adoption.
+	nudgeKubeletAfterSplitReadopt(t.Context(), byotMachine, []byte("talosconfig"),
+		true, false,
+		func(context.Context, string, []byte, string) error {
+			return errTestKubeletNotDefined
+		})
+
+	condition := conditions.Get(byotMachine, KubeletRestartNudgeCondition)
+	require.NotNil(t, condition)
+	assert.Equal(t, corev1.ConditionFalse, condition.Status)
+	assert.Equal(t, "RestartFailed", condition.Reason)
+	assert.Equal(t, clusterv1.ConditionSeverityWarning, condition.Severity)
+	assert.Contains(t, condition.Message, `service "kubelet" not defined`)
+}
+
+func TestNudgeKubeletAfterSplitReadoptSucceeds(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+
+	nudgeKubeletAfterSplitReadopt(t.Context(), byotMachine, []byte("talosconfig"),
+		true, false,
+		func(context.Context, string, []byte, string) error { return nil })
+
+	condition := conditions.Get(byotMachine, KubeletRestartNudgeCondition)
+	require.NotNil(t, condition)
+	assert.Equal(t, corev1.ConditionTrue, condition.Status)
+}
+
+func TestNudgeKubeletAfterSplitReadoptSkipsWhenNotBundleMatch(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+
+	// Fresh maintenance-mode adoption (bundleMatch=false): no kubelet restart
+	// nudge is issued, the kubelet starts on boot.
+	nudgeKubeletAfterSplitReadopt(t.Context(), byotMachine, nil, false, false,
+		func(context.Context, string, []byte, string) error {
+			t.Fatal("restart must not be called when bundleMatch is false")
+
+			return nil
+		})
+
+	assert.Nil(t, conditions.Get(byotMachine, KubeletRestartNudgeCondition))
+}
+
+func TestNudgeKubeletAfterSplitReadoptSkipsWhenAlreadyReady(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+
+	// Re-apply on an already-adopted machine (wasReady=true): no nudge, the
+	// kubelet picks up the updated config without a restart.
+	nudgeKubeletAfterSplitReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, true,
+		func(context.Context, string, []byte, string) error {
+			t.Fatal("restart must not be called when the machine was already ready")
+
+			return nil
+		})
+
+	assert.Nil(t, conditions.Get(byotMachine, KubeletRestartNudgeCondition))
 }

@@ -73,6 +73,12 @@ const ResetPerformedCondition clusterv1.ConditionType = "ResetPerformed"
 // maintenance mode or already carries this cluster's PKI bundle.
 const JoinPreflightCondition clusterv1.ConditionType = "JoinPreflight"
 
+// KubeletRestartNudgeCondition reports the outcome of the best-effort kubelet
+// restart issued after a split-re-adopt (splitPolicy=None) so the workload
+// Node re-registers. Its failure is non-fatal: the configuration apply already
+// succeeded and the kubelet (re)starts on boot regardless.
+const KubeletRestartNudgeCondition clusterv1.ConditionType = "KubeletRestartNudge"
+
 // ByotMachineReconciler reconciles a ByotMachine object.
 type ByotMachineReconciler struct {
 	Client ctrlclient.Client
@@ -303,19 +309,18 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
 
-	// Re-adopting a machine that was split with splitPolicy=None leaves its
-	// Node deleted in the workload cluster; the kubelet only re-registers it
-	// on restart.
-	if bundleMatch && !wasReady {
-		err = restartService(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
-		if err != nil {
-			return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
-		}
-
-		logger.Info("Kubelet restarted after split re-adoption",
-			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Spec.PublicIP)
-	}
+	// Best-effort kubelet re-registration nudge for a split-re-adopt
+	// (splitPolicy=None): the machine keeps its config and datastore, the
+	// Node was deleted by Cluster API, and the kubelet only re-registers it
+	// on restart. It runs solely when the machine was adopted via an
+	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine.
+	//
+	// Its failure never reverts a successful adoption: the configuration
+	// apply already succeeded and the kubelet (re)starts on boot. A
+	// transient failure (machine rebooting after its first apply, service
+	// not yet defined) is recorded as a warning and self-heals when the
+	// kubelet comes up.
+	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, restartService)
 
 	markAdopted(byotMachine, configHash)
 
@@ -327,6 +332,53 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
 
 	return ctrl.Result{}, nil
+}
+
+// nudgeKubeletAfterSplitReadopt restarts the kubelet so a Node deleted during
+// a splitPolicy=None split re-registers, when the machine was re-adopted via
+// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine. The
+// restart is best-effort: its failure is recorded as a warning condition and
+// never reverts the adoption, because the configuration apply already
+// succeeded and the kubelet (re)starts on boot regardless. restart is injected
+// so the non-fatal path is unit-testable without a live Talos API.
+func nudgeKubeletAfterSplitReadopt(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+	talosConfig []byte,
+	bundleMatch bool,
+	wasReady bool,
+	restart func(context.Context, string, []byte, string) error,
+) {
+	logger := log.FromContext(ctx)
+
+	if !bundleMatch || wasReady {
+		return
+	}
+
+	err := restart(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	if err != nil {
+		conditions.MarkFalse(
+			byotMachine,
+			KubeletRestartNudgeCondition,
+			"RestartFailed",
+			clusterv1.ConditionSeverityWarning,
+			"%s",
+			err.Error(),
+		)
+
+		logger.Info("Kubelet restart nudge failed (non-fatal); kubelet registers on boot",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP,
+			"error", err.Error())
+
+		return
+	}
+
+	conditions.MarkTrue(byotMachine, KubeletRestartNudgeCondition)
+
+	logger.Info("Kubelet restarted after split re-adoption",
+		"byotMachine", byotMachine.Name,
+		"publicIP", byotMachine.Spec.PublicIP)
 }
 
 // reconcileDelete releases the machine. With spec.splitPolicy=None (default)
