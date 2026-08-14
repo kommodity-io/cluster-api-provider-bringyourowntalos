@@ -78,6 +78,33 @@ untouched.
   deletion additionally wipes the machine (STATE + EPHEMERAL) and releases
   the finalizer only after the reset succeeds.
 
+## Adoption flow
+
+```mermaid
+flowchart TD
+    R[Reconcile ByotMachine] --> B[Bootstrap data ready?]
+    B -->|no| W[Requeue]:::wait
+    B -->|yes| C{Config unchanged?}
+    C -->|yes| N[No-op]:::ok
+    C -->|no| J{Reset on join requested?}
+    J -->|yes| Wipe[Wipe + reboot to maintenance]:::action
+    J -->|no| M{Machine in maintenance?}
+    Wipe --> M
+    M -->|yes| A1[Apply via insecure client]:::action
+    M -->|no| F{Foreign cluster?}
+    F -->|no| A2[Apply via cluster talosconfig mTLS]:::action
+    F -->|yes| X[Fail preflight]:::fail
+    A1 --> S{Apply OK?}
+    A2 --> S
+    S -->|no| AF[MachineAdopted=False]:::fail
+    S -->|yes| R1[Restart kubelet on re-adopt]:::action
+    R1 --> OK[markAdopted: Ready]:::ok
+    classDef wait fill:#fff3cd,stroke:#997404;
+    classDef action fill:#cfe2ff,stroke:#084298;
+    classDef ok fill:#d1e7dd,stroke:#0f5132;
+    classDef fail fill:#f8d7da,stroke:#842029;
+```
+
 ## Development
 
 ```sh
