@@ -34,7 +34,7 @@ func TestByotClusterReconcileSetsReady(t *testing.T) {
 	byotCluster := &infrav1.ByotCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testClusterName,
-			Namespace: "default",
+			Namespace: testNamespace,
 		},
 	}
 

@@ -55,6 +55,7 @@ func (c *ByotCluster) SetConditions(conditions clusterv1.Conditions) {
 type ByotClusterList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
+
 	Items           []ByotCluster `json:"items"`
 }
 

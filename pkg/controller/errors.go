@@ -34,4 +34,12 @@ var (
 	ErrJoinNoCredentials = errors.New("machine is already configured and no usable talosconfig " +
 		"is available: provide a talosconfig via spec.talosConfigSecretRef to " +
 		"authenticate the machine, or manually put it back in maintenance mode")
+
+	// ErrClusterNameUnresolved indicates the ByotMachine being deleted has no
+	// resolvable owning cluster name, so its workload Node cannot be cleaned up.
+	ErrClusterNameUnresolved = errors.New("cannot resolve cluster name for ByotMachine")
+
+	// ErrDrainTimeout indicates the best-effort drain of a workload Node
+	// exceeded its timeout during ByotMachine deletion.
+	ErrDrainTimeout = errors.New("timed out draining workload node")
 )

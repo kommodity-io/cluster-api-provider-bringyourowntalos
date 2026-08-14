@@ -476,15 +476,19 @@ func (r *ByotMachineReconciler) reconcileDelete(
 		return ctrl.Result{}, nil
 	}
 
+	patchHelper, err := patch.NewHelper(byotMachine, r.Client)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to create patch helper for deletion: %w", err)
+	}
+
+	machine, _ := util.GetOwnerMachine(ctx, r.Client, byotMachine.ObjectMeta)
+
+	r.markNodeCleanup(ctx, byotMachine, machine)
+
 	if byotMachine.Spec.SplitPolicy == infrav1.MachinePolicyReset {
 		err := r.resetWithResolvedAuth(ctx, byotMachine)
 		if err != nil {
-			logger.Info("Reset on delete failed, retrying",
-				"byotMachine", byotMachine.Name,
-				"publicIP", byotMachine.Spec.PublicIP,
-				"error", err.Error())
-
-			return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, nil
+			return r.handleResetFailure(ctx, patchHelper, byotMachine, err)
 		}
 
 		logger.Info("Machine reset and released", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
@@ -494,14 +498,66 @@ func (r *ByotMachineReconciler) reconcileDelete(
 			"publicIP", byotMachine.Spec.PublicIP)
 	}
 
-	if controllerutil.RemoveFinalizer(byotMachine, byotMachineFinalizer) {
-		err := r.Client.Update(ctx, byotMachine)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from ByotMachine %s: %w", byotMachine.Name, err)
-		}
+	controllerutil.RemoveFinalizer(byotMachine, byotMachineFinalizer)
+
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine for deletion: %w", err)
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// markNodeCleanup drains and deletes the workload Node backing byotMachine
+// (best-effort, independent of the CAPI cluster cache) and records the
+// outcome as the NodeCleanup condition. An unreachable workload or a drain
+// timeout is a warning and never blocks deletion.
+func (r *ByotMachineReconciler) markNodeCleanup(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+	machine *clusterv1.Machine,
+) {
+	logger := log.FromContext(ctx)
+
+	err := r.cleanupWorkloadNode(ctx, byotMachine, machine)
+	if err != nil {
+		logger.Info("Workload Node cleanup failed (non-fatal), proceeding with deletion",
+			"byotMachine", byotMachine.Name, "error", err.Error())
+
+		conditions.MarkFalse(
+			byotMachine,
+			NodeCleanupCondition,
+			"CleanupFailed",
+			clusterv1.ConditionSeverityWarning,
+			"%s",
+			err.Error(),
+		)
+
+		return
+	}
+
+	conditions.MarkTrue(byotMachine, NodeCleanupCondition)
+}
+
+// handleResetFailure persists the NodeCleanup condition and requeues when a
+// split reset on delete fails, so deletion blocks until the wipe succeeds.
+func (r *ByotMachineReconciler) handleResetFailure(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	resetErr error,
+) (ctrl.Result, error) {
+	log.FromContext(ctx).Info("Reset on delete failed, retrying",
+		"byotMachine", byotMachine.Name,
+		"publicIP", byotMachine.Spec.PublicIP,
+		"error", resetErr.Error())
+
+	err := patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine after reset failure: %w", err)
+	}
+
+	return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, nil
 }
 
 // resetWithResolvedAuth resets the machine using the first working
