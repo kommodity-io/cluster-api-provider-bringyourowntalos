@@ -78,6 +78,47 @@ untouched.
   deletion additionally wipes the machine (STATE + EPHEMERAL) and releases
   the finalizer only after the reset succeeds.
 
+## Adoption flow
+
+```mermaid
+flowchart TD
+    R[Reconcile ByotMachine] --> FIN[Ensure finalizer]
+    FIN --> IN["Resolve owner Machine + CABPT bootstrap data"]
+    IN -->|not ready| WAIT[Requeue 10s]
+    IN -->|ready| HASH[Compute config hash]
+    HASH --> SAME{Already adopted<br/>and hash unchanged?}
+    SAME -->|yes| NOOP[No-op: in sync]
+    SAME -->|no| RST{joinPolicy=Reset<br/>and not Ready?}
+    RST -->|yes| JRST["ensureJoinReset:<br/>wipe STATE + EPHEMERAL,<br/>reboot to maintenance, requeue"]
+    RST -->|no| APPLY[applyAndMarkAdopted]
+    JRST --> APPLY
+    APPLY --> AUTH[resolveApplyAuth]
+    AUTH --> Q1{Reset confirmed<br/>in maintenance mode?}
+    Q1 -->|yes| INSEC["Insecure maintenance client<br/>(no talosconfig)"]
+    Q1 -->|no| Q2{Already Ready?<br/>re-apply / drift}
+    Q2 -->|yes| CTALOS["mTLS with cluster<br/>talosconfig secret"]
+    Q2 -->|no| PF[Join preflight]
+    PF --> P1{Probe: maintenance mode?}
+    P1 -->|yes| INSEC
+    P1 -->|no| P2{Probe: cluster talosconfig OK?}
+    P2 -->|yes| CTALOS
+    P2 -->|no| FO[preflightForeignMachine]
+    FO --> F1{talosConfigSecretRef set?}
+    F1 -->|no| FAIL1[FAIL JoinPreflight=NoCredentials]
+    F1 -->|yes| F2{Foreign talosconfig probes OK?}
+    F2 -->|yes| FAIL2[FAIL JoinPreflight=BundleMismatch]
+    F2 -->|no| REF["Use referenced config<br/>(unreachable fallback)"]
+    INSEC --> AP[Apply machine config to publicIP:50000]
+    CTALOS --> AP
+    REF --> AP
+    AP -->|error| AFAIL[MachineAdopted=False ApplyFailed]
+    AP -->|ok| K{bundleMatch and<br/>not previously Ready?}
+    K -->|yes| KUB["Restart kubelet<br/>(re-register Node after split)"]
+    K -->|no| MK
+    KUB --> MK["markAdopted:<br/>providerID byot://publicIP,<br/>LastAppliedConfigSHA,<br/>Ready=true, MachineAdopted=true"]
+    MK --> DONE[Machine ready]
+```
+
 ## Development
 
 ```sh
