@@ -28,7 +28,10 @@ var (
 
 	// ErrJoinNoCredentials indicates the machine being adopted is already
 	// configured but no talosconfig exists that authenticates against it, so
-	// its bundle cannot be verified; it must be reset before it can join.
+	// its bundle cannot be verified. Provide a talosconfig (spec.talosConfigSecretRef)
+	// to authenticate and verify the machine, or manually return it to
+	// maintenance mode.
 	ErrJoinNoCredentials = errors.New("machine is already configured and no usable talosconfig " +
-		"is available: set spec.joinPolicy=Reset to wipe it before adoption, or pre-clean it manually")
+		"is available: provide a talosconfig via spec.talosConfigSecretRef to " +
+		"authenticate the machine, or manually put it back in maintenance mode")
 )
