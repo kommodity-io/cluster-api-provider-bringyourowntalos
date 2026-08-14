@@ -303,6 +303,7 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	}
 
 	wasReady := byotMachine.Status.Ready
+	previouslyAdopted := byotMachine.Status.LastAppliedConfigSHA != ""
 
 	err = applyMachineConfig(ctx, byotMachine.Spec.PublicIP, machineConfig, talosConfig)
 	if err != nil {
@@ -313,14 +314,17 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	// (splitPolicy=None): the machine keeps its config and datastore, the
 	// Node was deleted by Cluster API, and the kubelet only re-registers it
 	// on restart. It runs solely when the machine was adopted via an
-	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine.
+	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that
+	// had already been adopted before (its config hash was set): a fresh
+	// maintenance-mode adoption is excluded, since the kubelet starts on
+	// boot and the machine reboots right after the apply.
 	//
 	// Its failure never reverts a successful adoption: the configuration
 	// apply already succeeded and the kubelet (re)starts on boot. A
 	// transient failure (machine rebooting after its first apply, service
 	// not yet defined) is recorded as a warning and self-heals when the
 	// kubelet comes up.
-	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, restartService)
+	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, previouslyAdopted, restartService)
 
 	markAdopted(byotMachine, configHash)
 
@@ -336,22 +340,25 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 
 // nudgeKubeletAfterSplitReadopt restarts the kubelet so a Node deleted during
 // a splitPolicy=None split re-registers, when the machine was re-adopted via
-// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine. The
-// restart is best-effort: its failure is recorded as a warning condition and
-// never reverts the adoption, because the configuration apply already
-// succeeded and the kubelet (re)starts on boot regardless. restart is injected
-// so the non-fatal path is unit-testable without a live Talos API.
+// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that had
+// already been adopted before (previouslyAdopted). The restart is best-effort:
+// its failure is recorded as a warning condition and never reverts the
+// adoption, because the configuration apply already succeeded and the kubelet
+// (re)starts on boot regardless. A fresh maintenance-mode adoption is excluded
+// (previouslyAdopted=false), since its kubelet starts on boot. restart is
+// injected so the non-fatal path is unit-testable without a live Talos API.
 func nudgeKubeletAfterSplitReadopt(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
 	talosConfig []byte,
 	bundleMatch bool,
 	wasReady bool,
+	previouslyAdopted bool,
 	restart func(context.Context, string, []byte, string) error,
 ) {
 	logger := log.FromContext(ctx)
 
-	if !bundleMatch || wasReady {
+	if !bundleMatch || wasReady || !previouslyAdopted {
 		return
 	}
 
