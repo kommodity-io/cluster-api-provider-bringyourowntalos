@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -24,17 +25,24 @@ func objectKey(name string, namespace string) types.NamespacedName {
 	return types.NamespacedName{Name: name, Namespace: namespace}
 }
 
+const (
+	testClusterName = "test-cluster"
+	testMachineName = "test-machine"
+	testNamespace  = "default"
+	testMachineUID  = "machine-uid"
+)
+
 func clusterKey(obj metav1.Object) types.NamespacedName {
 	return types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
 }
 
-func newByotMachine(name string, namespace string, publicIP string) *infrav1.ByotMachine {
+func newByotMachine(publicIP string) *infrav1.ByotMachine {
 	return &infrav1.ByotMachine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:      testMachineName,
+			Namespace: testNamespace,
 			Labels: map[string]string{
-				clusterv1.ClusterNameLabel: "test-cluster",
+				clusterv1.ClusterNameLabel: testClusterName,
 			},
 		},
 		Spec: infrav1.ByotMachineSpec{
@@ -42,7 +50,6 @@ func newByotMachine(name string, namespace string, publicIP string) *infrav1.Byo
 		},
 	}
 }
-
 func TestByotMachineReconcileAddsFinalizer(t *testing.T) {
 	t.Parallel()
 
@@ -51,7 +58,7 @@ func TestByotMachineReconcileAddsFinalizer(t *testing.T) {
 	err := clusterv1.AddToScheme(scheme)
 	require.NoError(t, err)
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -77,8 +84,14 @@ func TestByotMachineReconcileAddsFinalizer(t *testing.T) {
 	assert.Nil(t, updated.Spec.ProviderID)
 }
 
-func newAdoptedByotMachine(name string, namespace string, publicIP string, configHash string) *infrav1.ByotMachine {
-	machine := newByotMachine(name, namespace, publicIP)
+// newAdoptedByotMachine builds a ByotMachine that is already adopted (ready,
+// providerID set, owner Machine reference attached) for tests that start past
+// the adoption phase. publicIP and configHash are kept as parameters for
+// readability even though current callers share defaults.
+//
+//nolint:unparam // test builder: parameters document intent for future cases
+func newAdoptedByotMachine(publicIP string, configHash string) *infrav1.ByotMachine {
+	machine := newByotMachine(publicIP)
 	providerID := infrav1.ProviderIDPrefix + publicIP
 	machine.Spec.ProviderID = &providerID
 	machine.Status.Ready = true
@@ -87,26 +100,31 @@ func newAdoptedByotMachine(name string, namespace string, publicIP string, confi
 		{
 			APIVersion: clusterv1.GroupVersion.String(),
 			Kind:       "Machine",
-			Name:       name,
-			UID:        "machine-uid",
+			Name:       testMachineName,
+			UID:        testMachineUID,
 		},
 	}
 
 	return machine
 }
 
-func newOwningMachine(name string, namespace string, dataSecretName string) *clusterv1.Machine {
+// newOwningMachine builds the CAPI Machine owning a ByotMachine, with its
+// bootstrap data secret reference set. dataSecretName is kept as a parameter
+// for readability even though current callers share a default.
+//
+//nolint:unparam // test builder: parameter documents intent for future cases
+func newOwningMachine(dataSecretName string) *clusterv1.Machine {
 	return &clusterv1.Machine{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			UID:       "machine-uid",
+			Name:      testMachineName,
+			Namespace: testNamespace,
+			UID:       testMachineUID,
 			Labels: map[string]string{
-				clusterv1.ClusterNameLabel: "test-cluster",
+				clusterv1.ClusterNameLabel: testClusterName,
 			},
 		},
 		Spec: clusterv1.MachineSpec{
-			ClusterName: "test-cluster",
+			ClusterName: testClusterName,
 			Bootstrap: clusterv1.Bootstrap{
 				DataSecretName: &dataSecretName,
 			},
@@ -143,8 +161,9 @@ func TestByotMachineReconcileNoOpWhenConfigUnchanged(t *testing.T) {
 	configData := []byte("cluster:\n  controlPlane: {}\n")
 	currentHash := sha256HexOf(configData)
 
-	byotMachine := newAdoptedByotMachine("test-machine", "default", "203.0.113.10", currentHash)
-	machine := newOwningMachine("test-machine", "default", "test-bootstrap")
+	byotMachine := newAdoptedByotMachine("203.0.113.10", currentHash)
+	machine := newOwningMachine("test-bootstrap")
+	machine.Status.NodeRef = &corev1.ObjectReference{Name: "test-node"} // node already linked
 	secret := newBootstrapSecret("test-bootstrap", "default", configData)
 
 	client := fake.NewClientBuilder().
@@ -171,8 +190,8 @@ func TestByotMachineReconcileRequeuesWhenClusterTalosConfigMissing(t *testing.T)
 	err := clusterv1.AddToScheme(scheme)
 	require.NoError(t, err)
 
-	byotMachine := newAdoptedByotMachine("test-machine", "default", "203.0.113.10", "stale-hash")
-	machine := newOwningMachine("test-machine", "default", "test-bootstrap")
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "stale-hash")
+	machine := newOwningMachine("test-bootstrap")
 	secret := newBootstrapSecret("test-bootstrap", "default", []byte("new-config"))
 
 	client := fake.NewClientBuilder().
@@ -202,7 +221,7 @@ func TestByotMachineReconcileDeleteBlocksUntilResetSucceeds(t *testing.T) {
 
 	// 127.0.0.1 refuses the Talos API connection immediately: the reset
 	// fails fast and deletion must stay blocked with the finalizer retained.
-	byotMachine := newByotMachine("test-machine", "default", "127.0.0.1")
+	byotMachine := newByotMachine("127.0.0.1")
 	byotMachine.Finalizers = []string{byotMachineFinalizer}
 	byotMachine.Spec.SplitPolicy = infrav1.MachinePolicyReset
 
@@ -241,7 +260,7 @@ func TestByotMachineReconcileDeleteReleasesWithoutReset(t *testing.T) {
 	// splitPolicy=None (the CRD default; fake client does not apply CRD
 	// defaults, so the zero value takes the None path): deletion releases
 	// the machine without touching it.
-	byotMachine := newByotMachine("test-machine", "default", "127.0.0.1")
+	byotMachine := newByotMachine("127.0.0.1")
 	byotMachine.Finalizers = []string{byotMachineFinalizer}
 
 	client := fake.NewClientBuilder().
@@ -279,16 +298,16 @@ func TestByotMachineReconcileJoinPreflightFailsWithoutCredentials(t *testing.T) 
 	// in maintenance mode nor verifiable against the cluster talosconfig,
 	// and no foreign talosconfig reference exists. The join preflight must
 	// fail with NoCredentials instead of blindly applying configuration.
-	byotMachine := newByotMachine("test-machine", "default", "127.0.0.1")
+	byotMachine := newByotMachine("127.0.0.1")
 	byotMachine.OwnerReferences = []metav1.OwnerReference{
 		{
 			APIVersion: clusterv1.GroupVersion.String(),
 			Kind:       "Machine",
 			Name:       "test-machine",
-			UID:        "machine-uid",
+			UID:        testMachineUID,
 		},
 	}
-	machine := newOwningMachine("test-machine", "default", "test-bootstrap")
+	machine := newOwningMachine("test-bootstrap")
 	secret := newBootstrapSecret("test-bootstrap", "default", []byte("new-config"))
 	cluster := newTalosConfigSecret("test-cluster-talosconfig", "default", []byte("cluster"))
 
@@ -324,7 +343,7 @@ func TestResetCredentialCandidatesOrder(t *testing.T) {
 	err := clusterv1.AddToScheme(scheme)
 	require.NoError(t, err)
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 	byotMachine.Spec.TalosConfigSecretRef = &infrav1.LocalObjectReference{Name: "foreign-creds"}
 
 	foreign := newTalosConfigSecret("foreign-creds", "default", []byte("foreign"))
@@ -353,7 +372,7 @@ func TestResetCredentialCandidatesInsecureOnly(t *testing.T) {
 	err := clusterv1.AddToScheme(scheme)
 	require.NoError(t, err)
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -406,7 +425,7 @@ var errTestKubeletNotDefined = errors.New(`service "kubelet" not defined`)
 func TestNudgeKubeletAfterSplitReadoptFailsNonFatal(t *testing.T) {
 	t.Parallel()
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 
 	// Genuine split-re-adopt: bundleMatch on a not-yet-ready ByotMachine that
 	// was already adopted (hash set), with a failing restart (machine
@@ -429,7 +448,7 @@ func TestNudgeKubeletAfterSplitReadoptFailsNonFatal(t *testing.T) {
 func TestNudgeKubeletAfterSplitReadoptSucceeds(t *testing.T) {
 	t.Parallel()
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 
 	nudgeKubeletAfterSplitReadopt(t.Context(), byotMachine, []byte("talosconfig"),
 		true, false, true,
@@ -443,7 +462,7 @@ func TestNudgeKubeletAfterSplitReadoptSucceeds(t *testing.T) {
 func TestNudgeKubeletAfterSplitReadoptSkipsWhenNotBundleMatch(t *testing.T) {
 	t.Parallel()
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 
 	// Fresh maintenance-mode adoption (bundleMatch=false): no kubelet restart
 	// nudge is issued, the kubelet starts on boot.
@@ -460,7 +479,7 @@ func TestNudgeKubeletAfterSplitReadoptSkipsWhenNotBundleMatch(t *testing.T) {
 func TestNudgeKubeletAfterSplitReadoptSkipsWhenAlreadyReady(t *testing.T) {
 	t.Parallel()
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 
 	// Re-apply on an already-adopted machine (wasReady=true): no nudge, the
 	// kubelet picks up the updated config without a restart.
@@ -477,7 +496,7 @@ func TestNudgeKubeletAfterSplitReadoptSkipsWhenAlreadyReady(t *testing.T) {
 func TestNudgeKubeletAfterSplitReadoptSkipsFreshAdoption(t *testing.T) {
 	t.Parallel()
 
-	byotMachine := newByotMachine("test-machine", "default", "203.0.113.10")
+	byotMachine := newByotMachine("203.0.113.10")
 
 	// Fresh maintenance-mode adoption followed by a stale-cache reconcile that
 	// probes bundleMatch=true with wasReady=false but no prior config hash:
@@ -492,4 +511,95 @@ func TestNudgeKubeletAfterSplitReadoptSkipsFreshAdoption(t *testing.T) {
 		})
 
 	assert.Nil(t, conditions.Get(byotMachine, KubeletRestartNudgeCondition))
+}
+
+func TestEnsureNodeLinkedRetriggersWhenNoNodeRef(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	machine := newOwningMachine("test-bootstrap") // no NodeRef
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+	patchHelper, err := patch.NewHelper(byotMachine, client)
+	require.NoError(t, err)
+
+	result, err := reconciler.ensureNodeLinked(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterNodeLink, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	err = client.Get(t.Context(), clusterKey(byotMachine), updated)
+	require.NoError(t, err)
+	assert.Contains(t, updated.Annotations, nodeLinkRetriggerAnnotation)
+}
+
+func TestEnsureNodeLinkedClearsAnnotationWhenLinked(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Annotations = map[string]string{nodeLinkRetriggerAnnotation: "12345"}
+	machine := newOwningMachine("test-bootstrap")
+	machine.Status.NodeRef = &corev1.ObjectReference{Name: "test-node"} // node now linked
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+	patchHelper, err := patch.NewHelper(byotMachine, client)
+	require.NoError(t, err)
+
+	result, err := reconciler.ensureNodeLinked(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	err = client.Get(t.Context(), clusterKey(byotMachine), updated)
+	require.NoError(t, err)
+	assert.NotContains(t, updated.Annotations, nodeLinkRetriggerAnnotation)
+}
+
+func TestEnsureNodeLinkedNoopWhenNotReady(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	// Not yet adopted: nothing to link, no requeue.
+	byotMachine := newByotMachine("203.0.113.10")
+	machine := newOwningMachine("test-bootstrap")
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+	patchHelper, err := patch.NewHelper(byotMachine, client)
+	require.NoError(t, err)
+
+	result, err := reconciler.ensureNodeLinked(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
 }

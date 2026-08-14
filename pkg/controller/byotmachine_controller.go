@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
@@ -58,6 +59,20 @@ const (
 	// kubeletServiceID is the Talos service restarted after a bundle-match
 	// re-adoption so the workload-cluster Node is re-registered.
 	kubeletServiceID = "kubelet"
+
+	// requeueAfterNodeLink is the delay between two attempts to retrigger the
+	// owning CAPI Machine's node-link reconciliation after adoption.
+	requeueAfterNodeLink = 30 * time.Second
+
+	// nodeLinkRetriggerAnnotation is bumped on an adopted ByotMachine whose
+	// owning Machine has not yet linked its workload Node (status.nodeRef).
+	// Each bump changes the ByotMachine object, retriggers the CAPI Machine
+	// controller (which watches the infra ref), and makes it re-list the
+	// workload nodes to match spec.providerID. This compensates for the
+	// control-plane bootstrap race where the workload API is down while the
+	// Machine controller first reconciles, so its node watch never observes
+	// the control-plane Node registering.
+	nodeLinkRetriggerAnnotation = "infrastructure.cluster.x-k8s.io/node-link-retrigger"
 )
 
 // MachineAdoptedCondition reports whether the machine configuration has been
@@ -164,7 +179,7 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 	configHash := sha256Hex(machineConfig)
 
 	if configUnchanged(byotMachine, configHash) {
-		return ctrl.Result{}, nil
+		return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
 	}
 
 	if byotMachine.Spec.JoinPolicy == infrav1.MachinePolicyReset && !byotMachine.Status.Ready {
@@ -335,7 +350,65 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 
 	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
 
-	return ctrl.Result{}, nil
+	return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
+}
+
+// ensureNodeLinked retriggers the owning CAPI Machine's node-link
+// reconciliation until the Machine reports status.nodeRef. An adopted
+// ByotMachine has spec.providerID set, and the CAPI Machine controller links
+// the workload Node by matching that providerID. On the control plane the
+// workload API is down while the Machine controller first reconciles, so its
+// node watch can miss the control-plane Node registering and the Machine
+// stalls on "Waiting for a node with matching ProviderID". Bumping
+// nodeLinkRetriggerAnnotation changes the ByotMachine object, which the
+// Machine controller watches, forcing a re-list of workload nodes until the
+// link completes. Once nodeRef is set the annotation is cleared and the
+// requeue stops.
+func (r *ByotMachineReconciler) ensureNodeLinked(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	machine *clusterv1.Machine,
+) (ctrl.Result, error) {
+	if !byotMachine.Status.Ready || byotMachine.Spec.ProviderID == nil {
+		return ctrl.Result{}, nil
+	}
+
+	latest := &clusterv1.Machine{}
+
+	err := r.Client.Get(ctx, ctrlclient.ObjectKeyFromObject(machine), latest)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get owner Machine %s: %w", machine.Name, err)
+	}
+
+	if latest.Status.NodeRef != nil {
+		if _, ok := byotMachine.Annotations[nodeLinkRetriggerAnnotation]; ok {
+			delete(byotMachine.Annotations, nodeLinkRetriggerAnnotation)
+
+			err := patchHelper.Patch(ctx, byotMachine)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine after clearing node-link annotation: %w", err)
+			}
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if byotMachine.Annotations == nil {
+		byotMachine.Annotations = map[string]string{}
+	}
+
+	byotMachine.Annotations[nodeLinkRetriggerAnnotation] = strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine with node-link retrigger: %w", err)
+	}
+
+	log.FromContext(ctx).Info("Retriggering Machine node-link",
+		"byotMachine", byotMachine.Name, "machine", machine.Name)
+
+	return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
 }
 
 // nudgeKubeletAfterSplitReadopt restarts the kubelet so a Node deleted during
