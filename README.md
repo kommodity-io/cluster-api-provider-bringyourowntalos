@@ -82,41 +82,27 @@ untouched.
 
 ```mermaid
 flowchart TD
-    R[Reconcile ByotMachine] --> FIN[Ensure finalizer]
-    FIN --> IN["Resolve owner Machine + CABPT bootstrap data"]
-    IN -->|not ready| WAIT[Requeue 10s]
-    IN -->|ready| HASH[Compute config hash]
-    HASH --> SAME{Already adopted<br/>and hash unchanged?}
-    SAME -->|yes| NOOP[No-op: in sync]
-    SAME -->|no| RST{joinPolicy=Reset<br/>and not Ready?}
-    RST -->|yes| JRST["ensureJoinReset:<br/>wipe STATE + EPHEMERAL,<br/>reboot to maintenance, requeue"]
-    RST -->|no| APPLY[applyAndMarkAdopted]
-    JRST --> APPLY
-    APPLY --> AUTH[resolveApplyAuth]
-    AUTH --> Q1{Reset confirmed<br/>in maintenance mode?}
-    Q1 -->|yes| INSEC["Insecure maintenance client<br/>(no talosconfig)"]
-    Q1 -->|no| Q2{Already Ready?<br/>re-apply / drift}
-    Q2 -->|yes| CTALOS["mTLS with cluster<br/>talosconfig secret"]
-    Q2 -->|no| PF[Join preflight]
-    PF --> P1{Probe: maintenance mode?}
-    P1 -->|yes| INSEC
-    P1 -->|no| P2{Probe: cluster talosconfig OK?}
-    P2 -->|yes| CTALOS
-    P2 -->|no| FO[preflightForeignMachine]
-    FO --> F1{talosConfigSecretRef set?}
-    F1 -->|no| FAIL1[FAIL JoinPreflight=NoCredentials]
-    F1 -->|yes| F2{Foreign talosconfig probes OK?}
-    F2 -->|yes| FAIL2[FAIL JoinPreflight=BundleMismatch]
-    F2 -->|no| REF["Use referenced config<br/>(unreachable fallback)"]
-    INSEC --> AP[Apply machine config to publicIP:50000]
-    CTALOS --> AP
-    REF --> AP
-    AP -->|error| AFAIL[MachineAdopted=False ApplyFailed]
-    AP -->|ok| K{bundleMatch and<br/>not previously Ready?}
-    K -->|yes| KUB["Restart kubelet<br/>(re-register Node after split)"]
-    K -->|no| MK
-    KUB --> MK["markAdopted:<br/>providerID byot://publicIP,<br/>LastAppliedConfigSHA,<br/>Ready=true, MachineAdopted=true"]
-    MK --> DONE[Machine ready]
+    R[Reconcile ByotMachine] --> B[Bootstrap data ready?]
+    B -->|no| W[Requeue]:::wait
+    B -->|yes| C{Config unchanged?}
+    C -->|yes| N[No-op]:::ok
+    C -->|no| J{Reset on join requested?}
+    J -->|yes| Wipe[Wipe + reboot to maintenance]:::action
+    J -->|no| M{Machine in maintenance?}
+    Wipe --> M
+    M -->|yes| A1[Apply via insecure client]:::action
+    M -->|no| F{Foreign cluster?}
+    F -->|no| A2[Apply via cluster talosconfig mTLS]:::action
+    F -->|yes| X[Fail preflight]:::fail
+    A1 --> S{Apply OK?}
+    A2 --> S
+    S -->|no| AF[MachineAdopted=False]:::fail
+    S -->|yes| R1[Restart kubelet on re-adopt]:::action
+    R1 --> OK[markAdopted: Ready]:::ok
+    classDef wait fill:#fff3cd,stroke:#997404;
+    classDef action fill:#cfe2ff,stroke:#084298;
+    classDef ok fill:#d1e7dd,stroke:#0f5132;
+    classDef fail fill:#f8d7da,stroke:#842029;
 ```
 
 ## Development
