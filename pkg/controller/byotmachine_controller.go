@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
@@ -58,6 +59,20 @@ const (
 	// kubeletServiceID is the Talos service restarted after a bundle-match
 	// re-adoption so the workload-cluster Node is re-registered.
 	kubeletServiceID = "kubelet"
+
+	// requeueAfterNodeLink is the delay between two attempts to retrigger the
+	// owning CAPI Machine's node-link reconciliation after adoption.
+	requeueAfterNodeLink = 30 * time.Second
+
+	// nodeLinkRetriggerAnnotation is bumped on an adopted ByotMachine whose
+	// owning Machine has not yet linked its workload Node (status.nodeRef).
+	// Each bump changes the ByotMachine object, retriggers the CAPI Machine
+	// controller (which watches the infra ref), and makes it re-list the
+	// workload nodes to match spec.providerID. This compensates for the
+	// control-plane bootstrap race where the workload API is down while the
+	// Machine controller first reconciles, so its node watch never observes
+	// the control-plane Node registering.
+	nodeLinkRetriggerAnnotation = "infrastructure.cluster.x-k8s.io/node-link-retrigger"
 )
 
 // MachineAdoptedCondition reports whether the machine configuration has been
@@ -72,6 +87,12 @@ const ResetPerformedCondition clusterv1.ConditionType = "ResetPerformed"
 // the machine is safe to adopt with spec.joinPolicy=None, i.e. it is in
 // maintenance mode or already carries this cluster's PKI bundle.
 const JoinPreflightCondition clusterv1.ConditionType = "JoinPreflight"
+
+// KubeletRestartNudgeCondition reports the outcome of the best-effort kubelet
+// restart issued after a split-re-adopt (splitPolicy=None) so the workload
+// Node re-registers. Its failure is non-fatal: the configuration apply already
+// succeeded and the kubelet (re)starts on boot regardless.
+const KubeletRestartNudgeCondition clusterv1.ConditionType = "KubeletRestartNudge"
 
 // ByotMachineReconciler reconciles a ByotMachine object.
 type ByotMachineReconciler struct {
@@ -158,7 +179,7 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 	configHash := sha256Hex(machineConfig)
 
 	if configUnchanged(byotMachine, configHash) {
-		return ctrl.Result{}, nil
+		return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
 	}
 
 	if byotMachine.Spec.JoinPolicy == infrav1.MachinePolicyReset && !byotMachine.Status.Ready {
@@ -297,25 +318,28 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	}
 
 	wasReady := byotMachine.Status.Ready
+	previouslyAdopted := byotMachine.Status.LastAppliedConfigSHA != ""
 
 	err = applyMachineConfig(ctx, byotMachine.Spec.PublicIP, machineConfig, talosConfig)
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
 
-	// Re-adopting a machine that was split with splitPolicy=None leaves its
-	// Node deleted in the workload cluster; the kubelet only re-registers it
-	// on restart.
-	if bundleMatch && !wasReady {
-		err = restartService(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
-		if err != nil {
-			return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
-		}
-
-		logger.Info("Kubelet restarted after split re-adoption",
-			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Spec.PublicIP)
-	}
+	// Best-effort kubelet re-registration nudge for a split-re-adopt
+	// (splitPolicy=None): the machine keeps its config and datastore, the
+	// Node was deleted by Cluster API, and the kubelet only re-registers it
+	// on restart. It runs solely when the machine was adopted via an
+	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that
+	// had already been adopted before (its config hash was set): a fresh
+	// maintenance-mode adoption is excluded, since the kubelet starts on
+	// boot and the machine reboots right after the apply.
+	//
+	// Its failure never reverts a successful adoption: the configuration
+	// apply already succeeded and the kubelet (re)starts on boot. A
+	// transient failure (machine rebooting after its first apply, service
+	// not yet defined) is recorded as a warning and self-heals when the
+	// kubelet comes up.
+	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, previouslyAdopted, restartService)
 
 	markAdopted(byotMachine, configHash)
 
@@ -326,7 +350,115 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 
 	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
 
-	return ctrl.Result{}, nil
+	return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
+}
+
+// ensureNodeLinked retriggers the owning CAPI Machine's node-link
+// reconciliation until the Machine reports status.nodeRef. An adopted
+// ByotMachine has spec.providerID set, and the CAPI Machine controller links
+// the workload Node by matching that providerID. On the control plane the
+// workload API is down while the Machine controller first reconciles, so its
+// node watch can miss the control-plane Node registering and the Machine
+// stalls on "Waiting for a node with matching ProviderID". Bumping
+// nodeLinkRetriggerAnnotation changes the ByotMachine object, which the
+// Machine controller watches, forcing a re-list of workload nodes until the
+// link completes. Once nodeRef is set the annotation is cleared and the
+// requeue stops.
+func (r *ByotMachineReconciler) ensureNodeLinked(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	machine *clusterv1.Machine,
+) (ctrl.Result, error) {
+	if !byotMachine.Status.Ready || byotMachine.Spec.ProviderID == nil {
+		return ctrl.Result{}, nil
+	}
+
+	latest := &clusterv1.Machine{}
+
+	err := r.Client.Get(ctx, ctrlclient.ObjectKeyFromObject(machine), latest)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get owner Machine %s: %w", machine.Name, err)
+	}
+
+	if latest.Status.NodeRef != nil {
+		if _, ok := byotMachine.Annotations[nodeLinkRetriggerAnnotation]; ok {
+			delete(byotMachine.Annotations, nodeLinkRetriggerAnnotation)
+
+			err := patchHelper.Patch(ctx, byotMachine)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine after clearing node-link annotation: %w", err)
+			}
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if byotMachine.Annotations == nil {
+		byotMachine.Annotations = map[string]string{}
+	}
+
+	byotMachine.Annotations[nodeLinkRetriggerAnnotation] = strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine with node-link retrigger: %w", err)
+	}
+
+	log.FromContext(ctx).Info("Retriggering Machine node-link",
+		"byotMachine", byotMachine.Name, "machine", machine.Name)
+
+	return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
+}
+
+// nudgeKubeletAfterSplitReadopt restarts the kubelet so a Node deleted during
+// a splitPolicy=None split re-registers, when the machine was re-adopted via
+// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that had
+// already been adopted before (previouslyAdopted). The restart is best-effort:
+// its failure is recorded as a warning condition and never reverts the
+// adoption, because the configuration apply already succeeded and the kubelet
+// (re)starts on boot regardless. A fresh maintenance-mode adoption is excluded
+// (previouslyAdopted=false), since its kubelet starts on boot. restart is
+// injected so the non-fatal path is unit-testable without a live Talos API.
+func nudgeKubeletAfterSplitReadopt(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+	talosConfig []byte,
+	bundleMatch bool,
+	wasReady bool,
+	previouslyAdopted bool,
+	restart func(context.Context, string, []byte, string) error,
+) {
+	logger := log.FromContext(ctx)
+
+	if !bundleMatch || wasReady || !previouslyAdopted {
+		return
+	}
+
+	err := restart(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	if err != nil {
+		conditions.MarkFalse(
+			byotMachine,
+			KubeletRestartNudgeCondition,
+			"RestartFailed",
+			clusterv1.ConditionSeverityWarning,
+			"%s",
+			err.Error(),
+		)
+
+		logger.Info("Kubelet restart nudge failed (non-fatal); kubelet registers on boot",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP,
+			"error", err.Error())
+
+		return
+	}
+
+	conditions.MarkTrue(byotMachine, KubeletRestartNudgeCondition)
+
+	logger.Info("Kubelet restarted after split re-adoption",
+		"byotMachine", byotMachine.Name,
+		"publicIP", byotMachine.Spec.PublicIP)
 }
 
 // reconcileDelete releases the machine. With spec.splitPolicy=None (default)
