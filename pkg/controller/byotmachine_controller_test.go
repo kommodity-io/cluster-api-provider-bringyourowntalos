@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -655,4 +656,95 @@ func TestEnsureNodeLinkedNoopWhenNotReady(t *testing.T) {
 	result, err := reconciler.ensureNodeLinked(t.Context(), patchHelper, byotMachine, machine)
 	require.NoError(t, err)
 	assert.Zero(t, result.RequeueAfter)
+}
+
+func TestWithoutNodeLinkRetriggerStripsAnnotation(t *testing.T) {
+	t.Parallel()
+
+	const otherKey = "other"
+
+	t.Run("nil map returns empty map", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, map[string]string{}, withoutNodeLinkRetrigger(nil))
+	})
+
+	t.Run("strips only the node-link annotation", func(t *testing.T) {
+		t.Parallel()
+
+		got := withoutNodeLinkRetrigger(map[string]string{
+			nodeLinkRetriggerAnnotation: "1700000000000000000",
+			otherKey:                   "kept",
+		})
+		assert.Equal(t, map[string]string{otherKey: "kept"}, got)
+	})
+}
+
+func TestNodeLinkRetriggerSelfFilterUpdate(t *testing.T) {
+	t.Parallel()
+
+	makeMachine := func(annotations map[string]string, generation int64) *infrav1.ByotMachine {
+		m := newByotMachine("203.0.113.10")
+		m.Annotations = annotations
+		m.Generation = generation
+
+		return m
+	}
+
+	t.Run("drops annotation-only bump", func(t *testing.T) {
+		t.Parallel()
+
+		oldObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "1"}, 1)
+		newObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "2"}, 1)
+		assert.False(t, nodeLinkRetriggerSelfFilter{}.Update(event.UpdateEvent{
+			ObjectOld: oldObj, ObjectNew: newObj,
+		}))
+	})
+
+	t.Run("drops annotation removal", func(t *testing.T) {
+		t.Parallel()
+
+		oldObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "1"}, 1)
+		newObj := makeMachine(map[string]string{}, 1)
+		assert.False(t, nodeLinkRetriggerSelfFilter{}.Update(event.UpdateEvent{
+			ObjectOld: oldObj, ObjectNew: newObj,
+		}))
+	})
+
+	t.Run("keeps spec change despite annotation bump", func(t *testing.T) {
+		t.Parallel()
+
+		oldObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "1"}, 1)
+		newObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "2"}, 2)
+		assert.True(t, nodeLinkRetriggerSelfFilter{}.Update(event.UpdateEvent{
+			ObjectOld: oldObj, ObjectNew: newObj,
+		}))
+	})
+
+	t.Run("keeps other annotation change", func(t *testing.T) {
+		t.Parallel()
+
+		oldObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "1"}, 1)
+		newObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "2", "other": "added"}, 1)
+		assert.True(t, nodeLinkRetriggerSelfFilter{}.Update(event.UpdateEvent{
+			ObjectOld: oldObj, ObjectNew: newObj,
+		}))
+	})
+
+	t.Run("keeps when old is nil", func(t *testing.T) {
+		t.Parallel()
+
+		newObj := makeMachine(map[string]string{nodeLinkRetriggerAnnotation: "1"}, 1)
+		assert.True(t, nodeLinkRetriggerSelfFilter{}.Update(event.UpdateEvent{
+			ObjectNew: newObj,
+		}))
+	})
+}
+
+func TestNodeLinkRetriggerSelfFilterCreateDeleteGeneric(t *testing.T) {
+	t.Parallel()
+
+	filter := nodeLinkRetriggerSelfFilter{}
+	assert.True(t, filter.Create(event.CreateEvent{}))
+	assert.True(t, filter.Delete(event.DeleteEvent{}))
+	assert.True(t, filter.Generic(event.GenericEvent{}))
 }

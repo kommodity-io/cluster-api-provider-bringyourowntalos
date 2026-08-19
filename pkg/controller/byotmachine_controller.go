@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"time"
 
@@ -20,9 +21,11 @@ import (
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -75,6 +78,15 @@ const (
 	nodeLinkRetriggerAnnotation = "infrastructure.cluster.x-k8s.io/node-link-retrigger"
 )
 
+// nodeLinkRetriggerSelfFilter is a watch predicate that drops Update events
+// whose only change is the nodeLinkRetriggerAnnotation. The ByotMachine
+// reconciler bumps that annotation to retrigger the owning CAPI Machine's
+// node-link, then requeues after requeueAfterNodeLink. Without this filter
+// every bump re-triggers the ByotMachine's own watch and the reconcile
+// hot-loops on the patch round-trip instead of waiting for the requeue. The
+// owning Machine controller watches ByotMachine through its own informer, so
+// dropping the self-bump here does not starve it.
+
 // MachineAdoptedCondition reports whether the machine configuration has been
 // applied to the adopted machine.
 const MachineAdoptedCondition clusterv1.ConditionType = "MachineAdopted"
@@ -93,6 +105,58 @@ const JoinPreflightCondition clusterv1.ConditionType = "JoinPreflight"
 // Node re-registers. Its failure is non-fatal: the configuration apply already
 // succeeded and the kubelet (re)starts on boot regardless.
 const KubeletRestartNudgeCondition clusterv1.ConditionType = "KubeletRestartNudge"
+
+// nodeLinkRetriggerSelfFilter is a watch predicate that drops Update events
+// whose only change is the nodeLinkRetriggerAnnotation. The ByotMachine
+// reconciler bumps that annotation to retrigger the owning CAPI Machine's
+// node-link, then requeues after requeueAfterNodeLink. Without this filter
+// every bump re-triggers the ByotMachine's own watch and the reconcile
+// hot-loops on the patch round-trip instead of waiting for the requeue. The
+// owning Machine controller watches ByotMachine through its own informer, so
+// dropping the self-bump here does not starve it.
+type nodeLinkRetriggerSelfFilter struct{}
+
+func (nodeLinkRetriggerSelfFilter) Create(event.CreateEvent) bool   { return true }
+func (nodeLinkRetriggerSelfFilter) Delete(event.DeleteEvent) bool   { return true }
+func (nodeLinkRetriggerSelfFilter) Generic(event.GenericEvent) bool { return true }
+
+// Update drops the event when the only change between old and new is the
+// nodeLinkRetriggerAnnotation value (including its addition or removal).
+// The annotation bump is a metadata-only patch: spec (generation) is
+// unchanged and every other annotation is identical, so the self-bump is
+// dropped and the requeueAfterNodeLink requeue drives the next attempt. Any
+// spec change (generation bump) or other annotation change re-triggers.
+func (nodeLinkRetriggerSelfFilter) Update(evt event.UpdateEvent) bool {
+	if evt.ObjectOld == nil || evt.ObjectNew == nil {
+		return true
+	}
+
+	oldAnn := withoutNodeLinkRetrigger(evt.ObjectOld.GetAnnotations())
+	newAnn := withoutNodeLinkRetrigger(evt.ObjectNew.GetAnnotations())
+
+	return !maps.Equal(oldAnn, newAnn) ||
+		evt.ObjectOld.GetGeneration() != evt.ObjectNew.GetGeneration()
+}
+
+// withoutNodeLinkRetrigger returns a copy of annotations with the
+// nodeLinkRetriggerAnnotation key removed. A nil map is treated as empty so
+// the caller can compare copies with maps.Equal without special-casing nil.
+func withoutNodeLinkRetrigger(annotations map[string]string) map[string]string {
+	if len(annotations) == 0 {
+		return map[string]string{}
+	}
+
+	filtered := make(map[string]string, len(annotations))
+	for k, v := range annotations {
+		if k == nodeLinkRetriggerAnnotation {
+			continue
+		}
+
+		filtered[k] = v
+	}
+
+	return filtered
+}
 
 // ByotMachineReconciler reconciles a ByotMachine object.
 type ByotMachineReconciler struct {
@@ -114,7 +178,7 @@ func (r *ByotMachineReconciler) SetupWithManager(
 	options ctrlcontroller.Options,
 ) error {
 	err := ctrl.NewControllerManagedBy(manager).
-		For(&infrav1.ByotMachine{}).
+		For(&infrav1.ByotMachine{}, builder.WithPredicates(nodeLinkRetriggerSelfFilter{})).
 		WithOptions(options).
 		Complete(r)
 	if err != nil {
