@@ -173,13 +173,7 @@ func restartService(ctx context.Context, publicIP string, talosConfig []byte, se
 }
 
 // serviceRunning reports whether the given Talos service is currently in the
-// Running state on the machine at publicIP. Used by the split-re-adopt kubelet
-// nudge to avoid restarting a kubelet that is still booting: a fresh
-// maintenance-mode adoption reboots the machine, and a stale-cache reconcile
-// may see bundleMatch=true before the kubelet is back up. Restarting a
-// not-yet-running service fails and records a spurious warning, so the nudge
-// is skipped instead. A Running kubelet holding a Node deleted by Cluster API
-// (splitPolicy=None round-trip) is restarted so it re-registers.
+// Running state on the machine.
 func serviceRunning(ctx context.Context, publicIP string, talosConfig []byte, serviceID string) (bool, error) {
 	client, err := authenticatedClient(ctx, publicIP, talosConfig)
 	if err != nil {

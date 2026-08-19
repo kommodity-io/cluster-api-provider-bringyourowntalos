@@ -78,15 +78,6 @@ const (
 	nodeLinkRetriggerAnnotation = "infrastructure.cluster.x-k8s.io/node-link-retrigger"
 )
 
-// nodeLinkRetriggerSelfFilter is a watch predicate that drops Update events
-// whose only change is the nodeLinkRetriggerAnnotation. The ByotMachine
-// reconciler bumps that annotation to retrigger the owning CAPI Machine's
-// node-link, then requeues after requeueAfterNodeLink. Without this filter
-// every bump re-triggers the ByotMachine's own watch and the reconcile
-// hot-loops on the patch round-trip instead of waiting for the requeue. The
-// owning Machine controller watches ByotMachine through its own informer, so
-// dropping the self-bump here does not starve it.
-
 // MachineAdoptedCondition reports whether the machine configuration has been
 // applied to the adopted machine.
 const MachineAdoptedCondition clusterv1.ConditionType = "MachineAdopted"
@@ -109,11 +100,7 @@ const KubeletRestartNudgeCondition clusterv1.ConditionType = "KubeletRestartNudg
 // nodeLinkRetriggerSelfFilter is a watch predicate that drops Update events
 // whose only change is the nodeLinkRetriggerAnnotation. The ByotMachine
 // reconciler bumps that annotation to retrigger the owning CAPI Machine's
-// node-link, then requeues after requeueAfterNodeLink. Without this filter
-// every bump re-triggers the ByotMachine's own watch and the reconcile
-// hot-loops on the patch round-trip instead of waiting for the requeue. The
-// owning Machine controller watches ByotMachine through its own informer, so
-// dropping the self-bump here does not starve it.
+// node-link, then requeues after requeueAfterNodeLink.
 type nodeLinkRetriggerSelfFilter struct{}
 
 func (nodeLinkRetriggerSelfFilter) Create(event.CreateEvent) bool   { return true }
@@ -121,11 +108,7 @@ func (nodeLinkRetriggerSelfFilter) Delete(event.DeleteEvent) bool   { return tru
 func (nodeLinkRetriggerSelfFilter) Generic(event.GenericEvent) bool { return true }
 
 // Update drops the event when the only change between old and new is the
-// nodeLinkRetriggerAnnotation value (including its addition or removal).
-// The annotation bump is a metadata-only patch: spec (generation) is
-// unchanged and every other annotation is identical, so the self-bump is
-// dropped and the requeueAfterNodeLink requeue drives the next attempt. Any
-// spec change (generation bump) or other annotation change re-triggers.
+// nodeLinkRetriggerAnnotation value.
 func (nodeLinkRetriggerSelfFilter) Update(evt event.UpdateEvent) bool {
 	if evt.ObjectOld == nil || evt.ObjectNew == nil {
 		return true
@@ -139,8 +122,7 @@ func (nodeLinkRetriggerSelfFilter) Update(evt event.UpdateEvent) bool {
 }
 
 // withoutNodeLinkRetrigger returns a copy of annotations with the
-// nodeLinkRetriggerAnnotation key removed. A nil map is treated as empty so
-// the caller can compare copies with maps.Equal without special-casing nil.
+// nodeLinkRetriggerAnnotation key removed.
 func withoutNodeLinkRetrigger(annotations map[string]string) map[string]string {
 	if len(annotations) == 0 {
 		return map[string]string{}
@@ -396,15 +378,7 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	// re-apply on an already-ready machine needs no restart, and a fresh
 	// maintenance-mode adoption reboots so the kubelet starts on boot.
 	//
-	// The nudge only restarts a kubelet that is already Running. A stale
-	// reconcile during a fresh-adoption reboot can see bundleMatch=true
-	// before the kubelet is back up, and restarting a not-yet-running
-	// service would record a spurious warning; skipping lets the kubelet
-	// register on boot. The running check also covers the splitPolicy=None
-	// round-trip, where the ByotMachine is deleted and recreated by Helm
-	// with no prior config hash: the host still carries the bundle
-	// (bundleMatch=true) and its kubelet is Running with a now-deleted Node,
-	// so the restart re-registers it.
+	// The nudge only restarts a kubelet that is already Running.
 	//
 	// Its failure never reverts a successful adoption: the configuration
 	// apply already succeeded and the kubelet (re)starts on boot. A
@@ -508,13 +482,7 @@ func nudgeKubeletAfterSplitReadopt(
 		return
 	}
 
-	// Only restart a kubelet that is already Running. A fresh
-	// maintenance-mode adoption reboots the machine, and a stale-cache
-	// reconcile may see bundleMatch=true before the kubelet is back up;
-	// restarting a not-yet-running service records a spurious warning, so
-	// the nudge is skipped and the kubelet registers on boot. A Running
-	// kubelet holding a Node deleted by Cluster API (splitPolicy=None
-	// round-trip) is restarted so it re-registers.
+	// Only restart a kubelet that is already Running.
 	isRunning, err := running(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
 	if err != nil {
 		// A probe failure is non-fatal: the kubelet registers on boot
