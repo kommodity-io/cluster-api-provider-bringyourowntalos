@@ -318,7 +318,6 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	}
 
 	wasReady := byotMachine.Status.Ready
-	previouslyAdopted := byotMachine.Status.LastAppliedConfigSHA != ""
 
 	err = applyMachineConfig(ctx, byotMachine.Spec.PublicIP, machineConfig, talosConfig)
 	if err != nil {
@@ -329,17 +328,26 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	// (splitPolicy=None): the machine keeps its config and datastore, the
 	// Node was deleted by Cluster API, and the kubelet only re-registers it
 	// on restart. It runs solely when the machine was adopted via an
-	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that
-	// had already been adopted before (its config hash was set): a fresh
-	// maintenance-mode adoption is excluded, since the kubelet starts on
-	// boot and the machine reboots right after the apply.
+	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine: a
+	// re-apply on an already-ready machine needs no restart, and a fresh
+	// maintenance-mode adoption reboots so the kubelet starts on boot.
+	//
+	// The nudge only restarts a kubelet that is already Running. A stale
+	// reconcile during a fresh-adoption reboot can see bundleMatch=true
+	// before the kubelet is back up, and restarting a not-yet-running
+	// service would record a spurious warning; skipping lets the kubelet
+	// register on boot. The running check also covers the splitPolicy=None
+	// round-trip, where the ByotMachine is deleted and recreated by Helm
+	// with no prior config hash: the host still carries the bundle
+	// (bundleMatch=true) and its kubelet is Running with a now-deleted Node,
+	// so the restart re-registers it.
 	//
 	// Its failure never reverts a successful adoption: the configuration
 	// apply already succeeded and the kubelet (re)starts on boot. A
 	// transient failure (machine rebooting after its first apply, service
 	// not yet defined) is recorded as a warning and self-heals when the
 	// kubelet comes up.
-	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, previouslyAdopted, restartService)
+	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, serviceRunning, restartService)
 
 	markAdopted(byotMachine, configHash)
 
@@ -413,29 +421,57 @@ func (r *ByotMachineReconciler) ensureNodeLinked(
 
 // nudgeKubeletAfterSplitReadopt restarts the kubelet so a Node deleted during
 // a splitPolicy=None split re-registers, when the machine was re-adopted via
-// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that had
-// already been adopted before (previouslyAdopted). The restart is best-effort:
-// its failure is recorded as a warning condition and never reverts the
-// adoption, because the configuration apply already succeeded and the kubelet
-// (re)starts on boot regardless. A fresh maintenance-mode adoption is excluded
-// (previouslyAdopted=false), since its kubelet starts on boot. restart is
-// injected so the non-fatal path is unit-testable without a live Talos API.
+// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine. The
+// restart is best-effort: its failure is recorded as a warning condition and
+// never reverts the adoption, because the configuration apply already
+// succeeded and the kubelet (re)starts on boot regardless. A fresh
+// maintenance-mode adoption is excluded by the running probe: its kubelet
+// starts on boot, and restarting a not-yet-running service would only record a
+// spurious warning. running and restart are injected so the non-fatal path is
+// unit-testable without a live Talos API.
 func nudgeKubeletAfterSplitReadopt(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
 	talosConfig []byte,
 	bundleMatch bool,
 	wasReady bool,
-	previouslyAdopted bool,
+	running func(context.Context, string, []byte, string) (bool, error),
 	restart func(context.Context, string, []byte, string) error,
 ) {
 	logger := log.FromContext(ctx)
 
-	if !bundleMatch || wasReady || !previouslyAdopted {
+	if !bundleMatch || wasReady {
 		return
 	}
 
-	err := restart(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	// Only restart a kubelet that is already Running. A fresh
+	// maintenance-mode adoption reboots the machine, and a stale-cache
+	// reconcile may see bundleMatch=true before the kubelet is back up;
+	// restarting a not-yet-running service records a spurious warning, so
+	// the nudge is skipped and the kubelet registers on boot. A Running
+	// kubelet holding a Node deleted by Cluster API (splitPolicy=None
+	// round-trip) is restarted so it re-registers.
+	isRunning, err := running(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	if err != nil {
+		// A probe failure is non-fatal: the kubelet registers on boot
+		// regardless. Record nothing to avoid a spurious condition.
+		logger.Info("Skipping kubelet restart nudge; service probe failed (non-fatal)",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP,
+			"error", err.Error())
+
+		return
+	}
+
+	if !isRunning {
+		logger.Info("Skipping kubelet restart nudge; kubelet not yet running (will register on boot)",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP)
+
+		return
+	}
+
+	err = restart(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
 	if err != nil {
 		conditions.MarkFalse(
 			byotMachine,
