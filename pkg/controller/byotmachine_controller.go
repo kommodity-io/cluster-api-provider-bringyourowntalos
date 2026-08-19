@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"time"
 
@@ -20,9 +21,11 @@ import (
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -94,6 +97,49 @@ const JoinPreflightCondition clusterv1.ConditionType = "JoinPreflight"
 // succeeded and the kubelet (re)starts on boot regardless.
 const KubeletRestartNudgeCondition clusterv1.ConditionType = "KubeletRestartNudge"
 
+// nodeLinkRetriggerSelfFilter is a watch predicate that drops Update events
+// whose only change is the nodeLinkRetriggerAnnotation. The ByotMachine
+// reconciler bumps that annotation to retrigger the owning CAPI Machine's
+// node-link, then requeues after requeueAfterNodeLink.
+type nodeLinkRetriggerSelfFilter struct{}
+
+func (nodeLinkRetriggerSelfFilter) Create(event.CreateEvent) bool   { return true }
+func (nodeLinkRetriggerSelfFilter) Delete(event.DeleteEvent) bool   { return true }
+func (nodeLinkRetriggerSelfFilter) Generic(event.GenericEvent) bool { return true }
+
+// Update drops the event when the only change between old and new is the
+// nodeLinkRetriggerAnnotation value.
+func (nodeLinkRetriggerSelfFilter) Update(evt event.UpdateEvent) bool {
+	if evt.ObjectOld == nil || evt.ObjectNew == nil {
+		return true
+	}
+
+	oldAnn := withoutNodeLinkRetrigger(evt.ObjectOld.GetAnnotations())
+	newAnn := withoutNodeLinkRetrigger(evt.ObjectNew.GetAnnotations())
+
+	return !maps.Equal(oldAnn, newAnn) ||
+		evt.ObjectOld.GetGeneration() != evt.ObjectNew.GetGeneration()
+}
+
+// withoutNodeLinkRetrigger returns a copy of annotations with the
+// nodeLinkRetriggerAnnotation key removed.
+func withoutNodeLinkRetrigger(annotations map[string]string) map[string]string {
+	if len(annotations) == 0 {
+		return map[string]string{}
+	}
+
+	filtered := make(map[string]string, len(annotations))
+	for k, v := range annotations {
+		if k == nodeLinkRetriggerAnnotation {
+			continue
+		}
+
+		filtered[k] = v
+	}
+
+	return filtered
+}
+
 // ByotMachineReconciler reconciles a ByotMachine object.
 type ByotMachineReconciler struct {
 	Client ctrlclient.Client
@@ -114,7 +160,7 @@ func (r *ByotMachineReconciler) SetupWithManager(
 	options ctrlcontroller.Options,
 ) error {
 	err := ctrl.NewControllerManagedBy(manager).
-		For(&infrav1.ByotMachine{}).
+		For(&infrav1.ByotMachine{}, builder.WithPredicates(nodeLinkRetriggerSelfFilter{})).
 		WithOptions(options).
 		Complete(r)
 	if err != nil {
@@ -318,7 +364,6 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	}
 
 	wasReady := byotMachine.Status.Ready
-	previouslyAdopted := byotMachine.Status.LastAppliedConfigSHA != ""
 
 	err = applyMachineConfig(ctx, byotMachine.Spec.PublicIP, machineConfig, talosConfig)
 	if err != nil {
@@ -329,17 +374,18 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	// (splitPolicy=None): the machine keeps its config and datastore, the
 	// Node was deleted by Cluster API, and the kubelet only re-registers it
 	// on restart. It runs solely when the machine was adopted via an
-	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that
-	// had already been adopted before (its config hash was set): a fresh
-	// maintenance-mode adoption is excluded, since the kubelet starts on
-	// boot and the machine reboots right after the apply.
+	// authenticated apply (bundleMatch) on a not-yet-ready ByotMachine: a
+	// re-apply on an already-ready machine needs no restart, and a fresh
+	// maintenance-mode adoption reboots so the kubelet starts on boot.
+	//
+	// The nudge only restarts a kubelet that is already Running.
 	//
 	// Its failure never reverts a successful adoption: the configuration
 	// apply already succeeded and the kubelet (re)starts on boot. A
 	// transient failure (machine rebooting after its first apply, service
 	// not yet defined) is recorded as a warning and self-heals when the
 	// kubelet comes up.
-	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, previouslyAdopted, restartService)
+	nudgeKubeletAfterSplitReadopt(ctx, byotMachine, talosConfig, bundleMatch, wasReady, serviceRunning, restartService)
 
 	markAdopted(byotMachine, configHash)
 
@@ -413,29 +459,51 @@ func (r *ByotMachineReconciler) ensureNodeLinked(
 
 // nudgeKubeletAfterSplitReadopt restarts the kubelet so a Node deleted during
 // a splitPolicy=None split re-registers, when the machine was re-adopted via
-// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine that had
-// already been adopted before (previouslyAdopted). The restart is best-effort:
-// its failure is recorded as a warning condition and never reverts the
-// adoption, because the configuration apply already succeeded and the kubelet
-// (re)starts on boot regardless. A fresh maintenance-mode adoption is excluded
-// (previouslyAdopted=false), since its kubelet starts on boot. restart is
-// injected so the non-fatal path is unit-testable without a live Talos API.
+// an authenticated apply (bundleMatch) on a not-yet-ready ByotMachine. The
+// restart is best-effort: its failure is recorded as a warning condition and
+// never reverts the adoption, because the configuration apply already
+// succeeded and the kubelet (re)starts on boot regardless. A fresh
+// maintenance-mode adoption is excluded by the running probe: its kubelet
+// starts on boot, and restarting a not-yet-running service would only record a
+// spurious warning. running and restart are injected so the non-fatal path is
+// unit-testable without a live Talos API.
 func nudgeKubeletAfterSplitReadopt(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
 	talosConfig []byte,
 	bundleMatch bool,
 	wasReady bool,
-	previouslyAdopted bool,
+	running func(context.Context, string, []byte, string) (bool, error),
 	restart func(context.Context, string, []byte, string) error,
 ) {
 	logger := log.FromContext(ctx)
 
-	if !bundleMatch || wasReady || !previouslyAdopted {
+	if !bundleMatch || wasReady {
 		return
 	}
 
-	err := restart(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	// Only restart a kubelet that is already Running.
+	isRunning, err := running(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	if err != nil {
+		// A probe failure is non-fatal: the kubelet registers on boot
+		// regardless. Record nothing to avoid a spurious condition.
+		logger.Info("Skipping kubelet restart nudge; service probe failed (non-fatal)",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP,
+			"error", err.Error())
+
+		return
+	}
+
+	if !isRunning {
+		logger.Info("Skipping kubelet restart nudge; kubelet not yet running (will register on boot)",
+			"byotMachine", byotMachine.Name,
+			"publicIP", byotMachine.Spec.PublicIP)
+
+		return
+	}
+
+	err = restart(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
 	if err != nil {
 		conditions.MarkFalse(
 			byotMachine,

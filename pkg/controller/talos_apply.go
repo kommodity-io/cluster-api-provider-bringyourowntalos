@@ -26,6 +26,10 @@ const (
 	// probeTimeout bounds a maintenance-mode probe attempt.
 	probeTimeout = 10 * time.Second
 
+	// talosServiceRunning is the Talos service state reported by ServiceInfo for
+	// a service that is fully up and healthy.
+	talosServiceRunning = "Running"
+
 	// talosLabelState is the STATE system-volume label wiped on reset.
 	talosLabelState = "STATE"
 
@@ -166,6 +170,33 @@ func restartService(ctx context.Context, publicIP string, talosConfig []byte, se
 	}
 
 	return nil
+}
+
+// serviceRunning reports whether the given Talos service is currently in the
+// Running state on the machine.
+func serviceRunning(ctx context.Context, publicIP string, talosConfig []byte, serviceID string) (bool, error) {
+	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+	if err != nil {
+		return false, err
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	defer cancel()
+
+	services, err := client.ServiceInfo(probeCtx, serviceID)
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect service %s on %s: %w", serviceID, publicIP, err)
+	}
+
+	for _, svc := range services {
+		if svc.Service != nil && svc.Service.GetState() == talosServiceRunning {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // resetMachine wipes the machine's STATE and EPHEMERAL system volumes and
