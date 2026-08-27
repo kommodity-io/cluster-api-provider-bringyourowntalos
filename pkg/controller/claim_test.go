@@ -7,7 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -127,7 +126,7 @@ func TestClaimHostClaimsAvailableHost(t *testing.T) {
 	assert.Equal(t, infrav1.HostPhaseClaimed, updated.Status.Phase)
 	require.NotNil(t, updated.Status.ClaimRef)
 	assert.Equal(t, testMachineName, updated.Status.ClaimRef.Name)
-	assert.Equal(t, types.UID(testMachineUID), updated.Status.ClaimRef.UID)
+	assert.Equal(t, testMachineUID, updated.Status.ClaimRef.UID)
 	assert.Contains(t, updated.Finalizers, byotHostFinalizer)
 }
 

@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -388,7 +387,7 @@ func hostCandidate(name string, fd *string, phase infrav1.HostPhase, claimUID st
 	}
 
 	if claimUID != "" {
-		host.Status.ClaimRef = &infrav1.HostClaimRef{UID: types.UID(claimUID)}
+		host.Status.ClaimRef = &infrav1.HostClaimRef{UID: claimUID}
 	}
 
 	return host

@@ -3,7 +3,6 @@ package v1alpha1
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 )
 
@@ -47,8 +46,8 @@ type HostClaimRef struct {
 	Name string `json:"name"`
 	// Namespace of the referent.
 	Namespace string `json:"namespace"`
-	// UID of the referent.
-	UID types.UID `json:"uid"`
+	// UID of the referent (the ByotMachine's UID).
+	UID string `json:"uid"`
 }
 
 // HostCPU holds discovered CPU topology, parsed from the kernel dmesg log.

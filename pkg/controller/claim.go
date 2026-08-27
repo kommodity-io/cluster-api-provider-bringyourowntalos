@@ -91,7 +91,7 @@ func (r *ByotMachineReconciler) verifyExistingClaim(
 		Name:      byotMachine.Status.ResolvedHost,
 	}, host)
 
-	if err == nil && host.Status.ClaimRef != nil && host.Status.ClaimRef.UID == byotMachine.UID {
+	if err == nil && host.Status.ClaimRef != nil && host.Status.ClaimRef.UID == string(byotMachine.UID) {
 		// Keep the resolved IP in sync (the host IP is immutable, so this
 		// only heals a stale status).
 		if byotMachine.Status.ResolvedPublicIP != host.Spec.PublicIP {
@@ -142,7 +142,7 @@ func (r *ByotMachineReconciler) resolveClaimCandidate(
 			return nil, ErrNoHostAvailable
 		}
 
-		if host.Status.ClaimRef != nil && host.Status.ClaimRef.UID != byotMachine.UID {
+		if host.Status.ClaimRef != nil && host.Status.ClaimRef.UID != string(byotMachine.UID) {
 			return nil, ErrNoHostAvailable
 		}
 
@@ -195,7 +195,7 @@ func filterClaimCandidates(hosts []infrav1.ByotHost, byotMachine *infrav1.ByotMa
 			continue
 		}
 
-		if host.Status.ClaimRef != nil && host.Status.ClaimRef.UID != byotMachine.UID {
+		if host.Status.ClaimRef != nil && host.Status.ClaimRef.UID != string(byotMachine.UID) {
 			continue
 		}
 
@@ -226,7 +226,7 @@ func (r *ByotMachineReconciler) claimCAS(
 		return err
 	}
 
-	if latest.Status.ClaimRef != nil && latest.Status.ClaimRef.UID != byotMachine.UID {
+	if latest.Status.ClaimRef != nil && latest.Status.ClaimRef.UID != string(byotMachine.UID) {
 		return ErrNoHostAvailable
 	}
 
@@ -234,7 +234,7 @@ func (r *ByotMachineReconciler) claimCAS(
 		Kind:      "ByotMachine",
 		Name:      byotMachine.Name,
 		Namespace: byotMachine.Namespace,
-		UID:       byotMachine.UID,
+		UID:       string(byotMachine.UID),
 	}
 	latest.Status.Phase = infrav1.HostPhaseClaimed
 
