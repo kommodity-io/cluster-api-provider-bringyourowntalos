@@ -1,5 +1,5 @@
 CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.3
-GOLANGCI_LINT ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.1.6
+GOLANGCI_LINT ?= go tool golangci-lint
 
 .PHONY: generate
 generate: ## Generate deepcopy methods and CRDs.

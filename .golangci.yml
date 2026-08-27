@@ -12,6 +12,10 @@ linters:
     - ireturn
     # Verbose wrapping with little value on generated-style getters.
     - wrapcheck
+    # Repo style uses inline `if err := ...; err != nil` throughout.
+    - noinlineerr
+    # Repo style omits the blank line after embedded fields.
+    - embeddedstructfieldcheck
   exclusions:
     rules:
       # Kubebuilder-style API packages require globals, init registration and
