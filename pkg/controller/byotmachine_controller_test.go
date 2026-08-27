@@ -30,24 +30,55 @@ const (
 	testClusterName = "test-cluster"
 	testMachineName = "test-machine"
 	testNamespace  = "default"
-	testMachineUID  = "machine-uid"
+	testMachineUID = "machine-uid"
+	testHostName   = "test-host"
 )
 
 func clusterKey(obj metav1.Object) types.NamespacedName {
 	return types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
 }
 
+// newByotMachine builds a ByotMachine that has already claimed test-host
+// (resolvedHost/resolvedPublicIP set) so adoption-target tests can proceed
+// past the claim step. publicIP is the resolved host IP.
 func newByotMachine(publicIP string) *infrav1.ByotMachine {
 	return &infrav1.ByotMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      testMachineName,
 			Namespace: testNamespace,
+			UID:       testMachineUID,
 			Labels: map[string]string{
 				clusterv1.ClusterNameLabel: testClusterName,
 			},
 		},
 		Spec: infrav1.ByotMachineSpec{
-			PublicIP: publicIP,
+			HostRef: &infrav1.LocalObjectReference{Name: testHostName},
+		},
+		Status: infrav1.ByotMachineStatus{
+			ResolvedHost:     testHostName,
+			ResolvedPublicIP: publicIP,
+		},
+	}
+}
+
+// newClaimedByotHost builds the ByotHost claimed by newByotMachine: phase
+// Claimed, claimRef pointing at the test ByotMachine, spec.publicIP set.
+func newClaimedByotHost(publicIP string) *infrav1.ByotHost {
+	return &infrav1.ByotHost{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testHostName,
+			Namespace: testNamespace,
+			Finalizers: []string{byotHostFinalizer},
+		},
+		Spec: infrav1.ByotHostSpec{PublicIP: publicIP},
+		Status: infrav1.ByotHostStatus{
+			Phase: infrav1.HostPhaseClaimed,
+			ClaimRef: &infrav1.HostClaimRef{
+				Kind:      "ByotMachine",
+				Name:      testMachineName,
+				Namespace: testNamespace,
+				UID:       testMachineUID,
+			},
 		},
 	}
 }
@@ -163,13 +194,14 @@ func TestByotMachineReconcileNoOpWhenConfigUnchanged(t *testing.T) {
 	currentHash := sha256HexOf(configData)
 
 	byotMachine := newAdoptedByotMachine("203.0.113.10", currentHash)
+	host := newClaimedByotHost("203.0.113.10")
 	machine := newOwningMachine("test-bootstrap")
 	machine.Status.NodeRef = &corev1.ObjectReference{Name: "test-node"} // node already linked
 	secret := newBootstrapSecret("test-bootstrap", "default", configData)
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(byotMachine, machine, secret).
+		WithObjects(byotMachine, host, machine, secret).
 		WithStatusSubresource(&infrav1.ByotMachine{}).
 		Build()
 
@@ -192,12 +224,13 @@ func TestByotMachineReconcileRequeuesWhenClusterTalosConfigMissing(t *testing.T)
 	require.NoError(t, err)
 
 	byotMachine := newAdoptedByotMachine("203.0.113.10", "stale-hash")
+	host := newClaimedByotHost("203.0.113.10")
 	machine := newOwningMachine("test-bootstrap")
 	secret := newBootstrapSecret("test-bootstrap", "default", []byte("new-config"))
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(byotMachine, machine, secret).
+		WithObjects(byotMachine, host, machine, secret).
 		WithStatusSubresource(&infrav1.ByotMachine{}).
 		Build()
 
@@ -223,13 +256,13 @@ func TestByotMachineReconcileDeleteBlocksUntilResetSucceeds(t *testing.T) {
 	// 127.0.0.1 refuses the Talos API connection immediately: the reset
 	// fails fast and deletion must stay blocked with the finalizer retained.
 	byotMachine := newByotMachine("127.0.0.1")
+	host := newClaimedByotHost("127.0.0.1")
 	byotMachine.Finalizers = []string{byotMachineFinalizer}
-	byotMachine.Spec.SplitPolicy = infrav1.MachinePolicyReset
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(byotMachine).
-		WithStatusSubresource(byotMachine).
+		WithObjects(byotMachine, host).
+		WithStatusSubresource(byotMachine, host).
 		Build()
 
 	reconciler := NewByotMachineReconciler(client)
@@ -258,10 +291,11 @@ func TestByotMachineReconcileDeleteReleasesWithoutReset(t *testing.T) {
 	err := clusterv1.AddToScheme(scheme)
 	require.NoError(t, err)
 
-	// splitPolicy=None (the CRD default; fake client does not apply CRD
-	// defaults, so the zero value takes the None path): deletion releases
-	// the machine without touching it.
+	// A ByotMachine that never claimed a host is removed immediately on
+	// delete (no host to reset).
 	byotMachine := newByotMachine("127.0.0.1")
+	byotMachine.Status.ResolvedHost = ""
+	byotMachine.Status.ResolvedPublicIP = ""
 	byotMachine.Finalizers = []string{byotMachineFinalizer}
 
 	client := fake.NewClientBuilder().
@@ -300,6 +334,7 @@ func TestByotMachineReconcileJoinPreflightFailsWithoutCredentials(t *testing.T) 
 	// and no foreign talosconfig reference exists. The join preflight must
 	// fail with NoCredentials instead of blindly applying configuration.
 	byotMachine := newByotMachine("127.0.0.1")
+	host := newClaimedByotHost("127.0.0.1")
 	byotMachine.OwnerReferences = []metav1.OwnerReference{
 		{
 			APIVersion: clusterv1.GroupVersion.String(),
@@ -314,8 +349,8 @@ func TestByotMachineReconcileJoinPreflightFailsWithoutCredentials(t *testing.T) 
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(byotMachine, machine, secret, cluster).
-		WithStatusSubresource(&infrav1.ByotMachine{}).
+		WithObjects(byotMachine, host, machine, secret, cluster).
+		WithStatusSubresource(&infrav1.ByotMachine{}, &infrav1.ByotHost{}).
 		Build()
 
 	reconciler := NewByotMachineReconciler(client)
@@ -386,19 +421,6 @@ func TestResetCredentialCandidatesInsecureOnly(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, candidates, 1)
 	assert.Nil(t, candidates[0])
-}
-
-func TestWithoutInsecure(t *testing.T) {
-	t.Parallel()
-
-	creds := [][]byte{[]byte("a"), []byte("b"), nil}
-	trimmed := withoutInsecure(creds)
-	assert.Len(t, trimmed, 2)
-
-	noTrailing := [][]byte{[]byte("a")}
-	assert.Len(t, withoutInsecure(noTrailing), 1)
-
-	assert.Empty(t, withoutInsecure([][]byte{nil}))
 }
 
 func TestAttemptResetWithoutCredentials(t *testing.T) {

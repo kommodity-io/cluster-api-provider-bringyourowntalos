@@ -13,7 +13,6 @@ import (
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
@@ -52,10 +51,6 @@ const (
 	// to come back in maintenance mode after a reset.
 	requeueAfterResetIssued = 10 * time.Second
 
-	// resetRateLimitWindow is the minimum delay between two reset issues
-	// against the same machine.
-	resetRateLimitWindow = 90 * time.Second
-
 	// clusterNameLabel is the CAPI label carrying the owning cluster name.
 	clusterNameLabel = "cluster.x-k8s.io/cluster-name"
 
@@ -82,13 +77,9 @@ const (
 // applied to the adopted machine.
 const MachineAdoptedCondition clusterv1.ConditionType = "MachineAdopted"
 
-// ResetPerformedCondition reports the state of a machine reset requested via
-// spec.joinPolicy=Reset or executed during deletion.
-const ResetPerformedCondition clusterv1.ConditionType = "ResetPerformed"
-
 // JoinPreflightCondition reports the outcome of the join preflight: whether
-// the machine is safe to adopt with spec.joinPolicy=None, i.e. it is in
-// maintenance mode or already carries this cluster's PKI bundle.
+// the machine is in maintenance mode (adoptable via the insecure client) or
+// already carries this cluster's PKI bundle (re-adoptable via mTLS).
 const JoinPreflightCondition clusterv1.ConditionType = "JoinPreflight"
 
 // KubeletRestartNudgeCondition reports the outcome of the best-effort kubelet
@@ -222,21 +213,21 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 		return *wait, nil
 	}
 
+	// Claim a ByotHost before adopting. The host's public IP is the adoption
+	// target; claiming is idempotent once resolvedHost is set.
+	claimResult, handled, err := r.claimHost(ctx, byotMachine, patchHelper)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if handled {
+		return claimResult, nil
+	}
+
 	configHash := sha256Hex(machineConfig)
 
 	if configUnchanged(byotMachine, configHash) {
 		return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
-	}
-
-	if byotMachine.Spec.JoinPolicy == infrav1.MachinePolicyReset && !byotMachine.Status.Ready {
-		result, handled, err := r.ensureJoinReset(ctx, patchHelper, byotMachine)
-		if err != nil {
-			return result, err
-		}
-
-		if handled {
-			return result, nil
-		}
 	}
 
 	return r.applyAndMarkAdopted(ctx, patchHelper, machine, byotMachine, machineConfig, configHash)
@@ -257,14 +248,6 @@ func (r *ByotMachineReconciler) resolveApplyAuth(
 	machine *clusterv1.Machine,
 	byotMachine *infrav1.ByotMachine,
 ) ([]byte, bool, *ctrl.Result, error) {
-	// A reset machine confirmed in maintenance mode has no PKI: apply with
-	// the insecure client, ignoring spec.talosConfigSecretRef.
-	if byotMachine.Spec.JoinPolicy == infrav1.MachinePolicyReset &&
-		!byotMachine.Status.Ready &&
-		conditions.IsTrue(byotMachine, ResetPerformedCondition) {
-		return nil, false, nil, nil
-	}
-
 	// Re-application on an already-adopted machine: use the cluster's own
 	// talosconfig (the machine carries our PKI since its first apply).
 	if byotMachine.Status.Ready {
@@ -306,7 +289,7 @@ func (r *ByotMachineReconciler) preflightJoin(
 	machine *clusterv1.Machine,
 	byotMachine *infrav1.ByotMachine,
 ) ([]byte, bool, *ctrl.Result, error) {
-	publicIP := byotMachine.Spec.PublicIP
+	publicIP := byotMachine.Status.ResolvedPublicIP
 
 	if probeMaintenance(ctx, publicIP) {
 		conditions.Set(byotMachine, &clusterv1.Condition{
@@ -365,7 +348,7 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 
 	wasReady := byotMachine.Status.Ready
 
-	err = applyMachineConfig(ctx, byotMachine.Spec.PublicIP, machineConfig, talosConfig)
+	err = applyMachineConfig(ctx, byotMachine.Status.ResolvedPublicIP, machineConfig, talosConfig)
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
@@ -394,7 +377,7 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine: %w", err)
 	}
 
-	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
+	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP)
 
 	return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
 }
@@ -483,13 +466,13 @@ func nudgeKubeletAfterSplitReadopt(
 	}
 
 	// Only restart a kubelet that is already Running.
-	isRunning, err := running(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	isRunning, err := running(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig, kubeletServiceID)
 	if err != nil {
 		// A probe failure is non-fatal: the kubelet registers on boot
 		// regardless. Record nothing to avoid a spurious condition.
 		logger.Info("Skipping kubelet restart nudge; service probe failed (non-fatal)",
 			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Spec.PublicIP,
+			"publicIP", byotMachine.Status.ResolvedPublicIP,
 			"error", err.Error())
 
 		return
@@ -498,12 +481,12 @@ func nudgeKubeletAfterSplitReadopt(
 	if !isRunning {
 		logger.Info("Skipping kubelet restart nudge; kubelet not yet running (will register on boot)",
 			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Spec.PublicIP)
+			"publicIP", byotMachine.Status.ResolvedPublicIP)
 
 		return
 	}
 
-	err = restart(ctx, byotMachine.Spec.PublicIP, talosConfig, kubeletServiceID)
+	err = restart(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig, kubeletServiceID)
 	if err != nil {
 		conditions.MarkFalse(
 			byotMachine,
@@ -516,7 +499,7 @@ func nudgeKubeletAfterSplitReadopt(
 
 		logger.Info("Kubelet restart nudge failed (non-fatal); kubelet registers on boot",
 			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Spec.PublicIP,
+			"publicIP", byotMachine.Status.ResolvedPublicIP,
 			"error", err.Error())
 
 		return
@@ -526,14 +509,14 @@ func nudgeKubeletAfterSplitReadopt(
 
 	logger.Info("Kubelet restarted after split re-adoption",
 		"byotMachine", byotMachine.Name,
-		"publicIP", byotMachine.Spec.PublicIP)
+		"publicIP", byotMachine.Status.ResolvedPublicIP)
 }
 
-// reconcileDelete releases the machine. With spec.splitPolicy=None (default)
-// the machine is only removed from management and keeps its configuration and
-// datastore intact. With spec.splitPolicy=Reset the machine is wiped (STATE
-// and EPHEMERAL volumes) before being released; deletion blocks until the
-// reset succeeds, guaranteeing the machine leaves the cluster wiped.
+// reconcileDelete releases the claimed ByotHost. Release always resets the
+// host (STATE + EPHEMERAL) back to maintenance so it returns to the registry
+// for re-claim; the ByotHost liveness loop flips Releasing → Available once
+// maintenance answers. Deletion blocks until the reset is issued. A
+// ByotMachine that never claimed a host is removed immediately.
 func (r *ByotMachineReconciler) reconcileDelete(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
@@ -544,22 +527,25 @@ func (r *ByotMachineReconciler) reconcileDelete(
 		return ctrl.Result{}, nil
 	}
 
-	if byotMachine.Spec.SplitPolicy == infrav1.MachinePolicyReset {
-		err := r.resetWithResolvedAuth(ctx, byotMachine)
+	if byotMachine.Status.ResolvedHost != "" {
+		err := r.releaseHost(ctx, byotMachine)
 		if err != nil {
-			logger.Info("Reset on delete failed, retrying",
+			logger.Info("Release reset failed, retrying",
 				"byotMachine", byotMachine.Name,
-				"publicIP", byotMachine.Spec.PublicIP,
+				"byotHost", byotMachine.Status.ResolvedHost,
+				"publicIP", byotMachine.Status.ResolvedPublicIP,
 				"error", err.Error())
 
 			return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, nil
 		}
 
-		logger.Info("Machine reset and released", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
+		logger.Info("Host reset to maintenance and released",
+				"byotMachine", byotMachine.Name,
+				"byotHost", byotMachine.Status.ResolvedHost,
+				"publicIP", byotMachine.Status.ResolvedPublicIP)
 	} else {
-		logger.Info("Machine released without reset (splitPolicy None)",
-			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Spec.PublicIP)
+		logger.Info("Machine released (no claimed host)",
+				"byotMachine", byotMachine.Name)
 	}
 
 	if controllerutil.RemoveFinalizer(byotMachine, byotMachineFinalizer) {
@@ -570,23 +556,6 @@ func (r *ByotMachineReconciler) reconcileDelete(
 	}
 
 	return ctrl.Result{}, nil
-}
-
-// resetWithResolvedAuth resets the machine using the first working
-// credential, in order: spec.talosConfigSecretRef, the cluster's own
-// talosconfig, then an insecure client for machines still in maintenance mode.
-func (r *ByotMachineReconciler) resetWithResolvedAuth(
-	ctx context.Context,
-	byotMachine *infrav1.ByotMachine,
-) error {
-	publicIP := byotMachine.Spec.PublicIP
-
-	candidates, err := r.resetCredentialCandidates(ctx, byotMachine)
-	if err != nil {
-		return err
-	}
-
-	return attemptReset(ctx, candidates, publicIP)
 }
 
 // attemptReset tries each credential candidate (a nil candidate selects the
@@ -643,104 +612,6 @@ func (r *ByotMachineReconciler) resetCredentialCandidates(
 	}
 
 	return append(candidates, nil), nil
-}
-
-// ensureJoinReset performs the pre-adoption reset when spec.joinPolicy is
-// Reset. handled is true when the caller must return the given result instead
-// of proceeding to the configuration apply.
-func (r *ByotMachineReconciler) ensureJoinReset(
-	ctx context.Context,
-	patchHelper *patch.Helper,
-	byotMachine *infrav1.ByotMachine,
-) (ctrl.Result, bool, error) {
-	logger := log.FromContext(ctx)
-
-	if probeMaintenance(ctx, byotMachine.Spec.PublicIP) {
-		// The machine is in maintenance mode: any previously applied
-		// configuration is gone.
-		byotMachine.Status.LastAppliedConfigSHA = ""
-
-		conditions.MarkTrue(byotMachine, ResetPerformedCondition)
-
-		err := patchHelper.Patch(ctx, byotMachine)
-		if err != nil {
-			return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after reset confirmation: %w", err)
-		}
-
-		logger.Info("Reset confirmed, machine in maintenance mode", "byotMachine", byotMachine.Name)
-
-		return ctrl.Result{}, false, nil
-	}
-
-	if lastReset := byotMachine.Status.LastResetAt; lastReset != nil && time.Since(lastReset.Time) < resetRateLimitWindow {
-		return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, true, nil
-	}
-
-	candidates, err := r.resetCredentialCandidates(ctx, byotMachine)
-	if err != nil {
-		return ctrl.Result{}, true, err
-	}
-
-	resetErr := attemptReset(ctx, withoutInsecure(candidates), byotMachine.Spec.PublicIP)
-	if resetErr != nil {
-		return ctrl.Result{}, true, r.recordResetFailure(ctx, patchHelper, byotMachine, resetErr)
-	}
-
-	now := metav1.Now()
-	byotMachine.Status.LastResetAt = &now
-
-	conditions.MarkFalse(
-		byotMachine,
-		ResetPerformedCondition,
-		"ResetInProgress",
-		clusterv1.ConditionSeverityInfo,
-		"reset issued, waiting for maintenance mode",
-	)
-
-	err = patchHelper.Patch(ctx, byotMachine)
-	if err != nil {
-		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after reset issued: %w", err)
-	}
-
-	logger.Info("Reset issued to machine", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Spec.PublicIP)
-
-	return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, true, nil
-}
-
-// withoutInsecure drops the trailing nil (insecure maintenance) candidate: a
-// configured machine must be reset via authenticated credentials before
-// adoption.
-func withoutInsecure(candidates [][]byte) [][]byte {
-	if len(candidates) > 0 && candidates[len(candidates)-1] == nil {
-		return candidates[:len(candidates)-1]
-	}
-
-	return candidates
-}
-
-// recordResetFailure marks the reset condition false, persists it, and
-// returns the reset error as the reconcile failure.
-func (r *ByotMachineReconciler) recordResetFailure(
-	ctx context.Context,
-	patchHelper *patch.Helper,
-	byotMachine *infrav1.ByotMachine,
-	resetErr error,
-) error {
-	conditions.MarkFalse(
-		byotMachine,
-		ResetPerformedCondition,
-		"ResetFailed",
-		clusterv1.ConditionSeverityWarning,
-		"%s",
-		resetErr.Error(),
-	)
-
-	err := patchHelper.Patch(ctx, byotMachine)
-	if err != nil {
-		return fmt.Errorf("failed to patch ByotMachine after reset failure: %w", err)
-	}
-
-	return resetErr
 }
 
 // adoptionInputs resolves the owner Machine and its bootstrap data. A non-nil
@@ -805,7 +676,7 @@ func (r *ByotMachineReconciler) recordApplyFailure(
 // markAdopted updates the ByotMachine spec and status after a successful
 // machine configuration apply.
 func markAdopted(byotMachine *infrav1.ByotMachine, configHash string) {
-	providerID := infrav1.ProviderIDPrefix + byotMachine.Spec.PublicIP
+	providerID := infrav1.ProviderIDPrefix + byotMachine.Status.ResolvedPublicIP
 
 	byotMachine.Spec.ProviderID = &providerID
 	byotMachine.Status.Ready = true
@@ -813,7 +684,7 @@ func markAdopted(byotMachine *infrav1.ByotMachine, configHash string) {
 	byotMachine.Status.Addresses = []clusterv1.MachineAddress{
 		{
 			Type:    clusterv1.MachineExternalIP,
-			Address: byotMachine.Spec.PublicIP,
+			Address: byotMachine.Status.ResolvedPublicIP,
 		},
 	}
 
@@ -897,7 +768,7 @@ func (r *ByotMachineReconciler) preflightForeignMachine(
 		return nil, nil, err
 	}
 
-	if probeAuthenticated(ctx, byotMachine.Spec.PublicIP, talosConfig) {
+	if probeAuthenticated(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig) {
 		return nil, nil, r.recordPreflightFailure(ctx, patchHelper, byotMachine, "BundleMismatch", ErrJoinBundleMismatch)
 	}
 
