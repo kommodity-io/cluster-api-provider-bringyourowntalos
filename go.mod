@@ -1,6 +1,6 @@
 module github.com/kommodity-io/cluster-api-provider-bringyourowntalos
 
-go 1.26.1
+go 1.26.7
 
 require (
 	github.com/siderolabs/talos/pkg/machinery v1.13.0
