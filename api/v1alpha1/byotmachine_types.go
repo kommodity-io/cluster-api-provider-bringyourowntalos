@@ -86,6 +86,16 @@ type ByotMachineStatus struct {
 	// +optional
 	LastResetAt *metav1.Time `json:"lastResetAt,omitempty"`
 
+	// NodeUpdated records that the controller has patched the workload
+	// cluster Node's spec.providerID to byot://<resolvedPublicIP>. byot has no
+	// cloud-controller-manager, so unlike cloud providers the controller owns
+	// the Machine<->Node providerID linkage: it patches the downstream Node
+	// once after adoption so CAPI's Machine controller can match
+	// Machine.spec.providerID against Node.spec.providerID and set
+	// status.nodeRef. Gated to run once.
+	// +optional
+	NodeUpdated bool `json:"nodeUpdated,omitempty"`
+
 	// Addresses contains the machine's addresses.
 	// +optional
 	Addresses []clusterv1.MachineAddress `json:"addresses,omitempty"`
