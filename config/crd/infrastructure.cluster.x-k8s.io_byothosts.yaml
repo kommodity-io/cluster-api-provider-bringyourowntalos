@@ -226,7 +226,6 @@ spec:
                         required:
                           - name
                           - size
-                          - systemDisk
                           - type
                         type: object
                       type: array
@@ -307,7 +306,10 @@ spec:
                   format: date-time
                   type: string
                 maintenanceMode:
-                  description: MaintenanceMode is the last maintenance-liveness probe result.
+                  description: |-
+                    MaintenanceMode is the last maintenance-liveness probe result.
+                    Absent (the default before the first probe completes) is equivalent to
+                    false: the host is not confirmed in maintenance mode.
                   type: boolean
                 phase:
                   description: Phase is the current lifecycle phase.
@@ -326,8 +328,6 @@ spec:
                 talosVersion:
                   description: TalosVersion is the discovered Talos version (from the Version RPC).
                   type: string
-              required:
-                - maintenanceMode
               type: object
           type: object
       served: true
