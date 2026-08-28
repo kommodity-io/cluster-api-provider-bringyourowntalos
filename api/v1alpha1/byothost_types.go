@@ -72,7 +72,8 @@ type HostDisk struct {
 	// +optional
 	Model string `json:"model,omitempty"`
 	// SystemDisk is true for the Talos system disk.
-	SystemDisk bool `json:"systemDisk"`
+	// +optional
+	SystemDisk bool `json:"systemDisk,omitempty"`
 	// BusPath is the PCI/bus path, when available.
 	// +optional
 	BusPath string `json:"busPath,omitempty"`
@@ -167,7 +168,10 @@ type ByotHostStatus struct {
 	Hardware *HostHardware `json:"hardware,omitempty"`
 
 	// MaintenanceMode is the last maintenance-liveness probe result.
-	MaintenanceMode bool `json:"maintenanceMode"`
+	// Absent (the default before the first probe completes) is equivalent to
+	// false: the host is not confirmed in maintenance mode.
+	// +optional
+	MaintenanceMode bool `json:"maintenanceMode,omitempty"`
 
 	// ClaimRef is set when a ByotMachine has claimed this host.
 	// +optional

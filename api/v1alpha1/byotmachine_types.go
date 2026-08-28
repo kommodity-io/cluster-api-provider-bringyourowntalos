@@ -61,7 +61,7 @@ type ByotMachineStatus struct {
 	// Ready denotes that the machine has been adopted: the machine
 	// configuration was applied successfully over the Talos maintenance API.
 	// +optional
-	Ready bool `json:"ready"`
+	Ready bool `json:"ready,omitempty"`
 
 	// ResolvedHost is the name of the ByotHost this machine has claimed. The
 	// public IP for adoption is read from that host.
