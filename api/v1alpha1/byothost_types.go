@@ -91,6 +91,41 @@ type HostHardware struct {
 	// unavailable in maintenance mode).
 	// +optional
 	NetworkInterfaces []string `json:"networkInterfaces,omitempty"`
+	// GPUs is the discovered GPU summary (count, vendor, model, memory).
+	// Nil when no GPU is present. Mixed models collapse to count+vendor only.
+	// +optional
+	GPUs *HostGPU `json:"gpus,omitempty"`
+}
+
+// HostGPU is the aggregated GPU summary discovered from the PCI bus via the
+// kernel dmesg log. Nodes are assumed homogeneous; a mixed-GPU host keeps
+// count/vendor but omits model and sets Mixed=true.
+type HostGPU struct {
+	// Vendor is the lowercase GPU vendor (nvidia, amd, intel). Omitted when
+	// the host has GPUs from more than one vendor.
+	// +optional
+	Vendor string `json:"vendor,omitempty"`
+	// Model is the normalized model family (e.g. "h100-pcie", "b300-sxm6"),
+	// from the PCI device-id table. Empty for unknown devices or mixed hosts.
+	// +optional
+	Model string `json:"model,omitempty"`
+	// DeviceID is the raw PCI device id (e.g. "2331") for triage of unknown
+	// devices. Empty for mixed hosts (no single id to report).
+	// +optional
+	DeviceID string `json:"deviceId,omitempty"`
+	// MemoryPerGPU is the per-GPU HBM as a resource.Quantity, derived from the
+	// model table (not measured). Zero when the model is unknown or mixed.
+	MemoryPerGPU resource.Quantity `json:"memoryPerGPU"`
+	// Count is the number of discovered GPUs (display-class PCI devices from
+	// a known vendor).
+	Count int32 `json:"count"`
+	// TotalMemory is Count times MemoryPerGPU. Zero when the model is unknown
+	// or mixed.
+	TotalMemory resource.Quantity `json:"totalMemory"`
+	// Mixed is true when the host has GPUs of more than one vendor:device pair.
+	// Model and DeviceID are empty in that case.
+	// +optional
+	Mixed bool `json:"mixed,omitempty"`
 }
 
 // ByotHostSpec defines the desired state of ByotHost. Operators add a host as
@@ -167,6 +202,14 @@ const (
 	HostDiscoveryFailedCondition clusterv1.ConditionType = "DiscoveryFailed"
 )
 
+// ByotHost condition reasons.
+const (
+	// HostDiscoveredReasonMixedGPUModels is set on HostDiscoveredCondition when
+	// discovery found GPUs of more than one vendor:device pair. The host stays
+	// non-Available so a ByotMachine cannot claim a mislabeled mixed node.
+	HostDiscoveredReasonMixedGPUModels = "MixedGPUModels"
+)
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Host phase"
@@ -174,6 +217,7 @@ const (
 // +kubebuilder:printcolumn:name="Talos",type="string",JSONPath=".status.talosVersion",description="Discovered Talos version"
 // +kubebuilder:printcolumn:name="Arch",type="string",JSONPath=".status.arch",description="Discovered architecture"
 // +kubebuilder:printcolumn:name="Claimed",type="string",JSONPath=".status.claimRef.name",description="ByotMachine claiming the host"
+// +kubebuilder:printcolumn:name="GPUs",type="string",JSONPath=".status.hardware.gpus.model",description="Discovered GPU model family"
 // +kubebuilder:printcolumn:name="FailureDomain",type="string",JSONPath=".spec.failureDomain",description="Failure domain"
 // +kubebuilder:resource:shortName=byothost
 // +kubebuilder:resource:shortName=byothosts
