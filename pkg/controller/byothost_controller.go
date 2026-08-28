@@ -23,7 +23,7 @@ import (
 const (
 	// byotHostFinalizer blocks ByotHost deletion while a ByotMachine has
 	// claimed it (status.claimRef set). Delete the owning ByotMachine first.
-	byotHostFinalizer = "byot-host-protection"
+	byotHostFinalizer = "byothost.infrastructure.cluster.x-k8s.io/protection"
 
 	// hostLivenessInterval is the default requeue delay between liveness
 	// probes for an Available host.
