@@ -474,7 +474,7 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 		return ctrl.Result{}, fmt.Errorf("failed to get workload cluster client for %s: %w", clusterKey, err)
 	}
 
-	if _, pErr := r.patchWorkloadNode(ctx, workloadClient, machine, *byotMachine.Spec.ProviderID); pErr != nil {
+	if _, pErr := r.patchWorkloadNode(ctx, workloadClient, byotMachine, *byotMachine.Spec.ProviderID); pErr != nil {
 		if errors.Is(pErr, errWorkloadNodePending) {
 			// Node not registered yet; the kubelet registers on boot. Requeue.
 			return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
@@ -495,25 +495,27 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 	return ctrl.Result{}, nil
 }
 
-// patchWorkloadNode gets the workload Node named after the owning Machine and
-// patches its spec.providerID when it does not already match. It returns
-// alreadySet=true when the Node already carries the providerID (a prior run),
-// so the caller marks status.nodeUpdated without a redundant patch.
-// errWorkloadNodePending means the Node is not registered yet.
+// patchWorkloadNode gets the workload Node named after the ByotMachine
+// (CABPT sets hostname.source=InfrastructureName, so the Node name equals
+// the infrastructureRef name == ByotMachine.Name) and patches its
+// spec.providerID when it does not already match. It returns alreadySet=true
+// when the Node already carries the providerID (a prior run), so the caller
+// marks status.nodeUpdated without a redundant patch. errWorkloadNodePending
+// means the Node is not registered yet.
 func (r *ByotMachineReconciler) patchWorkloadNode(
 	ctx context.Context,
 	workloadClient ctrlclient.Client,
-	machine *clusterv1.Machine,
+	byotMachine *infrav1.ByotMachine,
 	providerID string,
 ) (bool, error) {
 	node := &corev1.Node{}
 
-	if err := workloadClient.Get(ctx, ctrlclient.ObjectKey{Name: machine.Name}, node); err != nil {
+	if err := workloadClient.Get(ctx, ctrlclient.ObjectKey{Name: byotMachine.Name}, node); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, errWorkloadNodePending
 		}
 
-		return false, fmt.Errorf("failed to get workload Node %s: %w", machine.Name, err)
+		return false, fmt.Errorf("failed to get workload Node %s: %w", byotMachine.Name, err)
 	}
 
 	if node.Spec.ProviderID == providerID {
@@ -526,7 +528,7 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 	mergePatch := ctrlclient.RawPatch(types.MergePatchType, []byte(patchBytes))
 
 	if err := workloadClient.Patch(ctx, node, mergePatch); err != nil {
-		return false, fmt.Errorf("failed to patch workload Node %s providerID: %w", machine.Name, err)
+		return false, fmt.Errorf("failed to patch workload Node %s providerID: %w", byotMachine.Name, err)
 	}
 
 	return false, nil
