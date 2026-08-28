@@ -193,7 +193,6 @@ func (r *ByotHostReconciler) reconcileProbing(
 	host.Status.Phase = infrav1.HostPhaseAvailable
 	host.Status.MaintenanceMode = true
 	host.Status.ProbeFailureCount = 0
-	conditions.MarkTrue(host, infrav1.HostDiscoveredCondition)
 	conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
 	applyDiscoveryLabels(host)
 
@@ -260,7 +259,6 @@ func (r *ByotHostReconciler) reconcileUnavailable(
 	host.Status.Phase = infrav1.HostPhaseAvailable
 	host.Status.MaintenanceMode = true
 	host.Status.ProbeFailureCount = 0
-	conditions.MarkTrue(host, infrav1.HostDiscoveredCondition)
 	conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
 	applyDiscoveryLabels(host)
 
@@ -302,7 +300,6 @@ func (r *ByotHostReconciler) reconcileReleasing(
 	host.Status.ClaimRef = nil
 	host.Status.MaintenanceMode = true
 	host.Status.ProbeFailureCount = 0
-	conditions.MarkTrue(host, infrav1.HostDiscoveredCondition)
 	conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
 	applyDiscoveryLabels(host)
 
@@ -395,7 +392,10 @@ func (r *ByotHostReconciler) recordProbeFailure(
 	return ctrl.Result{RequeueAfter: hostProbeRequeue}, nil
 }
 
-// populateFromDiscovery copies a discovery result into the host status.
+// populateFromDiscovery copies a discovery result into the host status and
+// sets the Discovered condition: True on success, False with
+// MixedGPUModels when the host has GPUs of more than one vendor:device pair
+// (a mixed node is not claimable by a single-model selector).
 func (r *ByotHostReconciler) populateFromDiscovery(host *infrav1.ByotHost, result DiscoveryResult) {
 	host.Status.TalosVersion = result.TalosVersion
 	host.Status.Arch = result.Arch
@@ -405,8 +405,23 @@ func (r *ByotHostReconciler) populateFromDiscovery(host *infrav1.ByotHost, resul
 		Memory:            result.Memory,
 		Disks:             result.Disks,
 		NetworkInterfaces: result.NetworkInterfaces,
+		GPUs:              result.GPUs,
 	}
 	host.Status.LastProbedAt = nowPtr()
+
+	if result.GPUs != nil && result.GPUs.Mixed {
+		conditions.MarkFalse(
+			host,
+			infrav1.HostDiscoveredCondition,
+			infrav1.HostDiscoveredReasonMixedGPUModels,
+			clusterv1.ConditionSeverityWarning,
+			"host has GPUs of more than one vendor:device pair",
+		)
+
+		return
+	}
+
+	conditions.MarkTrue(host, infrav1.HostDiscoveredCondition)
 }
 
 // patchHost persists metadata (labels) and status.

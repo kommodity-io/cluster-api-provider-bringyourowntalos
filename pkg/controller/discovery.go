@@ -29,6 +29,9 @@ const (
 	labelMemoryClass   = discoveryLabelPrefix + "memory-class"
 	labelDiskType      = discoveryLabelPrefix + "disk-type"
 	labelDiskClass     = discoveryLabelPrefix + "disk-class"
+	labelGPUCount      = discoveryLabelPrefix + "gpu-count"
+	labelGPUVendor     = discoveryLabelPrefix + "gpu-vendor"
+	labelGPUModel      = discoveryLabelPrefix + "gpu-model"
 	labelPlatform      = discoveryLabelPrefix + "platform"
 	labelTalosVersion  = discoveryLabelPrefix + "talos-version"
 	labelFailureDomain = discoveryLabelPrefix + "failure-domain"
@@ -44,6 +47,7 @@ type DiscoveryResult struct {
 	Memory            resource.Quantity
 	Disks             []infrav1.HostDisk
 	NetworkInterfaces []string
+	GPUs              *infrav1.HostGPU
 }
 
 // discoverHost runs the maintenance-mode discovery surface against publicIP:
@@ -81,6 +85,7 @@ func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error)
 
 	result.CPU = parseCPU(dmesg)
 	result.Platform = parsePlatform(dmesg)
+	result.GPUs = parseGPUs(dmesg)
 
 	if err := discoverNetInterfaces(ctx, client, &result); err != nil {
 		return result, fmt.Errorf("net discovery: %w", err)
@@ -196,7 +201,191 @@ var (
 	cpuPackagesRegexp = regexp.MustCompile(`(?:packages|sockets)[=: ]+(\d+)`)
 	// numaRegexp extracts NUMA node numbers.
 	numaRegexp = regexp.MustCompile(`Node\s+(\d+)`)
+	// pciDeviceRegexp extracts the PCI address, vendor, device, and class
+	// from a kernel dmesg enumeration line, e.g.
+	//   "pci 0000:01:00.0: [10de:2331] type 00 class 0x030200 PCIe Endpoint".
+	pciDeviceRegexp = regexp.MustCompile(
+		`pci ([0-9a-f:\.]+): \[([0-9a-f]{4}):([0-9a-f]{4})\] type \d+ class 0x([0-9a-f]{6})`)
 )
+
+// gpuVendorNames maps a PCI vendor id (lowercase hex) to the lowercase label
+// value used for byot.io/gpu-vendor.
+//
+//nolint:gochecknoglobals // static vendor table
+var gpuVendorNames = map[string]string{
+	"10de": "nvidia",
+	"1002": "amd",
+	"8086": "intel",
+}
+
+// pciDisplayClassBase is the PCI base class for display controllers (0x03).
+const pciDisplayClassBase = 0x03
+
+// gpuModelTable maps vendor:device (lowercase hex) to the normalized model
+// family and per-GPU HBM in bytes. Derived from the pci.ids database
+// (https://pci-ids.ucw.cz). Only datacenter GPUs (Hopper, Blackwell, Ampere
+// compute) are listed; workstation/consumer SKUs are excluded. HBM is taken
+// from the product name where present, otherwise from vendor specs.
+//
+//nolint:gochecknoglobals // static device table
+var gpuModelTable = map[string]struct {
+	model    string
+	hbmBytes int64
+}{
+	// Hopper (GH100).
+	"10de:2330": {"h100-sxm5", 80 << 30},  // H100 SXM5 80GB
+	"10de:2331": {"h100-pcie", 80 << 30},   // H100 PCIe 80GB
+	"10de:2336": {"h100", 80 << 30},        // H100
+	"10de:2337": {"h100-sxm5-64g", 64 << 30},
+	"10de:2338": {"h100-sxm5-96g", 96 << 30},
+	"10de:2339": {"h100-sxm5-94g", 94 << 30},
+	"10de:233a": {"h800l-94g", 94 << 30},
+	"10de:233b": {"h200-nvl", 141 << 30},   // H200 NVL 141GB
+	"10de:233d": {"h100-96g", 96 << 30},
+	"10de:2321": {"h100l-94g", 94 << 30},
+	"10de:2322": {"h800-pcie", 80 << 30},   // H800 PCIe 80GB
+	"10de:2324": {"h800", 80 << 30},         // H800 80GB
+	"10de:2342": {"gh200-120g", 96 << 30},   // GH200 120GB (96GB HBM3e)
+	"10de:2348": {"gh200-144g", 144 << 30}, // GH200 144G HBM3e
+	// Blackwell (GB100/GB110).
+	"10de:2901": {"b200", 192 << 30},        // B200 192GB
+	"10de:2909": {"hgx-b200-168g", 168 << 30}, // HGX B200 168GB
+	"10de:2941": {"hgx-gb200", 192 << 30},   // HGX GB200 192GB
+	"10de:3182": {"b300-sxm6", 288 << 30},   // B300 SXM6 288GB
+	"10de:31a1": {"gb300-maxq", 288 << 30},
+	"10de:31c2": {"gb300", 288 << 30},
+	"10de:31c3": {"gb300", 288 << 30},
+	// Ampere (GA100) compute.
+	"10de:20b0": {"a100-sxm4-40g", 40 << 30},
+	"10de:20b1": {"a100-pcie-40g", 40 << 30},
+	"10de:20b2": {"a100-sxm4-80g", 80 << 30},
+	"10de:20b3": {"a100-sxm-64g", 64 << 30},
+	"10de:20b5": {"a100-pcie-80g", 80 << 30},
+	"10de:20b7": {"a30-pcie", 24 << 30}, // A30 24GB
+	"10de:20bd": {"a800-sxm4-40g", 40 << 30},
+	"10de:20f3": {"a800-sxm4-80g", 80 << 30},
+	"10de:20f5": {"a800-pcie-80g", 80 << 30},
+	"10de:20f6": {"a800-pcie-40g", 40 << 30},
+	// AMD Instinct (CDNA) datacenter GPUs.
+	// Vega 10 (gfx900): MI25 16GB HBM2.
+	"1002:6860": {"mi25", 16 << 30},
+	// Vega 20 (gfx906): MI50 16GB; MI60 32GB share the same device id.
+	"1002:66a1": {"mi50", 16 << 30},
+	// Arcturus (gfx908): MI100 32GB HBM2.
+	"1002:738c": {"mi100", 32 << 30},
+	"1002:738e": {"mi100", 32 << 30},
+	// Aldebaran (gfx90a): MI210 64GB, MI250/MI250X 128GB HBM3.
+	"1002:740f": {"mi210", 64 << 30},
+	"1002:740c": {"mi250", 128 << 30},
+	"1002:7408": {"mi250x", 128 << 30},
+	// Aqua Vanjaram (gfx942): MI300 series HBM3/3e.
+	"1002:74a0": {"mi300a", 128 << 30},
+	"1002:74a1": {"mi300x", 192 << 30},
+	"1002:74a2": {"mi308x", 128 << 30},
+	"1002:74a5": {"mi325x", 288 << 30},
+	"1002:75a0": {"mi350x", 288 << 30},
+	"1002:75a3": {"mi355x", 288 << 30},
+}
+
+// parseGPUs scans the kernel dmesg log for PCI display-class devices from a
+// known GPU vendor and returns an aggregated HostGPU summary. It is
+// best-effort: a parse anomaly is logged by the caller and skipped, and a
+// host with no GPU returns nil. Mixed (vendor,device) pairs collapse to a
+// count+vendor summary with Mixed=true and no model.
+func parseGPUs(dmesg string) *infrav1.HostGPU {
+	counts := countGPUPairs(dmesg)
+
+	if len(counts) == 0 {
+		return nil
+	}
+
+	gpu := &infrav1.HostGPU{}
+
+	for _, pairCount := range counts {
+		gpu.Count += pairCount
+	}
+
+	if len(counts) == 1 {
+		populateHomogeneousGPU(gpu, counts)
+
+		return gpu
+	}
+
+	populateMixedGPU(gpu, counts)
+
+	return gpu
+}
+
+// pairKey identifies a (vendor, device) PCI pair.
+type pairKey struct {
+	vendor, device string
+}
+
+// countGPUPairs tallies display-class PCI devices from known GPU vendors in
+// the dmesg log, keyed by (vendor, device).
+func countGPUPairs(dmesg string) map[pairKey]int32 {
+	counts := map[pairKey]int32{}
+
+	for _, match := range pciDeviceRegexp.FindAllStringSubmatch(dmesg, -1) {
+		vendor := match[2]
+		device := match[3]
+
+		class, err := strconv.ParseUint(match[4], 16, 32)
+		if err != nil {
+			continue
+		}
+
+		// Display class is 0x03xx; the base class is the high byte.
+		if class>>16 != pciDisplayClassBase {
+			continue
+		}
+
+		if _, ok := gpuVendorNames[vendor]; !ok {
+			continue
+		}
+
+		counts[pairKey{vendor, device}]++
+	}
+
+	return counts
+}
+
+// populateHomogeneousGPU fills a single-pair summary: vendor, model, device
+// id, and per-GPU/total HBM from the model table (empty/zero when unknown).
+func populateHomogeneousGPU(gpu *infrav1.HostGPU, counts map[pairKey]int32) {
+	for key, pairCount := range counts {
+		gpu.Vendor = gpuVendorNames[key.vendor]
+		gpu.DeviceID = key.device
+
+		entry, ok := gpuModelTable[key.vendor+":"+key.device]
+		if !ok {
+			continue
+		}
+
+		gpu.Model = entry.model
+		gpu.MemoryPerGPU = *resource.NewQuantity(entry.hbmBytes, resource.BinarySI)
+		total := int64(pairCount) * entry.hbmBytes
+		gpu.TotalMemory = *resource.NewQuantity(total, resource.BinarySI)
+	}
+}
+
+// populateMixedGPU fills a multi-pair summary: count only, plus vendor when
+// all GPUs share one vendor. Model and device id are left empty.
+func populateMixedGPU(gpu *infrav1.HostGPU, counts map[pairKey]int32) {
+	vendors := map[string]struct{}{}
+
+	for key := range counts {
+		vendors[key.vendor] = struct{}{}
+	}
+
+	if len(vendors) == 1 {
+		for vendor := range vendors {
+			gpu.Vendor = gpuVendorNames[vendor]
+		}
+	}
+
+	gpu.Mixed = true
+}
 
 // parseCPU extracts CPU topology from the kernel dmesg log. Missing fields
 // default to 1 (a single-CPU, single-package, single-NUMA host).
@@ -308,6 +497,10 @@ var memoryBuckets = []struct {
 	{"32G", 32 << 30},
 	{"64G", 64 << 30},
 	{"128G", 128 << 30},
+	{"256G", 256 << 30},
+	{"512G", 512 << 30},
+	{"1T", 1 << 40},
+	{"2T", 2 << 40},
 }
 
 // diskBuckets are the selection-oriented disk-size classes, ascending.
@@ -432,5 +625,26 @@ func promoteHardwareLabels(labels map[string]string, hardware *infrav1.HostHardw
 		if !disk.Size.IsZero() {
 			labels[labelDiskClass] = bucketDisk(disk.Size)
 		}
+	}
+
+	if hardware.GPUs != nil {
+		promoteGPULabels(labels, hardware.GPUs)
+	}
+}
+
+// promoteGPULabels lifts the GPU count, vendor, and model to labels. Model is
+// omitted for unknown devices and mixed hosts; vendor is omitted for
+// mixed-vendor hosts. Count is always set when GPUs are present.
+func promoteGPULabels(labels map[string]string, gpus *infrav1.HostGPU) {
+	if gpus.Count > 0 {
+		labels[labelGPUCount] = strconv.FormatInt(int64(gpus.Count), 10)
+	}
+
+	if gpus.Vendor != "" {
+		labels[labelGPUVendor] = gpus.Vendor
+	}
+
+	if gpus.Model != "" {
+		labels[labelGPUModel] = gpus.Model
 	}
 }
