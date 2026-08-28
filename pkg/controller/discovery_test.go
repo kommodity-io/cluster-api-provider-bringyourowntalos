@@ -487,3 +487,19 @@ func TestPopulateFromDiscoveryNoGPUsSucceeds(t *testing.T) {
 	assert.Nil(t, host.Status.Hardware.GPUs)
 	assert.True(t, conditions.IsTrue(host, infrav1.HostDiscoveredCondition))
 }
+
+func TestParseGPUsAMDInstinct(t *testing.T) {
+	t.Parallel()
+
+	// MI300X: 1002:74a1, class 0x030000. HBM 192GB per vendor specs.
+	mi300xLine := "pci 0000:43:00.0: [1002:74a1] type 00 class 0x030000 PCIe Endpoint"
+	gpu := parseGPUs(mi300xLine)
+	require.NotNil(t, gpu)
+	assert.Equal(t, int32(1), gpu.Count)
+	assert.Equal(t, "amd", gpu.Vendor)
+	assert.Equal(t, "mi300x", gpu.Model)
+	assert.Equal(t, "74a1", gpu.DeviceID)
+	assert.False(t, gpu.Mixed)
+	assert.Equal(t, "192Gi", gpu.MemoryPerGPU.String())
+	assert.Equal(t, "192Gi", gpu.TotalMemory.String())
+}

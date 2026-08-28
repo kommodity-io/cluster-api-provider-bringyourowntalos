@@ -266,6 +266,25 @@ var gpuModelTable = map[string]struct {
 	"10de:20f3": {"a800-sxm4-80g", 80 << 30},
 	"10de:20f5": {"a800-pcie-80g", 80 << 30},
 	"10de:20f6": {"a800-pcie-40g", 40 << 30},
+	// AMD Instinct (CDNA) datacenter GPUs.
+	// Vega 10 (gfx900): MI25 16GB HBM2.
+	"1002:6860": {"mi25", 16 << 30},
+	// Vega 20 (gfx906): MI50 16GB; MI60 32GB share the same device id.
+	"1002:66a1": {"mi50", 16 << 30},
+	// Arcturus (gfx908): MI100 32GB HBM2.
+	"1002:738c": {"mi100", 32 << 30},
+	"1002:738e": {"mi100", 32 << 30},
+	// Aldebaran (gfx90a): MI210 64GB, MI250/MI250X 128GB HBM3.
+	"1002:740f": {"mi210", 64 << 30},
+	"1002:740c": {"mi250", 128 << 30},
+	"1002:7408": {"mi250x", 128 << 30},
+	// Aqua Vanjaram (gfx942): MI300 series HBM3/3e.
+	"1002:74a0": {"mi300a", 128 << 30},
+	"1002:74a1": {"mi300x", 192 << 30},
+	"1002:74a2": {"mi308x", 128 << 30},
+	"1002:74a5": {"mi325x", 288 << 30},
+	"1002:75a0": {"mi350x", 288 << 30},
+	"1002:75a3": {"mi355x", 288 << 30},
 }
 
 // parseGPUs scans the kernel dmesg log for PCI display-class devices from a
