@@ -14,7 +14,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/finalizers"
@@ -135,6 +137,16 @@ func withoutNodeLinkRetrigger(annotations map[string]string) map[string]string {
 type ByotMachineReconciler struct {
 	Client ctrlclient.Client
 	Scheme *runtime.Scheme
+
+	// ClusterCache provides workload-cluster clients used to patch the
+	// downstream Node providerID. nil when no cache is wired (unit tests); set
+	// via SetClusterCache from Kommodity.
+	ClusterCache clustercache.ClusterCache
+
+	// getWorkloadClient is a seam over ClusterCache.GetClient, injectable in
+	// tests. updateNodeProviderID skips when it is nil and falls back to the
+	// nodeLinkRetriggerAnnotation path in ensureNodeLinked.
+	getWorkloadClient func(ctx context.Context, cluster ctrlclient.ObjectKey) (ctrlclient.Client, error)
 }
 
 // NewByotMachineReconciler creates a new ByotMachineReconciler.
@@ -143,6 +155,13 @@ func NewByotMachineReconciler(client ctrlclient.Client) *ByotMachineReconciler {
 		Client: client,
 		Scheme: client.Scheme(),
 	}
+}
+
+// SetClusterCache wires the ClusterCache and derives the workload-client
+// seam used by updateNodeProviderID. Call before SetupWithManager.
+func (r *ByotMachineReconciler) SetClusterCache(cache clustercache.ClusterCache) {
+	r.ClusterCache = cache
+	r.getWorkloadClient = cache.GetClient
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -227,7 +246,7 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 	configHash := sha256Hex(machineConfig)
 
 	if configUnchanged(byotMachine, configHash) {
-		return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
+		return r.linkNode(ctx, patchHelper, byotMachine, machine)
 	}
 
 	return r.applyAndMarkAdopted(ctx, patchHelper, machine, byotMachine, machineConfig, configHash)
@@ -379,7 +398,138 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 
 	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP)
 
+	return r.linkNode(ctx, patchHelper, byotMachine, machine)
+}
+
+// linkNode drives the Machine<->Node linkage for an adopted machine: first
+// patch the workload Node's providerID (byot has no CCM, so the controller
+// owns it), then retrigger the owning CAPI Machine's node-link reconciliation
+// until status.nodeRef is set. updateNodeProviderID runs once (gated by
+// status.nodeUpdated); ensureNodeLinked keeps retriggerring until the link
+// completes. A requeue from either step short-circuits the other, which is
+// fine since both re-run on the next reconcile.
+func (r *ByotMachineReconciler) linkNode(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	machine *clusterv1.Machine,
+) (ctrl.Result, error) {
+	result, err := r.updateNodeProviderID(ctx, patchHelper, byotMachine, machine)
+	if err != nil {
+		return result, err
+	}
+
+	if result.Requeue || result.RequeueAfter > 0 {
+		return result, nil
+	}
+
 	return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
+}
+
+// errWorkloadNodePending signals the workload Node is not registered yet;
+// the kubelet registers it on boot. updateNodeProviderID requeues on it.
+var errWorkloadNodePending = errors.New("workload node not registered")
+
+// updateNodeProviderID patches the workload cluster Node's spec.providerID to
+// byot://<resolvedPublicIP> so CAPI's Machine controller can link the Machine
+// to its Node. byot has no cloud-controller-manager, so unlike cloud providers
+// the controller owns the Machine<->Node providerID linkage: the kubelet
+// reports an empty providerID (the host-registry model resolves the IP at
+// claim time, so neither the chart nor CABPT can bake it into the config), so
+// CAPI's Machine.spec.providerID <-> Node.spec.providerID match never fires
+// and status.nodeRef is never set. Mirrors the kubevirt provider
+// (KubevirtMachineReconciler.updateNodeProviderID). Gated by
+// status.nodeUpdated so it runs once. When no ClusterCache is wired it is a
+// no-op and ensureNodeLinked's retrigger annotation is the fallback.
+func (r *ByotMachineReconciler) updateNodeProviderID(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	machine *clusterv1.Machine,
+) (ctrl.Result, error) {
+	if byotMachine.Status.NodeUpdated || byotMachine.Spec.ProviderID == nil {
+		return ctrl.Result{}, nil
+	}
+
+	if r.getWorkloadClient == nil {
+		// No ClusterCache wired (unit tests, or provider run standalone).
+		// ensureNodeLinked's retrigger annotation is the fallback.
+		return ctrl.Result{}, nil
+	}
+
+	clusterKey := ctrlclient.ObjectKey{
+		Namespace: byotMachine.Namespace,
+		Name:      machine.Spec.ClusterName,
+	}
+
+	workloadClient, err := r.getWorkloadClient(ctx, clusterKey)
+
+	if errors.Is(err, clustercache.ErrClusterNotConnected) {
+		// Workload API not up yet (control-plane bootstrap race). Requeue;
+		// ensureNodeLinked's retrigger also compensates.
+		return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get workload cluster client for %s: %w", clusterKey, err)
+	}
+
+	if _, pErr := r.patchWorkloadNode(ctx, workloadClient, machine, *byotMachine.Spec.ProviderID); pErr != nil {
+		if errors.Is(pErr, errWorkloadNodePending) {
+			// Node not registered yet; the kubelet registers on boot. Requeue.
+			return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
+		}
+
+		return ctrl.Result{}, pErr
+	}
+
+	byotMachine.Status.NodeUpdated = true
+
+	if err := patchHelper.Patch(ctx, byotMachine); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine after Node providerID update: %w", err)
+	}
+
+	log.FromContext(ctx).Info("Patched workload Node providerID",
+		"byotMachine", byotMachine.Name, "machine", machine.Name)
+
+	return ctrl.Result{}, nil
+}
+
+// patchWorkloadNode gets the workload Node named after the owning Machine and
+// patches its spec.providerID when it does not already match. It returns
+// alreadySet=true when the Node already carries the providerID (a prior run),
+// so the caller marks status.nodeUpdated without a redundant patch.
+// errWorkloadNodePending means the Node is not registered yet.
+func (r *ByotMachineReconciler) patchWorkloadNode(
+	ctx context.Context,
+	workloadClient ctrlclient.Client,
+	machine *clusterv1.Machine,
+	providerID string,
+) (bool, error) {
+	node := &corev1.Node{}
+
+	if err := workloadClient.Get(ctx, ctrlclient.ObjectKey{Name: machine.Name}, node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, errWorkloadNodePending
+		}
+
+		return false, fmt.Errorf("failed to get workload Node %s: %w", machine.Name, err)
+	}
+
+	if node.Spec.ProviderID == providerID {
+		return true, nil
+	}
+
+	// Patch the Node providerID. Usually a cloud-controller-manager does
+	// this, but byot has no CCM.
+	patchBytes := fmt.Sprintf(`{"spec":{"providerID":%q}}`, providerID)
+	mergePatch := ctrlclient.RawPatch(types.MergePatchType, []byte(patchBytes))
+
+	if err := workloadClient.Patch(ctx, node, mergePatch); err != nil {
+		return false, fmt.Errorf("failed to patch workload Node %s providerID: %w", machine.Name, err)
+	}
+
+	return false, nil
 }
 
 // ensureNodeLinked retriggers the owning CAPI Machine's node-link
@@ -540,12 +690,12 @@ func (r *ByotMachineReconciler) reconcileDelete(
 		}
 
 		logger.Info("Host reset to maintenance and released",
-				"byotMachine", byotMachine.Name,
-				"byotHost", byotMachine.Status.ResolvedHost,
-				"publicIP", byotMachine.Status.ResolvedPublicIP)
+			"byotMachine", byotMachine.Name,
+			"byotHost", byotMachine.Status.ResolvedHost,
+			"publicIP", byotMachine.Status.ResolvedPublicIP)
 	} else {
 		logger.Info("Machine released (no claimed host)",
-				"byotMachine", byotMachine.Name)
+			"byotMachine", byotMachine.Name)
 	}
 
 	if controllerutil.RemoveFinalizer(byotMachine, byotMachineFinalizer) {
