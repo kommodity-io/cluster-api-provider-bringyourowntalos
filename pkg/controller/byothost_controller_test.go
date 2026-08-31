@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -378,12 +379,32 @@ func TestFilterClaimCandidatesNoFailureDomainMatchesAllAvailable(t *testing.T) {
 	assert.Len(t, got, 2)
 }
 
-// hostCandidate builds a ByotHost for filterClaimCandidates tests.
+func TestFilterClaimCandidatesExcludesAvailableHostMidProbeFailure(t *testing.T) {
+	t.Parallel()
+
+	// An Available host whose last liveness probe failed (MaintenanceProbe=False,
+	// below the failure threshold so phase has not flipped to Unavailable) is not
+	// claimable: Decision 5 requires liveness confirmed.
+	available := infrav1.HostPhaseAvailable
+	host := hostCandidate("a", nil, available, "")
+	conditions.MarkFalse(&host, infrav1.HostMaintenanceProbeCondition,
+		"ProbeFailed", clusterv1.ConditionSeverityInfo, "transient")
+
+	got := filterClaimCandidates([]infrav1.ByotHost{host}, &infrav1.ByotMachine{})
+	assert.Empty(t, got)
+}
+
+// hostCandidate builds a ByotHost for filterClaimCandidates tests. An
+// Available host is marked maintenance-probe-true so it is claimable.
 func hostCandidate(name string, fd *string, phase infrav1.HostPhase, claimUID string) infrav1.ByotHost {
 	host := infrav1.ByotHost{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec:       infrav1.ByotHostSpec{FailureDomain: fd},
 		Status:     infrav1.ByotHostStatus{Phase: phase},
+	}
+
+	if phase == infrav1.HostPhaseAvailable {
+		conditions.MarkTrue(&host, infrav1.HostMaintenanceProbeCondition)
 	}
 
 	if claimUID != "" {

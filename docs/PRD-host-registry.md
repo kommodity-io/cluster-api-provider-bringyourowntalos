@@ -114,7 +114,6 @@ status:
       cores: 3
       packages: 1
       numaNodes: 1
-      tscMHz: 1996.250
     memory: "3981564Ki" # via Memory RPC (resource.Quantity: Meminfo.Memtotal)
     disks: # via Disks RPC
       - name: "/dev/sda"
@@ -149,9 +148,9 @@ spec:
       site: gefion
   failureDomain: "par01" # matched against ByotHost.spec.failureDomain
   # spec.publicIP REMOVED — IP resolved from claimed ByotHost
-  # joinPolicy, splitPolicy, talosConfigSecretRef: unchanged (splitPolicy.Reset
-  # is the only release path now; None still leaves the node running but the
-  # host is reset to maintenance regardless — see Release)
+  # joinPolicy, splitPolicy, talosConfigSecretRef REMOVED (Decisions 6/12;
+  # see the ByotMachine spec table). Release always resets the host to
+  # maintenance regardless — see Release.
 ```
 
 `hostRef` and `hostSelector` are mutually exclusive (CEL validation). The
@@ -171,9 +170,8 @@ only on Talos upgrade or re-discovery after an outage).
 fields under `status`:
 
 - `status.talosVersion`, `status.arch`, `status.platform`: string.
-- `status.hardware.cpu`: `{ cores int32, packages int32, numaNodes int32,
-tscMHz float64 }` — parsed from `Dmesg` (`nr_cpu_ids` / `Num. cores per
-package`).
+- `status.hardware.cpu`: `{ cores int32, packages int32, numaNodes int32 }`
+  — parsed from `Dmesg` (`nr_cpu_ids` / `Num. cores per package`).
 - `status.hardware.memory`: `resource.Quantity` (idiomatic for RAM; from
   `Memory` RPC `Meminfo.Memtotal`).
 - `status.hardware.disks[]`: `{ name, size resource.Quantity, type, model,
@@ -217,11 +215,12 @@ race leaves a stale `available: true`).
 
 ### ByotHost controller (discovery + liveness)
 
-1. On creation: set `phase=Probing`. Build the maintenance client
-   (`maintenanceClient`, insecure) against `spec.publicIP` and call the
+1. On creation: the host starts with an empty `phase` (treated as `Probing`)
+   and the controller runs initial discovery immediately. Build the maintenance
+   client (`maintenanceClient`, insecure) against `spec.publicIP` and call the
    confirmed maintenance-mode surface: `Version` (Talos version + arch),
    `Memory` (RAM total), `Disks` (disk inventory), `Dmesg` (CPU cores/packages/NUMA via parsing `nr_cpu_ids` / `Num. cores per package`; platform via `talos.platform=` kernel cmdline), and `LS /sys/class/net` (interface names). `Read` is restricted in maintenance mode and returns empty; it is not used.
-   On success populate `status.talosVersion`, `status.arch`, `status.platform`, `status.hardware` (cpu, memory, disks, networkInterfaces), `status.maintenanceMode=true`, set `phase=Available`.
+   On success populate `status.talosVersion`, `status.arch`, `status.platform`, `status.hardware` (cpu, memory, disks, networkInterfaces), `status.maintenanceMode=true`, set `phase=Available`. On failure set `phase=Probing` and requeue.
 2. Periodically (~60s): probe maintenance liveness (`probeMaintenance`). On
    consecutive failures (e.g. 3) set `phase=Unavailable`,
    `status.maintenanceMode=false`, condition `MaintenanceProbeFailed`. On

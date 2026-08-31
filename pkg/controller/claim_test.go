@@ -1,14 +1,20 @@
 package controller
 
 import (
+	"context"
 	"testing"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -30,7 +36,7 @@ func newClaimingByotMachine(hostRef string) *infrav1.ByotMachine {
 }
 
 func newAvailableByotHost(name string, publicIP string) *infrav1.ByotHost {
-	return &infrav1.ByotHost{
+	host := &infrav1.ByotHost{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: testNamespace,
@@ -38,6 +44,9 @@ func newAvailableByotHost(name string, publicIP string) *infrav1.ByotHost {
 		Spec:   infrav1.ByotHostSpec{PublicIP: publicIP},
 		Status: infrav1.ByotHostStatus{Phase: infrav1.HostPhaseAvailable},
 	}
+	conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
+
+	return host
 }
 
 func TestClaimHostRequeuesWhenHostUnavailable(t *testing.T) {
@@ -268,4 +277,50 @@ func TestClaimHostLostClaimReclaims(t *testing.T) {
 	assert.Zero(t, result.RequeueAfter)
 
 	assert.Equal(t, testHostName, machine.Status.ResolvedHost)
+}
+
+func TestClaimHostLostRaceRequeuesOnConflict(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	// Two ByotMachines race one Available host; this one loses the
+	// compare-and-swap (Status().Update conflicts because another writer set
+	// claimRef first). claimHost must swallow the conflict and requeue for a
+	// retry rather than erroring.
+	machine := newClaimingByotMachine(testHostName)
+	host := newAvailableByotHost(testHostName, "203.0.113.10")
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}, &infrav1.ByotHost{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(
+				_ context.Context,
+				_ ctrlclient.Client,
+				_ string,
+				_ ctrlclient.Object,
+				_ ...ctrlclient.SubResourceUpdateOption,
+			) error {
+				return apierrors.NewConflict(
+					schema.GroupResource{Resource: "byothosts"},
+					host.Name,
+					nil,
+				)
+			},
+		}).
+		Build()
+
+	r := NewByotMachineReconciler(client)
+	patchHelper, err := patch.NewHelper(machine, client)
+	require.NoError(t, err)
+
+	result, handled, err := r.claimHost(t.Context(), machine, patchHelper)
+	require.NoError(t, err) // conflict is swallowed
+	assert.True(t, handled)
+	assert.True(t, result.Requeue)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Empty(t, machine.Status.ResolvedHost) // claim not finalized
 }

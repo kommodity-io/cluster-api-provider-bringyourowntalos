@@ -9,6 +9,7 @@ import (
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -124,32 +125,42 @@ func (r *ByotMachineReconciler) resolveClaimCandidate(
 	byotMachine *infrav1.ByotMachine,
 ) (*infrav1.ByotHost, error) {
 	if byotMachine.Spec.HostRef != nil {
-		host := &infrav1.ByotHost{}
-
-		err := r.Client.Get(ctx, ctrlclient.ObjectKey{
-			Namespace: byotMachine.Namespace,
-			Name:      byotMachine.Spec.HostRef.Name,
-		}, host)
-		if apierrors.IsNotFound(err) {
-			return nil, ErrNoHostAvailable
-		}
-
-		if err != nil {
-			return nil, fmt.Errorf("failed to get ByotHost %s: %w", byotMachine.Spec.HostRef.Name, err)
-		}
-
-		if host.Status.Phase != infrav1.HostPhaseAvailable {
-			return nil, ErrNoHostAvailable
-		}
-
-		if host.Status.ClaimRef != nil && host.Status.ClaimRef.UID != string(byotMachine.UID) {
-			return nil, ErrNoHostAvailable
-		}
-
-		return host, nil
+		return r.resolveHostRef(ctx, byotMachine)
 	}
 
 	return r.selectClaimCandidate(ctx, byotMachine)
+}
+
+// resolveHostRef fetches the explicitly named ByotHost and admits it only when
+// it is Available with maintenance liveness confirmed and unclaimed (or
+// self-claimed).
+func (r *ByotMachineReconciler) resolveHostRef(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+) (*infrav1.ByotHost, error) {
+	host := &infrav1.ByotHost{}
+
+	err := r.Client.Get(ctx, ctrlclient.ObjectKey{
+		Namespace: byotMachine.Namespace,
+		Name:      byotMachine.Spec.HostRef.Name,
+	}, host)
+	if apierrors.IsNotFound(err) {
+		return nil, ErrNoHostAvailable
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ByotHost %s: %w", byotMachine.Spec.HostRef.Name, err)
+	}
+
+	if host.Status.Phase != infrav1.HostPhaseAvailable || !hostClaimable(host) {
+		return nil, ErrNoHostAvailable
+	}
+
+	if host.Status.ClaimRef != nil && host.Status.ClaimRef.UID != string(byotMachine.UID) {
+		return nil, ErrNoHostAvailable
+	}
+
+	return host, nil
 }
 
 // selectClaimCandidate lists Available ByotHosts matching the label selector
@@ -183,6 +194,16 @@ func (r *ByotMachineReconciler) selectClaimCandidate(
 	return &candidates[0], nil
 }
 
+// hostClaimable reports whether a ByotHost is claimable: it must be in the
+// Available phase with maintenance liveness confirmed at the last probe. A
+// host whose last probe failed (even once, before the failure threshold flips
+// its phase to Unavailable) is not claimable, so a transient liveness flap does
+// not let a claim grab a host mid-failure (Decision 5: Available requires
+// liveness confirmed).
+func hostClaimable(host *infrav1.ByotHost) bool {
+	return conditions.IsTrue(host, infrav1.HostMaintenanceProbeCondition)
+}
+
 // filterClaimCandidates keeps only Available, unclaimed (or self-claimed)
 // hosts matching the failureDomain, when set.
 func filterClaimCandidates(hosts []infrav1.ByotHost, byotMachine *infrav1.ByotMachine) []infrav1.ByotHost {
@@ -192,6 +213,10 @@ func filterClaimCandidates(hosts []infrav1.ByotHost, byotMachine *infrav1.ByotMa
 		host := &hosts[i]
 
 		if host.Status.Phase != infrav1.HostPhaseAvailable {
+			continue
+		}
+
+		if !hostClaimable(host) {
 			continue
 		}
 
