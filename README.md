@@ -109,23 +109,34 @@ The controller:
 The `ByotHost` controller drives each host through a phase state machine:
 `Probing → Available ↔ Unavailable`, `Available → Claimed → Releasing →
 Available`. It discovers features from the Talos maintenance API (`Version`,
-`Memory`, `Disks`, `Dmesg` for CPU topology + platform, `LS /sys/class/net`
-for interface names) and probes liveness (~60s), marking a host `Unavailable`
-after consecutive failures and re-discovering on recovery. Discovery populates
-a rich typed `status` (view-only) and promotes a curated, bucketed subset to
-controller-managed `byot.io/` labels:
+`Memory`, `Disks`, `Dmesg` for CPU topology + platform + GPU PCI devices,
+`LS /sys/class/net` for interface names) and probes liveness (~60s), marking a
+host `Unavailable` after consecutive failures and re-discovering on recovery.
+Discovery populates a rich typed `status` (view-only) and promotes a curated,
+bucketed subset to controller-managed `byot.io/` labels:
 
-| Label                    | Source               | Values                                       |
-| ------------------------ | -------------------- | -------------------------------------------- |
-| `byot.io/available`      | phase                | `"true"` only when `phase=Available`         |
-| `byot.io/cpu-cores`      | `hardware.cpu.cores` | integer as string                            |
-| `byot.io/cpu-arch`       | `Version` arch       | `amd64` / `arm64`                            |
-| `byot.io/memory-class`   | `hardware.memory`    | `4G` / `8G` / `16G` / `32G` / `64G` / `128G` |
-| `byot.io/disk-type`      | system disk type     | `nvme` / `ssd` / `hdd` / `sd`                |
-| `byot.io/disk-class`     | system disk size     | `20G` / `100G` / `250G` / `500G` / `1T`      |
-| `byot.io/platform`       | `platform`           | `scaleway`, `copenhagen`, ...                |
-| `byot.io/talos-version`  | `talosVersion`       | `v1.13.8`, ...                               |
-| `byot.io/failure-domain` | `spec.failureDomain` | operator-set physical FD, e.g. `par01`       |
+| Label                    | Source                 | Values                                                                       |
+| ------------------------ | ---------------------- | ---------------------------------------------------------------------------- |
+| `byot.io/available`      | phase                  | `"true"` only when `phase=Available`                                         |
+| `byot.io/cpu-cores`      | `hardware.cpu.cores`   | integer as string                                                            |
+| `byot.io/cpu-arch`       | `Version` arch         | `amd64` / `arm64`                                                            |
+| `byot.io/memory-class`   | `hardware.memory`      | `4G` / `8G` / `16G` / `32G` / `64G` / `128G` / `256G` / `512G` / `1T` / `2T` |
+| `byot.io/disk-type`      | system disk type       | `nvme` / `ssd` / `hdd` / `sd`                                                |
+| `byot.io/disk-class`     | system disk size       | `20G` / `100G` / `250G` / `500G` / `1T`                                      |
+| `byot.io/gpu-count`      | `hardware.gpus.count`  | integer as string (omitted when no GPU)                                      |
+| `byot.io/gpu-vendor`     | `hardware.gpus.vendor` | `nvidia` / `amd` / `intel` (omitted on mixed-vendor hosts)                   |
+| `byot.io/gpu-model`      | `hardware.gpus.model`  | `h100-pcie`, `b300-sxm6`, `mi300x`, ... (omitted on unknown/mixed hosts)     |
+| `byot.io/platform`       | `platform`             | `scaleway`, `copenhagen`, ...                                                |
+| `byot.io/talos-version`  | `talosVersion`         | `v1.13.8`, ...                                                               |
+| `byot.io/failure-domain` | `spec.failureDomain`   | operator-set physical FD, e.g. `par01`                                       |
+
+GPU discovery scans the kernel dmesg log for PCI display-class devices from
+a known vendor (NVIDIA/AMD/Intel) and resolves the model family + per-GPU HBM
+from a PCI device-id table (derived from [pci.ids database](https://pci-ids.ucw.cz)).
+A host with GPUs of more than one `vendor:device` pair is marked
+`HostDiscovered=False/MixedGPUModels` and stays non-`Available`, so a
+`ByotMachine` cannot claim a mislabeled mixed node. No GPU → `hardware.gpus`
+is nil and the GPU labels are omitted.
 
 A host is `Available` (claimable) only when maintenance-liveness is confirmed
 **and** features are discovered. Operators may add their own freeform labels
