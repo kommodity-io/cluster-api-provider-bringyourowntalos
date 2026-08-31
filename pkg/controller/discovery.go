@@ -66,15 +66,18 @@ func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error)
 
 	result := DiscoveryResult{}
 
-	if err := discoverVersion(ctx, client, &result); err != nil {
+	err = discoverVersion(ctx, client, &result)
+	if err != nil {
 		return result, fmt.Errorf("version discovery: %w", err)
 	}
 
-	if err := discoverMemory(ctx, client, &result); err != nil {
+	err = discoverMemory(ctx, client, &result)
+	if err != nil {
 		return result, fmt.Errorf("memory discovery: %w", err)
 	}
 
-	if err := discoverDisks(ctx, client, &result); err != nil {
+	err = discoverDisks(ctx, client, &result)
+	if err != nil {
 		return result, fmt.Errorf("disk discovery: %w", err)
 	}
 
@@ -87,7 +90,8 @@ func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error)
 	result.Platform = parsePlatform(dmesg)
 	result.GPUs = parseGPUs(dmesg)
 
-	if err := discoverNetInterfaces(ctx, client, &result); err != nil {
+	err = discoverNetInterfaces(ctx, client, &result)
+	if err != nil {
 		return result, fmt.Errorf("net discovery: %w", err)
 	}
 
@@ -399,13 +403,15 @@ func parseCPU(dmesg string) infrav1.HostCPU {
 	}
 
 	if m := cpuCoresRegexp.FindStringSubmatch(dmesg); m != nil {
-		if v, err := strconv.Atoi(m[1]); err == nil && v > 0 {
+		v, err := strconv.Atoi(m[1])
+		if err == nil && v > 0 {
 			cpu.Cores = int32(v)
 		}
 	}
 
 	if m := cpuPackagesRegexp.FindStringSubmatch(dmesg); m != nil {
-		if v, err := strconv.Atoi(m[1]); err == nil && v > 0 {
+		v, err := strconv.Atoi(m[1])
+		if err == nil && v > 0 {
 			cpu.Packages = int32(v)
 		}
 	}
@@ -422,7 +428,8 @@ func distinctNumaNodes(dmesg string) int {
 	seen := map[int]struct{}{}
 
 	for _, m := range numaRegexp.FindAllStringSubmatch(dmesg, -1) {
-		if n, err := strconv.Atoi(m[1]); err == nil {
+		n, err := strconv.Atoi(m[1])
+		if err == nil {
 			seen[n] = struct{}{}
 		}
 	}

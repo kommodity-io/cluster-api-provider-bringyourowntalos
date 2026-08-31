@@ -476,7 +476,8 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 		return ctrl.Result{}, fmt.Errorf("failed to get workload cluster client for %s: %w", clusterKey, err)
 	}
 
-	if _, pErr := r.patchWorkloadNode(ctx, workloadClient, byotMachine, *byotMachine.Spec.ProviderID); pErr != nil {
+	_, pErr := r.patchWorkloadNode(ctx, workloadClient, byotMachine, *byotMachine.Spec.ProviderID)
+	if pErr != nil {
 		if errors.Is(pErr, errWorkloadNodePending) {
 			// Node not registered yet; the kubelet registers on boot. Requeue.
 			return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
@@ -487,7 +488,8 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 
 	byotMachine.Status.NodeUpdated = true
 
-	if err := patchHelper.Patch(ctx, byotMachine); err != nil {
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine after Node providerID update: %w", err)
 	}
 
@@ -512,7 +514,8 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 ) (bool, error) {
 	node := &corev1.Node{}
 
-	if err := workloadClient.Get(ctx, ctrlclient.ObjectKey{Name: byotMachine.Name}, node); err != nil {
+	err := workloadClient.Get(ctx, ctrlclient.ObjectKey{Name: byotMachine.Name}, node)
+	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, errWorkloadNodePending
 		}
@@ -529,7 +532,8 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 	patchBytes := fmt.Sprintf(`{"spec":{"providerID":%q}}`, providerID)
 	mergePatch := ctrlclient.RawPatch(types.MergePatchType, []byte(patchBytes))
 
-	if err := workloadClient.Patch(ctx, node, mergePatch); err != nil {
+	err = workloadClient.Patch(ctx, node, mergePatch)
+	if err != nil {
 		return false, fmt.Errorf("failed to patch workload Node %s providerID: %w", byotMachine.Name, err)
 	}
 

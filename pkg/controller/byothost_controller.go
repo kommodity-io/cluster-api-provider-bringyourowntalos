@@ -118,7 +118,8 @@ func (r *ByotHostReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.reconcileDelete(ctx, host)
 	}
 
-	if _, err := finalizers.EnsureFinalizer(ctx, r.Client, host, byotHostFinalizer); err != nil {
+	_, err = finalizers.EnsureFinalizer(ctx, r.Client, host, byotHostFinalizer)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to add finalizer to ByotHost %s: %w", req.NamespacedName, err)
 	}
 
@@ -145,7 +146,8 @@ func (r *ByotHostReconciler) reconcileDelete(ctx context.Context, host *infrav1.
 	}
 
 	if controllerutil.RemoveFinalizer(host, byotHostFinalizer) {
-		if err := r.Client.Update(ctx, host); err != nil {
+		err := r.Client.Update(ctx, host)
+		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from ByotHost %s: %w", host.Name, err)
 		}
 	}
@@ -196,7 +198,8 @@ func (r *ByotHostReconciler) reconcileProbing(
 	conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
 	applyDiscoveryLabels(host)
 
-	if err := r.patchHost(ctx, patchHelper, host); err != nil {
+	err = r.patchHost(ctx, patchHelper, host)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -221,7 +224,8 @@ func (r *ByotHostReconciler) reconcileAvailable(
 		conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
 		applyDiscoveryLabels(host)
 
-		if err := r.patchHost(ctx, patchHelper, host); err != nil {
+		err := r.patchHost(ctx, patchHelper, host)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -242,7 +246,8 @@ func (r *ByotHostReconciler) reconcileUnavailable(
 		host.Status.LastProbedAt = nowPtr()
 		applyDiscoveryLabels(host)
 
-		if err := r.patchHost(ctx, patchHelper, host); err != nil {
+		err := r.patchHost(ctx, patchHelper, host)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -262,7 +267,8 @@ func (r *ByotHostReconciler) reconcileUnavailable(
 	conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
 	applyDiscoveryLabels(host)
 
-	if err := r.patchHost(ctx, patchHelper, host); err != nil {
+	err = r.patchHost(ctx, patchHelper, host)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -283,7 +289,8 @@ func (r *ByotHostReconciler) reconcileReleasing(
 		host.Status.LastProbedAt = nowPtr()
 		applyDiscoveryLabels(host)
 
-		if err := r.patchHost(ctx, patchHelper, host); err != nil {
+		err := r.patchHost(ctx, patchHelper, host)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -303,7 +310,8 @@ func (r *ByotHostReconciler) reconcileReleasing(
 	conditions.MarkTrue(host, infrav1.HostMaintenanceProbeCondition)
 	applyDiscoveryLabels(host)
 
-	if err := r.patchHost(ctx, patchHelper, host); err != nil {
+	err = r.patchHost(ctx, patchHelper, host)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -344,7 +352,8 @@ func (r *ByotHostReconciler) recordDiscoveryFailure(
 
 	applyDiscoveryLabels(host)
 
-	if err := r.patchHost(ctx, patchHelper, host); err != nil {
+	err := r.patchHost(ctx, patchHelper, host)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -385,7 +394,8 @@ func (r *ByotHostReconciler) recordProbeFailure(
 
 	applyDiscoveryLabels(host)
 
-	if err := r.patchHost(ctx, patchHelper, host); err != nil {
+	err := r.patchHost(ctx, patchHelper, host)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -426,7 +436,8 @@ func (r *ByotHostReconciler) populateFromDiscovery(host *infrav1.ByotHost, resul
 
 // patchHost persists metadata (labels) and status.
 func (r *ByotHostReconciler) patchHost(ctx context.Context, patchHelper *patch.Helper, host *infrav1.ByotHost) error {
-	if err := patchHelper.Patch(ctx, host); err != nil {
+	err := patchHelper.Patch(ctx, host)
+	if err != nil {
 		return fmt.Errorf("failed to patch ByotHost %s: %w", host.Name, err)
 	}
 

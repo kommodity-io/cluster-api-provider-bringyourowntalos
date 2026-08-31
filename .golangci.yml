@@ -12,16 +12,12 @@ linters:
     - ireturn
     # Verbose wrapping with little value on generated-style getters.
     - wrapcheck
-    # Repo style uses inline `if err := ...; err != nil` throughout.
-    - noinlineerr
-    # Repo style omits the blank line after embedded fields.
-    - embeddedstructfieldcheck
   exclusions:
     rules:
       # Kubebuilder-style API packages require globals, init registration and
       # long marker lines.
       - path: "api/"
-        linters: [gochecknoglobals, gochecknoinits, lll, tagliatelle]
+        linters: [gochecknoglobals, gochecknoinits, lll, tagliatelle, embeddedstructfieldcheck]
       # Tests intentionally exercise unexported behavior (finalizer names).
       - path: '_test\.go'
         linters: [testpackage]

@@ -33,9 +33,12 @@ func (r *ByotMachineReconciler) claimHost(
 	byotMachine *infrav1.ByotMachine,
 	patchHelper *patch.Helper,
 ) (ctrl.Result, bool, error) {
-	if kept, err := r.verifyExistingClaim(ctx, byotMachine, patchHelper); err != nil {
+	kept, err := r.verifyExistingClaim(ctx, byotMachine, patchHelper)
+	if err != nil {
 		return ctrl.Result{}, true, err
-	} else if kept {
+	}
+
+	if kept {
 		return ctrl.Result{}, false, nil
 	}
 
@@ -51,7 +54,8 @@ func (r *ByotMachineReconciler) claimHost(
 		return ctrl.Result{}, true, err
 	}
 
-	if err := r.claimCAS(ctx, host, byotMachine); err != nil {
+	err = r.claimCAS(ctx, host, byotMachine)
+	if err != nil {
 		if apierrors.IsConflict(err) {
 			// Lost the race to claim: retry on the next reconcile.
 			return ctrl.Result{Requeue: true}, true, nil
@@ -63,7 +67,8 @@ func (r *ByotMachineReconciler) claimHost(
 	byotMachine.Status.ResolvedHost = host.Name
 	byotMachine.Status.ResolvedPublicIP = host.Spec.PublicIP
 
-	if err := patchHelper.Patch(ctx, byotMachine); err != nil {
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
 		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after claim: %w", err)
 	}
 
@@ -98,7 +103,8 @@ func (r *ByotMachineReconciler) verifyExistingClaim(
 		if byotMachine.Status.ResolvedPublicIP != host.Spec.PublicIP {
 			byotMachine.Status.ResolvedPublicIP = host.Spec.PublicIP
 
-			if err := patchHelper.Patch(ctx, byotMachine); err != nil {
+			err = patchHelper.Patch(ctx, byotMachine)
+			if err != nil {
 				return false, fmt.Errorf("failed to patch ByotMachine resolved IP: %w", err)
 			}
 		}
@@ -111,7 +117,8 @@ func (r *ByotMachineReconciler) verifyExistingClaim(
 	byotMachine.Status.ResolvedHost = ""
 	byotMachine.Status.ResolvedPublicIP = ""
 
-	if err := patchHelper.Patch(ctx, byotMachine); err != nil {
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
 		return false, fmt.Errorf("failed to patch ByotMachine after lost claim: %w", err)
 	}
 
@@ -247,7 +254,8 @@ func (r *ByotMachineReconciler) claimCAS(
 	// Re-fetch the latest state right before claiming to tighten the race.
 	latest := &infrav1.ByotHost{}
 
-	if err := r.Client.Get(ctx, ctrlclient.ObjectKeyFromObject(host), latest); err != nil {
+	err := r.Client.Get(ctx, ctrlclient.ObjectKeyFromObject(host), latest)
+	if err != nil {
 		return err
 	}
 
@@ -263,14 +271,16 @@ func (r *ByotMachineReconciler) claimCAS(
 	}
 	latest.Status.Phase = infrav1.HostPhaseClaimed
 
-	if err := r.Client.Status().Update(ctx, latest); err != nil {
+	err = r.Client.Status().Update(ctx, latest)
+	if err != nil {
 		return err
 	}
 
 	// Ensure the protection finalizer so a claimed host cannot be deleted
 	// out from under the ByotMachine.
 	if controllerutil.AddFinalizer(latest, byotHostFinalizer) {
-		if err := r.Client.Update(ctx, latest); err != nil {
+		err = r.Client.Update(ctx, latest)
+		if err != nil {
 			return fmt.Errorf("failed to add finalizer to ByotHost %s: %w", latest.Name, err)
 		}
 	}
@@ -311,7 +321,8 @@ func (r *ByotMachineReconciler) releaseHost(
 
 	publicIP := byotMachine.Status.ResolvedPublicIP
 
-	if err := attemptReset(ctx, candidates, publicIP); err != nil {
+	err = attemptReset(ctx, candidates, publicIP)
+	if err != nil {
 		return fmt.Errorf("failed to reset host %s (%s): %w", host.Name, publicIP, err)
 	}
 
@@ -320,7 +331,8 @@ func (r *ByotMachineReconciler) releaseHost(
 	host.Status.Phase = infrav1.HostPhaseReleasing
 	host.Status.ClaimRef = nil
 
-	if err := r.Client.Status().Update(ctx, host); err != nil {
+	err = r.Client.Status().Update(ctx, host)
+	if err != nil {
 		return fmt.Errorf("failed to update ByotHost %s status on release: %w", host.Name, err)
 	}
 
