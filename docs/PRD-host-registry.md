@@ -195,7 +195,7 @@ meaningful for selection:
 | `byot.io/memory-class`   | `hardware.memory`    | bucketed: `4G`, `8G`, `16G`, `32G`, `64G`, `128G`                                                     |
 | `byot.io/disk-type`      | system disk's `type` | `nvme`, `ssd`, `hdd`, `sd`                                                                            |
 | `byot.io/disk-class`     | system disk's `size` | bucketed: `20G`, `100G`, `250G`, `500G`, `1T`                                                         |
-| `byot.io/platform`       | `platform`           | `scaleway`, `copenhagen`, ...                                                                         |
+| `byot.io/platform`       | `platform`           | `scaleway`, `azure`, ...                                                                         |
 | `byot.io/talos-version`  | `talosVersion`       | `v1.13.8`, ...                                                                                        |
 | `byot.io/failure-domain` | `spec.failureDomain` | operator-set physical FD, e.g. `par01`, `par02` (matched by claim selector for spread — see PLA-6629) |
 

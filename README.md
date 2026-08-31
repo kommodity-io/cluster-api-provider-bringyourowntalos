@@ -126,7 +126,7 @@ bucketed subset to controller-managed `byot.io/` labels:
 | `byot.io/gpu-count`      | `hardware.gpus.count`  | integer as string (omitted when no GPU)                                      |
 | `byot.io/gpu-vendor`     | `hardware.gpus.vendor` | `nvidia` / `amd` / `intel` (omitted on mixed-vendor hosts)                   |
 | `byot.io/gpu-model`      | `hardware.gpus.model`  | `h100-pcie`, `b300-sxm6`, `mi300x`, ... (omitted on unknown/mixed hosts)     |
-| `byot.io/platform`       | `platform`             | `scaleway`, `copenhagen`, ...                                                |
+| `byot.io/platform`       | `platform`             | `scaleway`, `azure`, ...                                                     |
 | `byot.io/talos-version`  | `talosVersion`         | `v1.13.8`, ...                                                               |
 | `byot.io/failure-domain` | `spec.failureDomain`   | operator-set physical FD, e.g. `par01`                                       |
 
