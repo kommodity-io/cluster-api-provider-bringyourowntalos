@@ -237,7 +237,10 @@ race leaves a stale `available: true`).
      maintenance-live); else requeue.
    - `hostSelector` set → list `Available` hosts matching `matchLabels` +
      `failureDomain`; claim the first via optimistic CAS on
-     `status.claimRef` (first writer wins; losers requeue and retry).
+     `status.claimRef` (first writer wins; losers requeue and retry). A
+     `ByotHost` with no `spec.failureDomain` is domain-agnostic and matches
+     any ByotMachine (spread is only enforced for tagged hosts);
+     `failureDomain` on `ByotHost` is optional.
 2. Set `ByotHost.status.claimRef` to this ByotMachine; the host finalizer
    blocks `ByotHost` deletion while claimed. Set `ByotHost.phase=Claimed`.
 3. Resolve `publicIP` from the claimed `ByotHost` into

@@ -379,6 +379,31 @@ func TestFilterClaimCandidatesNoFailureDomainMatchesAllAvailable(t *testing.T) {
 	assert.Len(t, got, 2)
 }
 
+func TestFilterClaimCandidatesDomainAgnosticHostMatchesAnyFailureDomain(t *testing.T) {
+	t.Parallel()
+
+	// A ByotHost with no failureDomain is domain-agnostic: claimable by a
+	// ByotMachine that specifies a failureDomain (spread is not enforced for
+	// untagged hosts). failureDomain on ByotHost is optional.
+	domain := "fd-a"
+	otherDomain := "fd-b"
+	available := infrav1.HostPhaseAvailable
+
+	hosts := []infrav1.ByotHost{
+		hostCandidate("tagged-match", &domain, available, ""),
+		hostCandidate("untagged", nil, available, ""),
+		hostCandidate("tagged-mismatch", &otherDomain, available, ""),
+	}
+
+	byotMachine := &infrav1.ByotMachine{Spec: infrav1.ByotMachineSpec{FailureDomain: &domain}}
+	byotMachine.UID = "self"
+
+	got := filterClaimCandidates(hosts, byotMachine)
+	require.Len(t, got, 2)
+	assert.Equal(t, "tagged-match", got[0].Name) // sorted first
+	assert.Equal(t, "untagged", got[1].Name)
+}
+
 func TestFilterClaimCandidatesExcludesAvailableHostMidProbeFailure(t *testing.T) {
 	t.Parallel()
 

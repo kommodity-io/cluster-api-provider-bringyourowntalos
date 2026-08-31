@@ -211,6 +211,23 @@ func hostClaimable(host *infrav1.ByotHost) bool {
 	return conditions.IsTrue(host, infrav1.HostMaintenanceProbeCondition)
 }
 
+// hostMatchesFailureDomain reports whether a host satisfies a ByotMachine's
+// failure-domain constraint. A ByotMachine without a failureDomain accepts any
+// host. A host with no failureDomain is domain-agnostic and accepted by any
+// ByotMachine (spread is only enforced for tagged hosts; failureDomain on
+// ByotHost is optional).
+func hostMatchesFailureDomain(host *infrav1.ByotHost, want *string) bool {
+	if want == nil || *want == "" {
+		return true
+	}
+
+	if host.Spec.FailureDomain == nil || *host.Spec.FailureDomain == "" {
+		return true
+	}
+
+	return *host.Spec.FailureDomain == *want
+}
+
 // filterClaimCandidates keeps only Available, unclaimed (or self-claimed)
 // hosts matching the failureDomain, when set.
 func filterClaimCandidates(hosts []infrav1.ByotHost, byotMachine *infrav1.ByotMachine) []infrav1.ByotHost {
@@ -231,10 +248,8 @@ func filterClaimCandidates(hosts []infrav1.ByotHost, byotMachine *infrav1.ByotMa
 			continue
 		}
 
-		if byotMachine.Spec.FailureDomain != nil && *byotMachine.Spec.FailureDomain != "" {
-			if host.Spec.FailureDomain == nil || *host.Spec.FailureDomain != *byotMachine.Spec.FailureDomain {
-				continue
-			}
+		if !hostMatchesFailureDomain(host, byotMachine.Spec.FailureDomain) {
+			continue
 		}
 
 		out = append(out, *host)
