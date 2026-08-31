@@ -24,7 +24,7 @@ Two adoption modes for the claimed host:
 - **Maintenance mode** (the registry path): the host is in maintenance, so the
   bootstrap config applies via unverified TLS (no host agent needed).
 - **Already configured**: a foreign machine previously booted with some other
-  machineconfig is taken over via mTLS using the machine's *current*
+  machineconfig is taken over via mTLS using the machine's _current_
   talosconfig (`spec.talosConfigSecretRef`).
 
 After adoption, byot keeps machines in sync: when the bootstrap data changes,
@@ -115,17 +115,17 @@ after consecutive failures and re-discovering on recovery. Discovery populates
 a rich typed `status` (view-only) and promotes a curated, bucketed subset to
 controller-managed `byot.io/` labels:
 
-| Label                    | Source               | Values                                            |
-| ------------------------ | -------------------- | ------------------------------------------------- |
-| `byot.io/available`      | phase                | `"true"` only when `phase=Available`              |
-| `byot.io/cpu-cores`      | `hardware.cpu.cores` | integer as string                                 |
-| `byot.io/cpu-arch`       | `Version` arch       | `amd64` / `arm64`                                 |
-| `byot.io/memory-class`   | `hardware.memory`    | `4G` / `8G` / `16G` / `32G` / `64G` / `128G`      |
-| `byot.io/disk-type`      | system disk type     | `nvme` / `ssd` / `hdd` / `sd`                     |
-| `byot.io/disk-class`     | system disk size     | `20G` / `100G` / `250G` / `500G` / `1T`          |
-| `byot.io/platform`       | `platform`           | `scaleway`, `gefion`, ...                         |
-| `byot.io/talos-version`  | `talosVersion`       | `v1.13.8`, ...                                    |
-| `byot.io/failure-domain` | `spec.failureDomain` | operator-set physical FD, e.g. `par01`           |
+| Label                    | Source               | Values                                       |
+| ------------------------ | -------------------- | -------------------------------------------- |
+| `byot.io/available`      | phase                | `"true"` only when `phase=Available`         |
+| `byot.io/cpu-cores`      | `hardware.cpu.cores` | integer as string                            |
+| `byot.io/cpu-arch`       | `Version` arch       | `amd64` / `arm64`                            |
+| `byot.io/memory-class`   | `hardware.memory`    | `4G` / `8G` / `16G` / `32G` / `64G` / `128G` |
+| `byot.io/disk-type`      | system disk type     | `nvme` / `ssd` / `hdd` / `sd`                |
+| `byot.io/disk-class`     | system disk size     | `20G` / `100G` / `250G` / `500G` / `1T`      |
+| `byot.io/platform`       | `platform`           | `scaleway`, `gefion`, ...                    |
+| `byot.io/talos-version`  | `talosVersion`       | `v1.13.8`, ...                               |
+| `byot.io/failure-domain` | `spec.failureDomain` | operator-set physical FD, e.g. `par01`       |
 
 A host is `Available` (claimable) only when maintenance-liveness is confirmed
 **and** features are discovered. Operators may add their own freeform labels
@@ -134,7 +134,7 @@ A host is `Available` (claimable) only when maintenance-liveness is confirmed
 ### Release
 
 Deleting a `ByotMachine` that has claimed a host always resets the host (STATE
-+ EPHEMERAL) back to maintenance and flips the host to `Releasing`; the liveness
+EPHEMERAL) back to maintenance and flips the host to `Releasing`; the liveness
 loop returns it to `Available` for re-claim. There is no "leave running" path
 for claimed hosts: every release is a clean reset. A `ByotHost` deletion is
 blocked by a finalizer while claimed — delete the owning `ByotMachine` first.
