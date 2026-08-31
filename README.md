@@ -123,13 +123,13 @@ controller-managed `byot.io/` labels:
 | `byot.io/memory-class`   | `hardware.memory`    | `4G` / `8G` / `16G` / `32G` / `64G` / `128G` |
 | `byot.io/disk-type`      | system disk type     | `nvme` / `ssd` / `hdd` / `sd`                |
 | `byot.io/disk-class`     | system disk size     | `20G` / `100G` / `250G` / `500G` / `1T`      |
-| `byot.io/platform`       | `platform`           | `scaleway`, `gefion`, ...                    |
+| `byot.io/platform`       | `platform`           | `scaleway`, `copenhagen`, ...                |
 | `byot.io/talos-version`  | `talosVersion`       | `v1.13.8`, ...                               |
 | `byot.io/failure-domain` | `spec.failureDomain` | operator-set physical FD, e.g. `par01`       |
 
 A host is `Available` (claimable) only when maintenance-liveness is confirmed
 **and** features are discovered. Operators may add their own freeform labels
-(e.g. `site: gefion`); the controller never overwrites non-`byot.io/` labels.
+(e.g. `site: copenhagen`); the controller never overwrites non-`byot.io/` labels.
 
 ### Release
 

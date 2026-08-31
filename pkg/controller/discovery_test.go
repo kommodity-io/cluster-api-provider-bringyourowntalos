@@ -4,13 +4,14 @@ import (
 	"strings"
 	"testing"
 
+	"strconv"
+
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/cluster-api/util/conditions"
-	"strconv"
 )
 
 func TestParseCPUDefaultsToSingleCPU(t *testing.T) {
@@ -71,17 +72,17 @@ func TestBucketMemory(t *testing.T) {
 		ki     int64
 		bucket string
 	}{
-		{3 * 1024 * 1024, "4G"},      // ~3Gi -> 4G
-		{7 * 1024 * 1024, "8G"},      // ~7Gi -> 8G
-		{15 * 1024 * 1024, "16G"},    // ~15Gi -> 16G
-		{30 * 1024 * 1024, "32G"},    // ~30Gi -> 32G
-		{60 * 1024 * 1024, "64G"},    // ~60Gi -> 64G
-		{120 * 1024 * 1024, "128G"},  // ~120Gi -> 128G
-		{200 * 1024 * 1024, "256G"},  // ~200Gi -> 256G
-		{400 * 1024 * 1024, "512G"},  // ~400Gi -> 512G
-		{800 * 1024 * 1024, "1T"},    // ~800Gi -> 1T
-		{1900 * 1024 * 1024, "2T"},   // ~1900Gi -> 2T
-		{4000 * 1024 * 1024, "2T"},   // oversized -> clamp
+		{3 * 1024 * 1024, "4G"},     // ~3Gi -> 4G
+		{7 * 1024 * 1024, "8G"},     // ~7Gi -> 8G
+		{15 * 1024 * 1024, "16G"},   // ~15Gi -> 16G
+		{30 * 1024 * 1024, "32G"},   // ~30Gi -> 32G
+		{60 * 1024 * 1024, "64G"},   // ~60Gi -> 64G
+		{120 * 1024 * 1024, "128G"}, // ~120Gi -> 128G
+		{200 * 1024 * 1024, "256G"}, // ~200Gi -> 256G
+		{400 * 1024 * 1024, "512G"}, // ~400Gi -> 512G
+		{800 * 1024 * 1024, "1T"},   // ~800Gi -> 1T
+		{1900 * 1024 * 1024, "2T"},  // ~1900Gi -> 2T
+		{4000 * 1024 * 1024, "2T"},  // oversized -> clamp
 	}
 
 	for _, c := range cases {
@@ -153,10 +154,10 @@ func TestApplyDiscoveryLabelsPromotesCuratedLabels(t *testing.T) {
 			FailureDomain: &fd,
 		},
 		Status: infrav1.ByotHostStatus{
-			Phase:       infrav1.HostPhaseAvailable,
+			Phase:        infrav1.HostPhaseAvailable,
 			TalosVersion: "v1.13.8",
-			Arch:        "amd64",
-			Platform:    "scaleway",
+			Arch:         "amd64",
+			Platform:     "scaleway",
 			Hardware: &infrav1.HostHardware{
 				CPU:    infrav1.HostCPU{Cores: 16},
 				Memory: resource.MustParse("64Gi"),
@@ -169,7 +170,7 @@ func TestApplyDiscoveryLabelsPromotesCuratedLabels(t *testing.T) {
 	}
 
 	// Operator labels preserved.
-	host.Labels = map[string]string{"site": "gefion"}
+	host.Labels = map[string]string{"site": "copenhagen"}
 
 	applyDiscoveryLabels(host)
 
@@ -182,7 +183,7 @@ func TestApplyDiscoveryLabelsPromotesCuratedLabels(t *testing.T) {
 	assert.Equal(t, "scaleway", host.Labels[labelPlatform])
 	assert.Equal(t, "v1.13.8", host.Labels[labelTalosVersion])
 	assert.Equal(t, "par01", host.Labels[labelFailureDomain])
-	assert.Equal(t, "gefion", host.Labels["site"]) // operator label preserved
+	assert.Equal(t, "copenhagen", host.Labels["site"]) // operator label preserved
 }
 
 func TestApplyDiscoveryLabelsDropsAvailableWhenNotAvailable(t *testing.T) {
@@ -192,13 +193,13 @@ func TestApplyDiscoveryLabelsDropsAvailableWhenNotAvailable(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "host-1"},
 		Status:     infrav1.ByotHostStatus{Phase: infrav1.HostPhaseUnavailable},
 	}
-	host.Labels = map[string]string{labelAvailable: "true", "site": "gefion"}
+	host.Labels = map[string]string{labelAvailable: "true", "site": "copenhagen"}
 
 	applyDiscoveryLabels(host)
 
 	_, hasAvailable := host.Labels[labelAvailable]
 	assert.False(t, hasAvailable)
-	assert.Equal(t, "gefion", host.Labels["site"])
+	assert.Equal(t, "copenhagen", host.Labels["site"])
 }
 
 func TestApplyDiscoveryLabelsPreservesOperatorLabelsAcrossRediscovery(t *testing.T) {
@@ -209,15 +210,15 @@ func TestApplyDiscoveryLabelsPreservesOperatorLabelsAcrossRediscovery(t *testing
 		Status:     infrav1.ByotHostStatus{Phase: infrav1.HostPhaseAvailable, Arch: "arm64"},
 	}
 	host.Labels = map[string]string{
-		"site":            "gefion",
-		labelCPUArch:      "amd64", // stale, should be overwritten
-		labelAvailable:    "true",
+		"site":         "copenhagen",
+		labelCPUArch:   "amd64", // stale, should be overwritten
+		labelAvailable: "true",
 	}
 
 	applyDiscoveryLabels(host)
 
 	assert.Equal(t, "arm64", host.Labels[labelCPUArch]) // controller label overwritten
-	assert.Equal(t, "gefion", host.Labels["site"])     // operator label preserved
+	assert.Equal(t, "copenhagen", host.Labels["site"])  // operator label preserved
 }
 
 func TestDiscoverHostFailsOnUnreachable(t *testing.T) {
@@ -230,6 +231,7 @@ func TestDiscoverHostFailsOnUnreachable(t *testing.T) {
 	assert.True(t, strings.Contains(err.Error(), "version discovery") ||
 		strings.Contains(err.Error(), "maintenance client"))
 }
+
 // h100DmesgLine is a real kernel dmesg line captured from a Scaleway H100-1-80G
 // host in Talos maintenance mode (PLA-6633 probe). 10de:2331 = NVIDIA GH100
 // (H100 PCIe 80G), class 0x030200 (headless 3D controller).
@@ -350,14 +352,14 @@ func TestApplyDiscoveryLabelsGPUs(t *testing.T) {
 			},
 		},
 	}
-	host.Labels = map[string]string{"site": "gefion"}
+	host.Labels = map[string]string{"site": "copenhagen"}
 
 	applyDiscoveryLabels(host)
 
 	assert.Equal(t, "1", host.Labels[labelGPUCount])
 	assert.Equal(t, "nvidia", host.Labels[labelGPUVendor])
 	assert.Equal(t, "h100-pcie", host.Labels[labelGPUModel])
-	assert.Equal(t, "gefion", host.Labels["site"])
+	assert.Equal(t, "copenhagen", host.Labels["site"])
 }
 
 func TestApplyDiscoveryLabelsGPUsMixedOmitsModel(t *testing.T) {

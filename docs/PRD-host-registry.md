@@ -100,7 +100,7 @@ metadata:
     byot.io/disk-class: "20G"
     byot.io/platform: "scaleway"
     byot.io/talos-version: "v1.13.8"
-    site: gefion # freeform operator labels, also matchable
+    site: copenhagen # freeform operator labels, also matchable
 spec:
   publicIP: "203.0.113.10" # immutable identity
   failureDomain: "par01" # first-class, matched by ByotMachine
@@ -145,7 +145,7 @@ spec:
       byot.io/available: "true"
       byot.io/disk-type: "ssd"
       byot.io/memory-class: "64G"
-      site: gefion
+      site: copenhagen
   failureDomain: "par01" # matched against ByotHost.spec.failureDomain
   # spec.publicIP REMOVED — IP resolved from claimed ByotHost
   # joinPolicy, splitPolicy, talosConfigSecretRef REMOVED (Decisions 6/12;
@@ -195,14 +195,14 @@ meaningful for selection:
 | `byot.io/memory-class`   | `hardware.memory`    | bucketed: `4G`, `8G`, `16G`, `32G`, `64G`, `128G`                                                     |
 | `byot.io/disk-type`      | system disk's `type` | `nvme`, `ssd`, `hdd`, `sd`                                                                            |
 | `byot.io/disk-class`     | system disk's `size` | bucketed: `20G`, `100G`, `250G`, `500G`, `1T`                                                         |
-| `byot.io/platform`       | `platform`           | `scaleway`, `gefion`, ...                                                                             |
+| `byot.io/platform`       | `platform`           | `scaleway`, `copenhagen`, ...                                                                         |
 | `byot.io/talos-version`  | `talosVersion`       | `v1.13.8`, ...                                                                                        |
 | `byot.io/failure-domain` | `spec.failureDomain` | operator-set physical FD, e.g. `par01`, `par02` (matched by claim selector for spread — see PLA-6629) |
 
 NOT promoted (high cardinality or not selection-relevant; remain in status
 only): disk model, serial, uuid, wwid, bus path, MAC, exact memory bytes,
 non-system disks, TSC MHz, NUMA detail. Operators may add their own freeform
-labels (e.g. `site: gefion`); the controller never overwrites operator labels.
+labels (e.g. `site: copenhagen`); the controller never overwrites operator labels.
 
 Selector claims are pure label selectors and conventionally include
 `byot.io/available: "true"` plus any capability labels. The controller lists
