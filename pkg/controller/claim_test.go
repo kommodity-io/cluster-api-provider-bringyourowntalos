@@ -56,7 +56,7 @@ func TestClaimHostRequeuesWhenHostUnavailable(t *testing.T) {
 	require.NoError(t, clusterv1.AddToScheme(scheme))
 
 	machine := newClaimingByotMachine("missing-host")
-	host := newAvailableByotHost("missing-host", "203.0.113.10")
+	host := newAvailableByotHost("missing-host", testHostPublicIP)
 	host.Status.Phase = infrav1.HostPhaseUnavailable
 
 	client := fake.NewClientBuilder().
@@ -108,7 +108,7 @@ func TestClaimHostClaimsAvailableHost(t *testing.T) {
 	require.NoError(t, clusterv1.AddToScheme(scheme))
 
 	machine := newClaimingByotMachine(testHostName)
-	host := newAvailableByotHost(testHostName, "203.0.113.10")
+	host := newAvailableByotHost(testHostName, testHostPublicIP)
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -126,7 +126,7 @@ func TestClaimHostClaimsAvailableHost(t *testing.T) {
 	assert.Zero(t, result.RequeueAfter)
 
 	assert.Equal(t, testHostName, machine.Status.ResolvedHost)
-	assert.Equal(t, "203.0.113.10", machine.Status.ResolvedPublicIP)
+	assert.Equal(t, testHostPublicIP, machine.Status.ResolvedPublicIP)
 
 	// Host is now Claimed with claimRef pointing at the ByotMachine.
 	updated := &infrav1.ByotHost{}
@@ -147,9 +147,9 @@ func TestClaimHostIdempotentWhenAlreadyClaimed(t *testing.T) {
 
 	machine := newClaimingByotMachine(testHostName)
 	machine.Status.ResolvedHost = testHostName
-	machine.Status.ResolvedPublicIP = "203.0.113.10"
+	machine.Status.ResolvedPublicIP = testHostPublicIP
 
-	host := newAvailableByotHost(testHostName, "203.0.113.10")
+	host := newAvailableByotHost(testHostName, testHostPublicIP)
 	host.Status.Phase = infrav1.HostPhaseClaimed
 	host.Status.ClaimRef = &infrav1.HostClaimRef{
 		Kind: "ByotMachine", Name: testMachineName, Namespace: testNamespace, UID: testMachineUID,
@@ -257,9 +257,9 @@ func TestClaimHostLostClaimReclaims(t *testing.T) {
 	// (claimRef cleared, phase Available). claimHost must re-claim it.
 	machine := newClaimingByotMachine(testHostName)
 	machine.Status.ResolvedHost = testHostName
-	machine.Status.ResolvedPublicIP = "203.0.113.10"
+	machine.Status.ResolvedPublicIP = testHostPublicIP
 
-	host := newAvailableByotHost(testHostName, "203.0.113.10") // Available, no claimRef
+	host := newAvailableByotHost(testHostName, testHostPublicIP) // Available, no claimRef
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -279,6 +279,62 @@ func TestClaimHostLostClaimReclaims(t *testing.T) {
 	assert.Equal(t, testHostName, machine.Status.ResolvedHost)
 }
 
+func TestClaimHostTransientGetErrorKeepsResolvedHost(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	// ByotMachine holds a valid claim; a transient Get error (throttle/timeout)
+	// must not clear ResolvedHost, or the still-Claimed host would be orphaned.
+	machine := newClaimingByotMachine(testHostName)
+	machine.Status.ResolvedHost = testHostName
+	machine.Status.ResolvedPublicIP = testHostPublicIP
+
+	host := newAvailableByotHost(testHostName, testHostPublicIP)
+	host.Status.Phase = infrav1.HostPhaseClaimed
+	host.Status.ClaimRef = &infrav1.HostClaimRef{
+		Kind: "ByotMachine", Name: testMachineName, Namespace: testNamespace, UID: testMachineUID,
+	}
+
+	transientErr := apierrors.NewServerTimeout(
+		schema.GroupResource{Resource: "byothosts"}, "get", 1)
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}, &infrav1.ByotHost{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(
+				_ context.Context,
+				_ ctrlclient.WithWatch,
+				key ctrlclient.ObjectKey,
+				_ ctrlclient.Object,
+				_ ...ctrlclient.GetOption,
+			) error {
+				if key.Name == testHostName {
+					return transientErr
+				}
+
+				return nil
+			},
+		}).
+		Build()
+
+	r := NewByotMachineReconciler(client)
+	patchHelper, err := patch.NewHelper(machine, client)
+	require.NoError(t, err)
+
+	_, handled, err := r.claimHost(t.Context(), machine, patchHelper)
+	require.Error(t, err)
+	assert.True(t, handled)
+	require.ErrorIs(t, err, transientErr)
+
+	// Status must be untouched: ResolvedHost kept, no orphaned host.
+	assert.Equal(t, testHostName, machine.Status.ResolvedHost)
+	assert.Equal(t, testHostPublicIP, machine.Status.ResolvedPublicIP)
+}
+
 func TestClaimHostLostRaceRequeuesOnConflict(t *testing.T) {
 	t.Parallel()
 
@@ -290,7 +346,7 @@ func TestClaimHostLostRaceRequeuesOnConflict(t *testing.T) {
 	// claimRef first). claimHost must swallow the conflict and requeue for a
 	// retry rather than erroring.
 	machine := newClaimingByotMachine(testHostName)
-	host := newAvailableByotHost(testHostName, "203.0.113.10")
+	host := newAvailableByotHost(testHostName, testHostPublicIP)
 
 	client := fake.NewClientBuilder().
 		WithScheme(scheme).

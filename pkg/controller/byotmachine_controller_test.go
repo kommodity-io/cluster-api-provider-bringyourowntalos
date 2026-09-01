@@ -36,6 +36,9 @@ const (
 	testNamespace   = "default"
 	testMachineUID  = "machine-uid"
 	testHostName    = "test-host"
+
+	// testHostPublicIP is the example address used for resolved hosts in tests.
+	testHostPublicIP = "203.0.113.10"
 )
 
 func clusterKey(obj metav1.Object) types.NamespacedName {

@@ -79,8 +79,13 @@ func (r *ByotMachineReconciler) claimHost(
 }
 
 // verifyExistingClaim returns kept=true when the ByotMachine already holds a
-// valid claim on its resolved host. A lost claim (host gone or re-claimed
-// elsewhere) is cleared so the caller re-claims.
+// valid claim on its resolved host. A confirmed-lost claim (host gone or
+// re-claimed elsewhere) is cleared so the caller re-claims. A transient Get
+// error (throttle/timeout/5xx) is returned without mutating status: clearing
+// ResolvedHost here while the host is still Claimed-by-self would orphan it on
+// the next reconcile (resolveHostRef re-fetches, sees Phase != Available, and
+// requeues forever; deleting the ByotMachine no-ops releaseHost and leaves the
+// host Claimed with a dangling claimRef).
 func (r *ByotMachineReconciler) verifyExistingClaim(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
@@ -96,33 +101,52 @@ func (r *ByotMachineReconciler) verifyExistingClaim(
 		Namespace: byotMachine.Namespace,
 		Name:      byotMachine.Status.ResolvedHost,
 	}, host)
-
-	if err == nil && host.Status.ClaimRef != nil && host.Status.ClaimRef.UID == string(byotMachine.UID) {
-		// Keep the resolved IP in sync (the host IP is immutable, so this
-		// only heals a stale status).
-		if byotMachine.Status.ResolvedPublicIP != host.Spec.PublicIP {
-			byotMachine.Status.ResolvedPublicIP = host.Spec.PublicIP
-
-			err = patchHelper.Patch(ctx, byotMachine)
-			if err != nil {
-				return false, fmt.Errorf("failed to patch ByotMachine resolved IP: %w", err)
-			}
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// Host genuinely gone: clear and re-claim.
+			return false, r.clearResolvedHost(ctx, byotMachine, patchHelper)
 		}
 
-		return true, nil
+		// Transient error: do not mutate status, retry on next reconcile.
+		return false, fmt.Errorf("failed to get ByotHost %s: %w", byotMachine.Status.ResolvedHost, err)
 	}
 
-	// Lost the claim (host released/deleted/re-claimed elsewhere): clear
-	// and fall through to re-claim.
+	if host.Status.ClaimRef == nil || host.Status.ClaimRef.UID != string(byotMachine.UID) {
+		// Lost the claim (host re-claimed elsewhere): clear and re-claim.
+		return false, r.clearResolvedHost(ctx, byotMachine, patchHelper)
+	}
+
+	// Keep the resolved IP in sync (the host IP is immutable, so this
+	// only heals a stale status).
+	if byotMachine.Status.ResolvedPublicIP != host.Spec.PublicIP {
+		byotMachine.Status.ResolvedPublicIP = host.Spec.PublicIP
+
+		err = patchHelper.Patch(ctx, byotMachine)
+		if err != nil {
+			return false, fmt.Errorf("failed to patch ByotMachine resolved IP: %w", err)
+		}
+	}
+
+	return true, nil
+}
+
+// clearResolvedHost clears the resolved host/IP and patches the ByotMachine.
+// Used when a claim is confirmed lost (host gone or re-claimed elsewhere), so
+// the caller re-claims on the next reconcile.
+func (r *ByotMachineReconciler) clearResolvedHost(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+	patchHelper *patch.Helper,
+) error {
 	byotMachine.Status.ResolvedHost = ""
 	byotMachine.Status.ResolvedPublicIP = ""
 
-	err = patchHelper.Patch(ctx, byotMachine)
+	err := patchHelper.Patch(ctx, byotMachine)
 	if err != nil {
-		return false, fmt.Errorf("failed to patch ByotMachine after lost claim: %w", err)
+		return fmt.Errorf("failed to patch ByotMachine after lost claim: %w", err)
 	}
 
-	return false, nil
+	return nil
 }
 
 // resolveClaimCandidate picks the ByotHost to claim: the host named by

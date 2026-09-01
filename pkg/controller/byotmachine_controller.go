@@ -186,6 +186,9 @@ func (r *ByotMachineReconciler) SetupWithManager(
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=byotmachines,verbs=create;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=byotmachines/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=byotmachines/finalizers,verbs=update
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=byothosts,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=byothosts/status,verbs=update;patch
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=byothosts/finalizers,verbs=update
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;machines/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
