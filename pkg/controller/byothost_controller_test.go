@@ -71,6 +71,13 @@ func fakeDiscovery() DiscoveryResult {
 			{Name: "/dev/sda", Size: resource.MustParse("100Gi"), Type: "SSD", SystemDisk: true},
 		},
 		NetworkInterfaces: []string{"eth0"},
+		Identity: &infrav1.HostIdentity{
+			SystemUUID:   "12345678-1234-1234-1234-123456789012",
+			SerialNumber: "SVC0001",
+			Manufacturer: "Supermicro",
+			ProductName:  "X12SPA",
+			HardwareAddr: "52:54:00:12:34:56",
+		},
 	}
 }
 
@@ -102,6 +109,12 @@ func TestByotHostReconcileDiscoveryPopulatesStatusAndLabels(t *testing.T) {
 	require.NotNil(t, updated.Status.Hardware)
 	assert.Equal(t, int32(4), updated.Status.Hardware.CPU.Cores)
 	assert.True(t, conditions.IsTrue(updated, infrav1.HostDiscoveredCondition))
+
+	// Reboot-stable identity copied into status.
+	require.NotNil(t, updated.Status.Identity)
+	assert.Equal(t, "12345678-1234-1234-1234-123456789012", updated.Status.Identity.SystemUUID)
+	assert.Equal(t, "52:54:00:12:34:56", updated.Status.Identity.HardwareAddr)
+	assert.Equal(t, "SVC0001", updated.Status.Identity.SerialNumber)
 
 	// Curated labels promoted.
 	assert.Equal(t, "true", updated.Labels[labelAvailable])

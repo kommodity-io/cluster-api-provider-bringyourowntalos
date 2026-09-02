@@ -410,6 +410,7 @@ func (r *ByotHostReconciler) populateFromDiscovery(host *infrav1.ByotHost, resul
 	host.Status.TalosVersion = result.TalosVersion
 	host.Status.Arch = result.Arch
 	host.Status.Platform = result.Platform
+	host.Status.Identity = result.Identity
 	host.Status.Hardware = &infrav1.HostHardware{
 		CPU:               result.CPU,
 		Memory:            result.Memory,

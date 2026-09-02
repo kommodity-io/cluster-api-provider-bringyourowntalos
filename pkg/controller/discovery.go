@@ -10,8 +10,12 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	storageapi "github.com/siderolabs/talos/pkg/machinery/api/storage"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -48,6 +52,7 @@ type DiscoveryResult struct {
 	Disks             []infrav1.HostDisk
 	NetworkInterfaces []string
 	GPUs              *infrav1.HostGPU
+	Identity          *infrav1.HostIdentity
 }
 
 // discoverHost runs the maintenance-mode discovery surface against publicIP:
@@ -94,6 +99,12 @@ func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error)
 	if err != nil {
 		return result, fmt.Errorf("net discovery: %w", err)
 	}
+
+	// Identity is best-effort: a host without SMBIOS UUID and without a
+	// physical NIC still completes discovery, just with an empty Identity.
+	// Identity fields that fail to fetch individually are left empty rather
+	// than aborting the whole discovery.
+	discoverIdentity(ctx, client.COSI, &result)
 
 	return result, nil
 }
@@ -489,6 +500,45 @@ func discoverNetInterfaces(
 	result.NetworkInterfaces = ifaces
 
 	return nil
+}
+
+// discoverIdentity fetches the reboot-stable hardware identity of the host:
+// the SMBIOS System Information UUID (and the supporting serial/manufacturer/
+// product fields) and the first-up NIC hardware address. It is best-effort:
+// each field is fetched independently and a missing/empty value is recorded as
+// an empty string rather than failing discovery, so a host with no SMBIOS UUID
+// or a virtual NIC still completes discovery with a partial identity. The
+// caller treats an all-empty Identity as "no identity available".
+func discoverIdentity(
+	ctx context.Context,
+	cosi state.CoreState,
+	result *DiscoveryResult,
+) {
+	identity := &infrav1.HostIdentity{}
+
+	sysInfo, err := safe.StateGetByID[*hardware.SystemInformation](ctx, cosi, hardware.SystemInformationID)
+	if err == nil && sysInfo != nil {
+		spec := sysInfo.TypedSpec()
+		identity.SystemUUID = spec.UUID
+		identity.SerialNumber = spec.SerialNumber
+		identity.Manufacturer = spec.Manufacturer
+		identity.ProductName = spec.ProductName
+	}
+
+	hwAddr, err := safe.StateGetByID[*network.HardwareAddr](ctx, cosi, network.FirstHardwareAddr)
+	if err == nil && hwAddr != nil {
+		identity.HardwareAddr = hwAddr.TypedSpec().HardwareAddr.String()
+	}
+
+	// Only store a non-empty identity; an all-zero Identity is meaningless and
+	// keeps the status field nil to signal "identity unavailable".
+	if identity.SystemUUID == "" && identity.HardwareAddr == "" &&
+		identity.SerialNumber == "" && identity.Manufacturer == "" &&
+		identity.ProductName == "" {
+		return
+	}
+
+	result.Identity = identity
 }
 
 // memoryBuckets are the selection-oriented memory classes, ascending.
