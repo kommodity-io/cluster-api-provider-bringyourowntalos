@@ -6,7 +6,13 @@ import (
 
 	"strconv"
 
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
+	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
+	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -504,4 +510,85 @@ func TestParseGPUsAMDInstinct(t *testing.T) {
 	assert.False(t, gpu.Mixed)
 	assert.Equal(t, "192Gi", gpu.MemoryPerGPU.String())
 	assert.Equal(t, "192Gi", gpu.TotalMemory.String())
+}
+
+// newTestCOSI builds a multi-namespace in-memory COSI state for identity
+// discovery tests. The hardware and network namespaces hold the
+// SystemInformation and HardwareAddr resources respectively.
+func newTestCOSI() state.CoreState {
+	return namespaced.NewState(inmem.Build)
+}
+
+func TestDiscoverIdentityPopulatesFromCOSI(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	sysInfo := hardware.NewSystemInformation(hardware.SystemInformationID)
+	sysInfo.TypedSpec().UUID = "12345678-1234-1234-1234-123456789012"
+	sysInfo.TypedSpec().SerialNumber = "SVC0001"
+	sysInfo.TypedSpec().Manufacturer = "Supermicro"
+	sysInfo.TypedSpec().ProductName = "X12SPA"
+	require.NoError(t, cosi.Create(t.Context(), sysInfo))
+
+	hwAddr := network.NewHardwareAddr(network.NamespaceName, network.FirstHardwareAddr)
+	hwAddr.TypedSpec().Name = "eth0"
+	hwAddr.TypedSpec().HardwareAddr = nethelpers.HardwareAddr{0x52, 0x54, 0x00, 0x12, 0x34, 0x56}
+	require.NoError(t, cosi.Create(t.Context(), hwAddr))
+
+	result := DiscoveryResult{}
+	discoverIdentity(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.Identity)
+	assert.Equal(t, "12345678-1234-1234-1234-123456789012", result.Identity.SystemUUID)
+	assert.Equal(t, "SVC0001", result.Identity.SerialNumber)
+	assert.Equal(t, "Supermicro", result.Identity.Manufacturer)
+	assert.Equal(t, "X12SPA", result.Identity.ProductName)
+	assert.Equal(t, "52:54:00:12:34:56", result.Identity.HardwareAddr)
+}
+
+func TestDiscoverIdentityEmptyWhenNoResources(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	result := DiscoveryResult{}
+	discoverIdentity(t.Context(), cosi, &result)
+
+	assert.Nil(t, result.Identity, "all-empty identity must stay nil to signal unavailable")
+}
+
+func TestDiscoverIdentityPartialMacOnly(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	hwAddr := network.NewHardwareAddr(network.NamespaceName, network.FirstHardwareAddr)
+	hwAddr.TypedSpec().Name = "eth0"
+	hwAddr.TypedSpec().HardwareAddr = nethelpers.HardwareAddr{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc}
+	require.NoError(t, cosi.Create(t.Context(), hwAddr))
+
+	result := DiscoveryResult{}
+	discoverIdentity(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.Identity)
+	assert.Empty(t, result.Identity.SystemUUID, "SMBIOS UUID absent")
+	assert.Equal(t, "52:54:00:aa:bb:cc", result.Identity.HardwareAddr)
+}
+
+func TestDiscoverIdentityPartialUUIDOnly(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	sysInfo := hardware.NewSystemInformation(hardware.SystemInformationID)
+	sysInfo.TypedSpec().UUID = "abcdefab-cdef-abcd-efab-cdefabcdefab"
+	require.NoError(t, cosi.Create(t.Context(), sysInfo))
+
+	result := DiscoveryResult{}
+	discoverIdentity(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.Identity)
+	assert.Equal(t, "abcdefab-cdef-abcd-efab-cdefabcdefab", result.Identity.SystemUUID)
+	assert.Empty(t, result.Identity.HardwareAddr, "first-up NIC absent")
 }
