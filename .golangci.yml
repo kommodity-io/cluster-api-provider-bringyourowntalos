@@ -17,7 +17,7 @@ linters:
       # Kubebuilder-style API packages require globals, init registration and
       # long marker lines.
       - path: "api/"
-        linters: [gochecknoglobals, gochecknoinits, lll, tagliatelle]
+        linters: [gochecknoglobals, gochecknoinits, lll, tagliatelle, embeddedstructfieldcheck]
       # Tests intentionally exercise unexported behavior (finalizer names).
       - path: '_test\.go'
         linters: [testpackage]

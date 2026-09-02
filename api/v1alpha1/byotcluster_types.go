@@ -16,7 +16,8 @@ type ByotClusterSpec struct {
 type ByotClusterStatus struct {
 	// Ready denotes that the cluster infrastructure is ready. Since adopted
 	// clusters require no provisioning, this is set to true immediately.
-	Ready bool `json:"ready"`
+	// +optional
+	Ready bool `json:"ready,omitempty"`
 
 	// Conditions defines current service state of the ByotCluster.
 	// +optional

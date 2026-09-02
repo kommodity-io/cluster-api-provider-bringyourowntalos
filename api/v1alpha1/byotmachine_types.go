@@ -8,24 +8,6 @@ import (
 // ProviderIDPrefix is the scheme prefix of provider IDs assigned to adopted machines.
 const ProviderIDPrefix = "byot://"
 
-// MachinePolicy declares the lifecycle stance taken when a machine joins or
-// leaves the cluster's management.
-type MachinePolicy string
-
-const (
-	// MachinePolicyNone takes no action against the machine's running state.
-	// On join, a machine carrying state from a different cluster fails the
-	// preflight instead of being wiped. On split, the machine keeps running
-	// with its configuration and datastore intact.
-	MachinePolicyNone MachinePolicy = "None"
-
-	// MachinePolicyReset wipes the machine's STATE and EPHEMERAL system
-	// volumes via a Talos reset, returning it to maintenance mode. On join
-	// the wipe happens before configuration is applied; on split it happens
-	// before the machine is released.
-	MachinePolicyReset MachinePolicy = "Reset"
-)
-
 // LocalObjectReference contains enough information to locate a resource in the same namespace.
 type LocalObjectReference struct {
 	// Name of the referent.
@@ -33,12 +15,26 @@ type LocalObjectReference struct {
 }
 
 // ByotMachineSpec defines the desired state of ByotMachine.
+//
+// A ByotMachine claims a ByotHost from the registry and adopts the Talos
+// machine at the host's public IP. Either hostRef (explicit) or hostSelector
+// (label-based) selects the host; they are mutually exclusive.
+//
+// +kubebuilder:validation:XValidation:rule="!(has(self.hostRef) && has(self.hostSelector))",message="hostRef and hostSelector are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="has(self.hostRef) || has(self.hostSelector)",message="one of hostRef or hostSelector is required"
 type ByotMachineSpec struct {
-	// PublicIP identifies the machine to adopt. It must be reachable on the
-	// Talos machine API port (50000) in maintenance mode.
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="publicIP is immutable"
-	PublicIP string `json:"publicIP"`
+	// HostRef names the ByotHost to claim explicitly. The host must be
+	// Available (maintenance-live and discovered). Mutually exclusive with
+	// hostSelector.
+	// +optional
+	HostRef *LocalObjectReference `json:"hostRef,omitempty"`
+
+	// HostSelector selects a ByotHost to claim by label selector. The
+	// controller lists Available hosts matching the selector (plus the
+	// failureDomain, when set) and claims the first via claimRef CAS.
+	// Mutually exclusive with hostRef.
+	// +optional
+	HostSelector *metav1.LabelSelector `json:"hostSelector,omitempty"`
 
 	// TalosConfigSecretRef references a Secret holding a talosconfig (YAML
 	// under the "talosconfig" key) for the machine's CURRENT configuration.
@@ -49,35 +45,13 @@ type ByotMachineSpec struct {
 	// +optional
 	TalosConfigSecretRef *LocalObjectReference `json:"talosConfigSecretRef,omitempty"`
 
-	// JoinPolicy defines what to do when adopting the machine. "None" (the
-	// default) adopts the machine only if it is in maintenance mode or already
-	// carries this cluster's PKI bundle; a machine carrying a different
-	// cluster's state fails the join preflight instead of being wiped.
-	// "Reset" wipes the machine's STATE and EPHEMERAL system volumes before
-	// the machine configuration is applied. Reset is a pre-adoption latch: it
-	// only takes effect while no configuration has been applied yet
-	// (status.lastAppliedConfigSHA empty).
-	// +optional
-	// +kubebuilder:validation:Enum=None;Reset
-	// +kubebuilder:default=None
-	JoinPolicy MachinePolicy `json:"joinPolicy,omitempty"`
-
-	// SplitPolicy defines what to do when the machine is removed from the
-	// cluster's management. "None" (the default) removes the ByotMachine
-	// object only: the machine keeps running with its configuration and
-	// datastore intact and can be re-adopted without any changes. "Reset"
-	// wipes the machine's STATE and EPHEMERAL system volumes before it is
-	// released, returning it to maintenance mode for reuse elsewhere.
-	// +optional
-	// +kubebuilder:validation:Enum=None;Reset
-	// +kubebuilder:default=None
-	SplitPolicy MachinePolicy `json:"splitPolicy,omitempty"`
-
 	// ProviderID is set by the controller once the machine has been adopted.
 	// +optional
 	ProviderID *string `json:"providerID,omitempty"`
 
-	// FailureDomain is the unique name of the failure domain the machine is placed in.
+	// FailureDomain is the unique name of the failure domain the machine is
+	// placed in. When claiming via hostSelector, it is matched against the
+	// ByotHost's spec.failureDomain.
 	// +optional
 	FailureDomain *string `json:"failureDomain,omitempty"`
 }
@@ -87,7 +61,17 @@ type ByotMachineStatus struct {
 	// Ready denotes that the machine has been adopted: the machine
 	// configuration was applied successfully over the Talos maintenance API.
 	// +optional
-	Ready bool `json:"ready"`
+	Ready bool `json:"ready,omitempty"`
+
+	// ResolvedHost is the name of the ByotHost this machine has claimed. The
+	// public IP for adoption is read from that host.
+	// +optional
+	ResolvedHost string `json:"resolvedHost,omitempty"`
+
+	// ResolvedPublicIP is the public IP of the claimed ByotHost, used as the
+	// adoption target.
+	// +optional
+	ResolvedPublicIP string `json:"resolvedPublicIP,omitempty"`
 
 	// LastAppliedConfigSHA records the SHA256 hash of the last machine
 	// configuration applied. When the bootstrap data changes, the controller
@@ -102,6 +86,16 @@ type ByotMachineStatus struct {
 	// +optional
 	LastResetAt *metav1.Time `json:"lastResetAt,omitempty"`
 
+	// NodeUpdated records that the controller has patched the workload
+	// cluster Node's spec.providerID to byot://<resolvedPublicIP>. byot has no
+	// cloud-controller-manager, so unlike cloud providers the controller owns
+	// the Machine<->Node providerID linkage: it patches the downstream Node
+	// once after adoption so CAPI's Machine controller can match
+	// Machine.spec.providerID against Node.spec.providerID and set
+	// status.nodeRef. Gated to run once.
+	// +optional
+	NodeUpdated bool `json:"nodeUpdated,omitempty"`
+
 	// Addresses contains the machine's addresses.
 	// +optional
 	Addresses []clusterv1.MachineAddress `json:"addresses,omitempty"`
@@ -115,14 +109,14 @@ type ByotMachineStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".metadata.labels['cluster\\.x-k8s\\.io/cluster-name']",description="Cluster"
 // +kubebuilder:printcolumn:name="Machine",type="string",JSONPath=".metadata.ownerReferences[?(@.kind==\"Machine\")].name",description="Machine object which owns this ByotMachine"
-// +kubebuilder:printcolumn:name="PublicIP",type="string",JSONPath=".spec.publicIP",description="Public IP of the adopted machine"
+// +kubebuilder:printcolumn:name="PublicIP",type="string",JSONPath=".status.resolvedPublicIP",description="Public IP of the adopted machine"
 // +kubebuilder:printcolumn:name="Ready",type="boolean",JSONPath=".status.ready",description="Machine adopted"
 // +kubebuilder:printcolumn:name="ProviderID",type="string",JSONPath=".spec.providerID",description="Provider ID of the adopted machine"
 
-// ByotMachine is the Schema for the byotmachines API. It adopts an existing
-// Talos machine running in maintenance mode, identified by public IP, by
-// applying the cluster's bootstrap machine configuration over the Talos
-// machine API.
+// ByotMachine is the Schema for the byotmachines API. It claims a
+// ByotHost from the host registry and adopts the Talos machine at the host's
+// public IP by applying the cluster's bootstrap machine configuration over
+// the Talos machine API.
 type ByotMachine struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
