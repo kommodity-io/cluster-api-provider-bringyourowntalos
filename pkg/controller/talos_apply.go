@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
@@ -22,6 +23,9 @@ const (
 
 	// resetTimeout bounds a single Reset attempt.
 	resetTimeout = 30 * time.Second
+
+	// upgradeTimeout bounds a single Upgrade attempt.
+	upgradeTimeout = 10 * time.Minute
 
 	// probeTimeout bounds a maintenance-mode probe attempt.
 	probeTimeout = 10 * time.Second
@@ -109,6 +113,108 @@ func authenticatedClient(ctx context.Context, publicIP string, talosConfig []byt
 	}
 
 	return client, nil
+}
+
+// versionProbeAuthenticated returns the live Talos version tag of the machine
+// at publicIP, queried over the cluster talosconfig (mTLS). Used by the
+// post-adoption upgrade path: after the bootstrap config is applied the host
+// carries the cluster PKI bundle, so only the authenticated client is accepted.
+func versionProbeAuthenticated(ctx context.Context, publicIP string, talosConfig []byte) (string, error) {
+	return versionProbeWithClient(ctx, publicIP, func(ctx context.Context) (*talosclient.Client, error) {
+		return authenticatedClient(ctx, publicIP, talosConfig)
+	})
+}
+
+// versionProbeWithClient runs the Version RPC against the machine at publicIP
+// using the given client builder and returns the reported tag.
+func versionProbeWithClient(
+	ctx context.Context,
+	publicIP string,
+	buildClient func(context.Context) (*talosclient.Client, error),
+) (string, error) {
+	client, err := buildClient(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	defer cancel()
+
+	resp, err := client.Version(probeCtx)
+	if err != nil {
+		return "", fmt.Errorf("version probe failed on %s: %w", publicIP, err)
+	}
+
+	if len(resp.GetMessages()) == 0 {
+		return "", fmt.Errorf("version probe returned no messages on %s: %w", publicIP, ErrVersionProbeEmpty)
+	}
+
+	info := resp.GetMessages()[0].GetVersion()
+	if info == nil {
+		return "", fmt.Errorf("version probe returned no version info on %s: %w", publicIP, ErrVersionProbeNoInfo)
+	}
+
+	return info.GetTag(), nil
+}
+
+// upgradeMachine issues a Talos Upgrade of the machine at publicIP to the
+// given installer image, over the cluster talosconfig (mTLS). preserve=true
+// carries the just-applied machineconfig across the upgrade reboot so the
+// node rejoins the cluster on the new version without re-adoption; force is
+// false because the caller's predicate already excludes same-version calls.
+// The machine reboots into the new version on success. Requires the host to
+// already carry the cluster PKI bundle (i.e. be adopted), since the maintenance
+// client is Reader-only and cannot call Upgrade (Talos authz: Upgrade is
+// Admin-only).
+func upgradeMachine(ctx context.Context, publicIP string, talosConfig []byte, image string) error {
+	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+	if err != nil {
+		return err
+	}
+
+	defer client.Close() //nolint:errcheck
+
+	upgradeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), upgradeTimeout)
+	defer cancel()
+
+	//nolint:staticcheck // client.Upgrade is deprecated in favor of LifecycleClient,
+	// whose Upgrade takes an InstallArtifactsSource (registry/config) rather than
+	// a simple image ref. The image-based Upgrade is exactly the post-adoption
+	// upgrade semantics we want.
+	_, err = client.UpgradeWithOptions(upgradeCtx,
+		talosclient.WithUpgradeImage(image),
+		talosclient.WithUpgradeForce(false),
+		talosclient.WithUpgradePreserve(true),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to upgrade machine %s to %s: %w", publicIP, image, err)
+	}
+
+	return nil
+}
+
+// installerTag parses the version tag from an installer image ref. The tag is
+// the substring after the last ':' that follows the last '/'; for a ref like
+// ghcr.io/siderolabs/installer:v1.14.0 it returns v1.14.0.
+//
+// A ref without a tag (no ':' in the repo part) is returned as-is so the
+// predicate never matches a live tag and the upgrade path is skipped.
+func installerTag(ref string) string {
+	idx := strings.LastIndex(ref, "/")
+
+	repo := ref
+	if idx >= 0 {
+		repo = ref[idx+1:]
+	}
+
+	colon := strings.LastIndex(repo, ":")
+	if colon < 0 {
+		return ref
+	}
+
+	return repo[colon+1:]
 }
 
 // probeMaintenance reports whether the machine at publicIP answers the Talos
