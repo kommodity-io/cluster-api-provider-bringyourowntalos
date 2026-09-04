@@ -34,4 +34,10 @@ var (
 	ErrJoinNoCredentials = errors.New("machine is already configured and no usable talosconfig " +
 		"is available: provide a talosconfig via spec.talosConfigSecretRef to " +
 		"authenticate the machine, or manually put it back in maintenance mode")
+
+	// ErrVersionProbeEmpty indicates the Version RPC returned no messages.
+	ErrVersionProbeEmpty = errors.New("version probe returned no messages")
+
+	// ErrVersionProbeNoInfo indicates the Version RPC returned no version info.
+	ErrVersionProbeNoInfo = errors.New("version probe returned no version info")
 )
