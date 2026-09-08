@@ -27,7 +27,6 @@ var ErrNoHostAvailable = errors.New("no available ByotHost matches the claim cri
 // claim it sets status.resolvedHost and status.resolvedPublicIP. handled is
 // true when the caller must return the given result (requeue waiting for a
 // host, or a CAS conflict) instead of proceeding to adoption.
-//
 func (r *ByotMachineReconciler) claimHost(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
@@ -353,6 +352,23 @@ func (r *ByotMachineReconciler) releaseHost(
 		return fmt.Errorf("failed to get ByotHost %s: %w", byotMachine.Status.ResolvedHost, err)
 	}
 
+	// A host that was never adopted (Ready=false) is still in maintenance
+	// mode: no config was applied, so there is nothing to wipe. Resetting it
+	// would fail anyway (the maintenance client is Reader-only and cannot
+	// Reset), and would block deletion forever. Just clear the claim and
+	// return the host to Available for immediate re-claim.
+	if !byotMachine.Status.Ready {
+		host.Status.Phase = infrav1.HostPhaseAvailable
+		host.Status.ClaimRef = nil
+
+		err = r.Client.Status().Update(ctx, host)
+		if err != nil {
+			return fmt.Errorf("failed to update ByotHost %s status on release: %w", host.Name, err)
+		}
+
+		return nil
+	}
+
 	candidates, err := r.resetCredentialCandidates(ctx, byotMachine)
 	if err != nil {
 		return err
@@ -377,4 +393,3 @@ func (r *ByotMachineReconciler) releaseHost(
 
 	return nil
 }
-

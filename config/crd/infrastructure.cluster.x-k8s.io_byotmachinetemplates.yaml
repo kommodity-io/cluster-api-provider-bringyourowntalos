@@ -69,6 +69,16 @@ spec:
                     spec:
                       description: Spec is the specification of the desired behavior of the machine.
                       properties:
+                        desiredTalosVersion:
+                          description: |-
+                            DesiredTalosVersion is an installer image ref (e.g.
+                            ghcr.io/siderolabs/installer:v1.14.0) the claimed host is upgraded to
+                            after the machine is adopted. Empty (the default) opts out of version
+                            management: no Version probe runs and existing adoption behavior is
+                            unchanged. Stamped from the ByotMachineTemplate. Mutable; editing after
+                            Ready=true retriggers an in-place upgrade via generation bump. For the
+                            host-swap rollout model, roll a new template instead.
+                          type: string
                         failureDomain:
                           description: |-
                             FailureDomain is the unique name of the failure domain the machine is
