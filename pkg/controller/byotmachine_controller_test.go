@@ -127,8 +127,6 @@ func TestByotMachineReconcileAddsFinalizer(t *testing.T) {
 // providerID set, owner Machine reference attached) for tests that start past
 // the adoption phase. publicIP and configHash are kept as parameters for
 // readability even though current callers share defaults.
-//
-//nolint:unparam // test builder: parameters document intent for future cases
 func newAdoptedByotMachine(publicIP string, configHash string) *infrav1.ByotMachine {
 	machine := newByotMachine(publicIP)
 	providerID := infrav1.ProviderIDPrefix + publicIP
@@ -262,8 +260,9 @@ func TestByotMachineReconcileDeleteBlocksUntilResetSucceeds(t *testing.T) {
 	require.NoError(t, err)
 
 	// 127.0.0.1 refuses the Talos API connection immediately: the reset
-	// fails fast and deletion must stay blocked with the finalizer retained.
-	byotMachine := newByotMachine("127.0.0.1")
+	// of an adopted host fails fast and deletion must stay blocked with the
+	// finalizer retained.
+	byotMachine := newAdoptedByotMachine("127.0.0.1", "config-hash")
 	host := newClaimedByotHost("127.0.0.1")
 	byotMachine.Finalizers = []string{byotMachineFinalizer}
 
@@ -327,6 +326,55 @@ func TestByotMachineReconcileDeleteReleasesWithoutReset(t *testing.T) {
 	deleted := &infrav1.ByotMachine{}
 	err = client.Get(t.Context(), clusterKey(byotMachine), deleted)
 	assert.True(t, apierrors.IsNotFound(err))
+}
+
+func TestByotMachineReconcileDeleteReleasesClaimedNeverAdoptedHostWithoutReset(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	// A ByotMachine that claimed a host but never adopted it (Ready=false, e.g.
+	// a worker held at the WaitingForControlPlane gate) releases the host
+	// without a reset: the host is still in maintenance mode, there is nothing
+	// to wipe, and a maintenance client is Reader-only and cannot Reset. The
+	// host returns to Available for immediate re-claim, and the ByotMachine is
+	// deleted.
+	byotMachine := newByotMachine("203.0.113.10")
+	byotMachine.Status.Ready = false
+	byotMachine.Finalizers = []string{byotMachineFinalizer}
+	host := newClaimedByotHost("203.0.113.10")
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, host).
+		WithStatusSubresource(byotMachine, host).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+
+	err = client.Delete(t.Context(), byotMachine)
+	require.NoError(t, err)
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	// ByotMachine finalizer removed: the object is gone.
+	deleted := &infrav1.ByotMachine{}
+	err = client.Get(t.Context(), clusterKey(byotMachine), deleted)
+	assert.True(t, apierrors.IsNotFound(err))
+
+	// The host returns to Available with no claim.
+	released := &infrav1.ByotHost{}
+	err = client.Get(t.Context(), clusterKey(host), released)
+	require.NoError(t, err)
+	assert.Equal(t, infrav1.HostPhaseAvailable, released.Status.Phase)
+	assert.Nil(t, released.Status.ClaimRef)
 }
 
 func TestByotMachineReconcileJoinPreflightFailsWithoutCredentials(t *testing.T) {
@@ -1547,5 +1595,67 @@ func TestInstallerTag(t *testing.T) {
 
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, installerTag(tc.ref), "ref=%q", tc.ref)
+	}
+}
+
+// TestClusterControlPlaneReady verifies the worker-adoption gate's signal:
+// the helper reports Ready only when the Cluster carries ControlPlaneReady
+// True. A worker is held at WaitingForControlPlane until the control plane
+// provider (TalosControlPlane) sets this condition, so the worker's apid can
+// obtain certs from trustd on a live CP instead of wedging against an
+// unreachable controlPlaneEndpoint.
+func TestClusterControlPlaneReady(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	applyCondition := func(status corev1.ConditionStatus) func(*clusterv1.Cluster) {
+		return func(cluster *clusterv1.Cluster) {
+			switch status {
+			case corev1.ConditionTrue:
+				conditions.MarkTrue(cluster, clusterv1.ControlPlaneReadyCondition)
+			case corev1.ConditionFalse:
+				conditions.MarkFalse(cluster, clusterv1.ControlPlaneReadyCondition,
+					"Provisioning", clusterv1.ConditionSeverityWarning, "")
+			case corev1.ConditionUnknown:
+				// No condition set: the helper reads no ControlPlaneReady.
+			}
+		}
+	}
+
+	cases := []struct {
+		name      string
+		present   bool
+		status    corev1.ConditionStatus
+		wantReady bool
+	}{
+		{name: "absent", wantReady: false},
+		{name: "unset", present: true, wantReady: false},
+		{name: "false", present: true, status: corev1.ConditionFalse, wantReady: false},
+		{name: "true", present: true, status: corev1.ConditionTrue, wantReady: true},
+	}
+
+	for _, scenario := range cases {
+		t.Run(scenario.name, func(t *testing.T) {
+			t.Parallel()
+
+			var objs []ctrlclient.Object
+
+			if scenario.present {
+				cluster := &clusterv1.Cluster{
+					ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testNamespace},
+				}
+				applyCondition(scenario.status)(cluster)
+				objs = append(objs, cluster)
+			}
+
+			client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			reconciler := NewByotMachineReconciler(client)
+
+			ready, err := reconciler.clusterControlPlaneReady(t.Context(), testClusterName, testNamespace)
+			require.NoError(t, err)
+			assert.Equal(t, scenario.wantReady, ready)
+		})
 	}
 }
