@@ -20,6 +20,9 @@ import (
 	"sigs.k8s.io/cluster-api/util/conditions"
 )
 
+// testNICName is the fixed NIC name used across identity discovery tests.
+const testNICName = "eth0"
+
 func TestParseCPUDefaultsToSingleCPU(t *testing.T) {
 	t.Parallel()
 
@@ -170,7 +173,7 @@ func TestApplyDiscoveryLabelsPromotesCuratedLabels(t *testing.T) {
 				Disks: []infrav1.HostDisk{
 					{Name: "/dev/sda", Size: resource.MustParse("250Gi"), Type: "SSD", SystemDisk: true},
 				},
-				NetworkInterfaces: []string{"eth0"},
+				NetworkInterfaces: []string{testNICName},
 			},
 		},
 	}
@@ -496,6 +499,47 @@ func TestPopulateFromDiscoveryNoGPUsSucceeds(t *testing.T) {
 	assert.True(t, conditions.IsTrue(host, infrav1.HostDiscoveredCondition))
 }
 
+// TestPopulateFromDiscoveryPreservesIdentityOnEmptyResult guards the review
+// concern: a transient COSI failure yields a nil Identity, which must not
+// clobber a previously recorded reboot-stable identity.
+func TestPopulateFromDiscoveryPreservesIdentityOnEmptyResult(t *testing.T) {
+	t.Parallel()
+
+	reconciler := &ByotHostReconciler{}
+	prior := &infrav1.HostIdentity{SystemUUID: "11111111-2222-3333-4444-555555555555"}
+	host := &infrav1.ByotHost{
+		ObjectMeta: metav1.ObjectMeta{Name: "h"},
+		Status:     infrav1.ByotHostStatus{Identity: prior},
+	}
+	result := DiscoveryResult{TalosVersion: "v1.13.8"} // Identity nil (COSI fetch failed)
+
+	reconciler.populateFromDiscovery(host, result)
+
+	require.NotNil(t, host.Status.Identity)
+	assert.Equal(t, prior.SystemUUID, host.Status.Identity.SystemUUID)
+}
+
+// TestPopulateFromDiscoveryOverwritesIdentityOnNewResult ensures a freshly
+// discovered identity replaces a prior one.
+func TestPopulateFromDiscoveryOverwritesIdentityOnNewResult(t *testing.T) {
+	t.Parallel()
+
+	reconciler := &ByotHostReconciler{}
+	prior := &infrav1.HostIdentity{SystemUUID: "old-uuid"}
+	host := &infrav1.ByotHost{
+		ObjectMeta: metav1.ObjectMeta{Name: "h"},
+		Status:     infrav1.ByotHostStatus{Identity: prior},
+	}
+	result := DiscoveryResult{
+		Identity: &infrav1.HostIdentity{SystemUUID: "new-uuid"},
+	}
+
+	reconciler.populateFromDiscovery(host, result)
+
+	require.NotNil(t, host.Status.Identity)
+	assert.Equal(t, "new-uuid", host.Status.Identity.SystemUUID)
+}
+
 func TestParseGPUsAMDInstinct(t *testing.T) {
 	t.Parallel()
 
@@ -532,7 +576,7 @@ func TestDiscoverIdentityPopulatesFromCOSI(t *testing.T) {
 	require.NoError(t, cosi.Create(t.Context(), sysInfo))
 
 	hwAddr := network.NewHardwareAddr(network.NamespaceName, network.FirstHardwareAddr)
-	hwAddr.TypedSpec().Name = "eth0"
+	hwAddr.TypedSpec().Name = testNICName
 	hwAddr.TypedSpec().HardwareAddr = nethelpers.HardwareAddr{0x52, 0x54, 0x00, 0x12, 0x34, 0x56}
 	require.NoError(t, cosi.Create(t.Context(), hwAddr))
 
@@ -564,7 +608,7 @@ func TestDiscoverIdentityPartialMacOnly(t *testing.T) {
 	cosi := newTestCOSI()
 
 	hwAddr := network.NewHardwareAddr(network.NamespaceName, network.FirstHardwareAddr)
-	hwAddr.TypedSpec().Name = "eth0"
+	hwAddr.TypedSpec().Name = testNICName
 	hwAddr.TypedSpec().HardwareAddr = nethelpers.HardwareAddr{0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc}
 	require.NoError(t, cosi.Create(t.Context(), hwAddr))
 
@@ -591,4 +635,23 @@ func TestDiscoverIdentityPartialUUIDOnly(t *testing.T) {
 	require.NotNil(t, result.Identity)
 	assert.Equal(t, "abcdefab-cdef-abcd-efab-cdefabcdefab", result.Identity.SystemUUID)
 	assert.Empty(t, result.Identity.HardwareAddr, "first-up NIC absent")
+}
+
+// TestDiscoverIdentitySkipsAllZeroMAC guards the virtual-NIC zero-MAC case
+// from the review: a 6-byte all-zero MAC stringifies to
+// "00:00:00:00:00:00" (non-empty) and must not be stored as a valid identity.
+func TestDiscoverIdentitySkipsAllZeroMAC(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	hwAddr := network.NewHardwareAddr(network.NamespaceName, network.FirstHardwareAddr)
+	hwAddr.TypedSpec().Name = testNICName
+	hwAddr.TypedSpec().HardwareAddr = nethelpers.HardwareAddr{0, 0, 0, 0, 0, 0}
+	require.NoError(t, cosi.Create(t.Context(), hwAddr))
+
+	result := DiscoveryResult{}
+	discoverIdentity(t.Context(), cosi, &result)
+
+	assert.Nil(t, result.Identity, "all-zero MAC must not be stored as a valid identity")
 }

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,11 +15,13 @@ import (
 	"github.com/cosi-project/runtime/pkg/state"
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	storageapi "github.com/siderolabs/talos/pkg/machinery/api/storage"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // discoveryLabelPrefix is the controller-managed label prefix. The controller
@@ -516,29 +519,50 @@ func discoverIdentity(
 ) {
 	identity := &infrav1.HostIdentity{}
 
+	populateSystemIdentity(ctx, cosi, identity)
+	populateHardwareAddr(ctx, cosi, identity)
+
+	// Only store a non-empty identity; an all-zero Identity is meaningless and
+	// keeps the status field nil to signal "identity unavailable".
+	if identity.SystemUUID != "" || identity.HardwareAddr != "" ||
+		identity.SerialNumber != "" || identity.Manufacturer != "" ||
+		identity.ProductName != "" {
+		result.Identity = identity
+	}
+}
+
+// populateSystemIdentity fills the SMBIOS SystemInformation fields (UUID, serial,
+// manufacturer, product) from the COSI resource, logging fetch errors.
+func populateSystemIdentity(ctx context.Context, cosi state.CoreState, identity *infrav1.HostIdentity) {
 	sysInfo, err := safe.StateGetByID[*hardware.SystemInformation](ctx, cosi, hardware.SystemInformationID)
-	if err == nil && sysInfo != nil {
+	if err != nil {
+		log.FromContext(ctx).Error(err, "fetching SMBIOS SystemInformation from COSI")
+	} else if sysInfo != nil {
 		spec := sysInfo.TypedSpec()
 		identity.SystemUUID = spec.UUID
 		identity.SerialNumber = spec.SerialNumber
 		identity.Manufacturer = spec.Manufacturer
 		identity.ProductName = spec.ProductName
 	}
+}
 
+// populateHardwareAddr fills the first-up NIC hardware address, logging fetch
+// errors. All-zero MACs are skipped: some virtual NICs report a 6-byte zero MAC
+// that stringifies to "00:00:00:00:00:00" (non-empty) and would false-positive a
+// future MAC-equality gate. IsZero() only checks length, not contents.
+func populateHardwareAddr(ctx context.Context, cosi state.CoreState, identity *infrav1.HostIdentity) {
 	hwAddr, err := safe.StateGetByID[*network.HardwareAddr](ctx, cosi, network.FirstHardwareAddr)
-	if err == nil && hwAddr != nil {
-		identity.HardwareAddr = hwAddr.TypedSpec().HardwareAddr.String()
+	if err != nil {
+		log.FromContext(ctx).Error(err, "fetching first-up NIC HardwareAddr from COSI")
+	} else if hwAddr != nil {
+		mac := hwAddr.TypedSpec().HardwareAddr
+		// Skip all-zero MACs: some virtual NICs report a 6-byte zero MAC that
+		// stringifies to "00:00:00:00:00:00" (non-empty) and would false-positive
+		// a future MAC-equality gate. IsZero() only checks length, not contents.
+		if len(mac) > 0 && !bytes.Equal(mac, make(nethelpers.HardwareAddr, len(mac))) {
+			identity.HardwareAddr = mac.String()
+		}
 	}
-
-	// Only store a non-empty identity; an all-zero Identity is meaningless and
-	// keeps the status field nil to signal "identity unavailable".
-	if identity.SystemUUID == "" && identity.HardwareAddr == "" &&
-		identity.SerialNumber == "" && identity.Manufacturer == "" &&
-		identity.ProductName == "" {
-		return
-	}
-
-	result.Identity = identity
 }
 
 // memoryBuckets are the selection-oriented memory classes, ascending.
