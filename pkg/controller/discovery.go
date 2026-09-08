@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,11 +11,17 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	storageapi "github.com/siderolabs/talos/pkg/machinery/api/storage"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // discoveryLabelPrefix is the controller-managed label prefix. The controller
@@ -48,6 +55,7 @@ type DiscoveryResult struct {
 	Disks             []infrav1.HostDisk
 	NetworkInterfaces []string
 	GPUs              *infrav1.HostGPU
+	Identity          *infrav1.HostIdentity
 }
 
 // discoverHost runs the maintenance-mode discovery surface against publicIP:
@@ -94,6 +102,12 @@ func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error)
 	if err != nil {
 		return result, fmt.Errorf("net discovery: %w", err)
 	}
+
+	// Identity is best-effort: a host without SMBIOS UUID and without a
+	// physical NIC still completes discovery, just with an empty Identity.
+	// Identity fields that fail to fetch individually are left empty rather
+	// than aborting the whole discovery.
+	discoverIdentity(ctx, client.COSI, &result)
 
 	return result, nil
 }
@@ -489,6 +503,66 @@ func discoverNetInterfaces(
 	result.NetworkInterfaces = ifaces
 
 	return nil
+}
+
+// discoverIdentity fetches the reboot-stable hardware identity of the host:
+// the SMBIOS System Information UUID (and the supporting serial/manufacturer/
+// product fields) and the first-up NIC hardware address. It is best-effort:
+// each field is fetched independently and a missing/empty value is recorded as
+// an empty string rather than failing discovery, so a host with no SMBIOS UUID
+// or a virtual NIC still completes discovery with a partial identity. The
+// caller treats an all-empty Identity as "no identity available".
+func discoverIdentity(
+	ctx context.Context,
+	cosi state.CoreState,
+	result *DiscoveryResult,
+) {
+	identity := &infrav1.HostIdentity{}
+
+	populateSystemIdentity(ctx, cosi, identity)
+	populateHardwareAddr(ctx, cosi, identity)
+
+	// Only store a non-empty identity; an all-zero Identity is meaningless and
+	// keeps the status field nil to signal "identity unavailable".
+	if identity.SystemUUID != "" || identity.HardwareAddr != "" ||
+		identity.SerialNumber != "" || identity.Manufacturer != "" ||
+		identity.ProductName != "" {
+		result.Identity = identity
+	}
+}
+
+// populateSystemIdentity fills the SMBIOS SystemInformation fields (UUID, serial,
+// manufacturer, product) from the COSI resource, logging fetch errors.
+func populateSystemIdentity(ctx context.Context, cosi state.CoreState, identity *infrav1.HostIdentity) {
+	sysInfo, err := safe.StateGetByID[*hardware.SystemInformation](ctx, cosi, hardware.SystemInformationID)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "fetching SMBIOS SystemInformation from COSI")
+	} else if sysInfo != nil {
+		spec := sysInfo.TypedSpec()
+		identity.SystemUUID = spec.UUID
+		identity.SerialNumber = spec.SerialNumber
+		identity.Manufacturer = spec.Manufacturer
+		identity.ProductName = spec.ProductName
+	}
+}
+
+// populateHardwareAddr fills the first-up NIC hardware address, logging fetch
+// errors. All-zero MACs are skipped: some virtual NICs report a 6-byte zero MAC
+// that stringifies to "00:00:00:00:00:00" (non-empty) and would false-positive a
+// future MAC-equality gate. IsZero() only checks length, not contents.
+func populateHardwareAddr(ctx context.Context, cosi state.CoreState, identity *infrav1.HostIdentity) {
+	hwAddr, err := safe.StateGetByID[*network.HardwareAddr](ctx, cosi, network.FirstHardwareAddr)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "fetching first-up NIC HardwareAddr from COSI")
+	} else if hwAddr != nil {
+		mac := hwAddr.TypedSpec().HardwareAddr
+		// Skip all-zero MACs: some virtual NICs report a 6-byte zero MAC that
+		// stringifies to "00:00:00:00:00:00" (non-empty) and would false-positive
+		// a future MAC-equality gate. IsZero() only checks length, not contents.
+		if len(mac) > 0 && !bytes.Equal(mac, make(nethelpers.HardwareAddr, len(mac))) {
+			identity.HardwareAddr = mac.String()
+		}
+	}
 }
 
 // memoryBuckets are the selection-oriented memory classes, ascending.

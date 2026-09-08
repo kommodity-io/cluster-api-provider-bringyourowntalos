@@ -79,6 +79,37 @@ type HostDisk struct {
 	BusPath string `json:"busPath,omitempty"`
 }
 
+// HostIdentity holds the reboot-stable hardware identity of a host, used to
+// verify that the machine answering at spec.publicIP after a reboot (upgrade,
+// reset, power cycle) is the same physical board the host record was created
+// for. The primary identifier is the SMBIOS System Information UUID (firmware-
+// burned, OS-independent); the first-up NIC hardware address is a secondary
+// cross-check. Both are fetched over the Talos maintenance API (unverified
+// TLS) and so are only as trustworthy as the network path to the host.
+type HostIdentity struct {
+	// SystemUUID is the SMBIOS Type 1 UUID (firmware-burned, survives Talos
+	// upgrades and reinstalls). Empty when the firmware does not expose one.
+	// +optional
+	SystemUUID string `json:"systemUUID,omitempty"`
+	// SerialNumber is the SMBIOS Type 1 board serial number, kept as an
+	// additional cross-check. Empty when unavailable.
+	// +optional
+	SerialNumber string `json:"serialNumber,omitempty"`
+	// Manufacturer is the SMBIOS Type 1 manufacturer string. Empty when
+	// unavailable.
+	// +optional
+	Manufacturer string `json:"manufacturer,omitempty"`
+	// ProductName is the SMBIOS Type 1 product name. Empty when unavailable.
+	// +optional
+	ProductName string `json:"productName,omitempty"`
+	// HardwareAddr is the colon-separated MAC of the first-up physical NIC
+	// (the address Talos uses for machine identity), from the network.HardwareAddr
+	// resource. Spoofable from userspace and zero on some virtual NICs, so it is
+	// a cross-check rather than a primary identity.
+	// +optional
+	HardwareAddr string `json:"hardwareAddr,omitempty"`
+}
+
 // HostHardware holds the discovered hardware features of a host.
 type HostHardware struct {
 	// CPU is the discovered CPU topology.
@@ -88,8 +119,9 @@ type HostHardware struct {
 	// Disks is the discovered disk inventory.
 	// +optional
 	Disks []HostDisk `json:"disks,omitempty"`
-	// NetworkInterfaces lists interface names from /sys/class/net (MACs are
-	// unavailable in maintenance mode).
+	// NetworkInterfaces lists interface names from /sys/class/net. Per-
+	// interface MACs are not collected here; the first-up NIC MAC used for
+	// machine identity is in status.identity.hardwareAddr.
 	// +optional
 	NetworkInterfaces []string `json:"networkInterfaces,omitempty"`
 	// GPUs is the discovered GPU summary (count, vendor, model, memory).
@@ -166,6 +198,13 @@ type ByotHostStatus struct {
 	// Hardware holds the discovered hardware features (view-only).
 	// +optional
 	Hardware *HostHardware `json:"hardware,omitempty"`
+
+	// Identity holds the reboot-stable hardware identity (SMBIOS UUID + first
+	// NIC MAC) used to verify the host is the same physical board across
+	// reboots/upgrades. Populated by discovery; empty when the firmware or NIC
+	// exposes nothing usable.
+	// +optional
+	Identity *HostIdentity `json:"identity,omitempty"`
 
 	// MaintenanceMode is the last maintenance-liveness probe result.
 	// Absent (the default before the first probe completes) is equivalent to

@@ -410,6 +410,13 @@ func (r *ByotHostReconciler) populateFromDiscovery(host *infrav1.ByotHost, resul
 	host.Status.TalosVersion = result.TalosVersion
 	host.Status.Arch = result.Arch
 	host.Status.Platform = result.Platform
+	// Preserve a previously recorded identity when this discovery produced none:
+	// COSI fetches are best-effort, so a transient failure during a reboot cycle
+	// must not erase the reboot-stable identity this feature relies on.
+	if result.Identity != nil {
+		host.Status.Identity = result.Identity
+	}
+
 	host.Status.Hardware = &infrav1.HostHardware{
 		CPU:               result.CPU,
 		Memory:            result.Memory,
