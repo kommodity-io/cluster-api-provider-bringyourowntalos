@@ -185,12 +185,7 @@ The post-adoption Talos upgrade (opt-in via `ByotMachine.spec.desiredTalosVersio
 runs **before** the workload Node is linked: a freshly-claimed host reboots
 onto the desired Talos version while it is still unlinked, so the CAPI
 MachineDeployment does not roll the old node away (it waits for the new
-Machine's `nodeRef`) until the new host is on the desired version. This is the
-non-disruptive rollout order — the upgraded node only goes live once
-`TalosVersionReady=True/Upgraded`. On completion the new live version is
-mirrored onto the owning `ByotHost.status.talosVersion` (the ByotHost
-controller only re-discovers the version while the host is in maintenance, so
-without the mirror it would stay stale across an in-place upgrade).
+Machine's `nodeRef`) until the new host is on the desired version.
 
 ## Development
 
