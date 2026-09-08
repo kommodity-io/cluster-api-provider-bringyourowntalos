@@ -171,11 +171,26 @@ flowchart TD
     A2 --> S
     S -->|no| AF[MachineAdopted=False]:::fail
     S -->|yes| OK[markAdopted: Ready]:::ok
+    OK --> U{DesiredTalosVersion set + mismatch?}
+    U -->|yes, in flight| UR[Upgrade over cluster talosconfig; Requeue]:::wait
+    U -->|no / upgrade done| L[linkNode: set Node providerID]:::action
+    L --> NL[Machine.nodeRef linked]:::ok
     classDef wait fill:#fff3cd,stroke:#997404;
     classDef action fill:#cfe2ff,stroke:#084298;
     classDef ok fill:#d1e7dd,stroke:#0f5132;
     classDef fail fill:#f8d7da,stroke:#842029;
 ```
+
+The post-adoption Talos upgrade (opt-in via `ByotMachine.spec.desiredTalosVersion`)
+runs **before** the workload Node is linked: a freshly-claimed host reboots
+onto the desired Talos version while it is still unlinked, so the CAPI
+MachineDeployment does not roll the old node away (it waits for the new
+Machine's `nodeRef`) until the new host is on the desired version. This is the
+non-disruptive rollout order — the upgraded node only goes live once
+`TalosVersionReady=True/Upgraded`. On completion the new live version is
+mirrored onto the owning `ByotHost.status.talosVersion` (the ByotHost
+controller only re-discovers the version while the host is in maintenance, so
+without the mirror it would stay stale across an in-place upgrade).
 
 ## Development
 

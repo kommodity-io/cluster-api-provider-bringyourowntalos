@@ -1288,7 +1288,7 @@ func upgradeTestClient(t *testing.T, byotMachine *infrav1.ByotMachine) ctrlclien
 	return fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(byotMachine, host, machine, bootstrap, talosConfig).
-		WithStatusSubresource(&infrav1.ByotMachine{}).
+		WithStatusSubresource(&infrav1.ByotMachine{}, &infrav1.ByotHost{}).
 		Build()
 }
 
@@ -1658,4 +1658,115 @@ func TestClusterControlPlaneReady(t *testing.T) {
 			assert.Equal(t, scenario.wantReady, ready)
 		})
 	}
+}
+
+// TestSyncHostTalosVersionMirrorsAfterUpgrade covers issue PLA-6555: the
+// ByotHost's recorded status.talosVersion must reflect the new live version
+// after an in-place upgrade. The ByotHost controller only (re)discovers the
+// version while the host is in maintenance; while Claimed probing is paused,
+// so the ByotMachine reconciler mirrors currentTalosVersion onto the host
+// when the upgrade completes.
+func TestSyncHostTalosVersionMirrorsAfterUpgrade(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	client := upgradeTestClient(t, byotMachine)
+
+	reconciler := upgradeReconciler(t, client,
+		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
+		func(_ context.Context, _ string, _ []byte, _ string) error { return nil },
+	)
+
+	machine := newOwningMachine("test-bootstrap")
+
+	// 1. Mismatch → issue Upgrade, InFlight.
+	current := byotMachine
+	_, handled, err := reconciler.ensureTalosVersion(
+		t.Context(), upgradePatchHelper(t, client, current), current, machine)
+	require.NoError(t, err)
+	assert.True(t, handled)
+
+	current = refreshByotMachine(t, client, byotMachine)
+	assert.Equal(t, infrav1.UpgradeStateInFlight, current.Status.UpgradeState)
+
+	// Host still on the pre-upgrade (discovered) version: not mirrored yet.
+	host := &infrav1.ByotHost{}
+	require.NoError(t, client.Get(t.Context(), ctrlclient.ObjectKey{Name: testHostName, Namespace: testNamespace}, host))
+	assert.Empty(t, host.Status.TalosVersion)
+
+	// 2. InFlight → desired tag → complete → mirror onto ByotHost.
+	_, handled, err = reconciler.ensureTalosVersion(
+		t.Context(), upgradePatchHelper(t, client, current), current, machine)
+	require.NoError(t, err)
+	assert.False(t, handled)
+
+	host = &infrav1.ByotHost{}
+	require.NoError(t, client.Get(t.Context(), ctrlclient.ObjectKey{Name: testHostName, Namespace: testNamespace}, host))
+	assert.Equal(t, "v1.13.9", host.Status.TalosVersion,
+		"ByotHost.talosVersion must mirror the upgraded live version")
+}
+
+// TestReconcileAdoptedUpgradesBeforeLinking covers the non-disruptive rollout
+// order (issue PLA-6555): a freshly-adopted host upgrades (reboots) BEFORE the
+// workload Node is linked, so the MachineDeployment does not roll the old
+// node away until the new host is on the desired version. While the upgrade
+// is in flight the Node providerID is not set and status.nodeUpdated stays
+// false; only once the upgrade completes does linkNode run.
+func TestReconcileAdoptedUpgradesBeforeLinking(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	byotMachine.Status.NodeUpdated = false // not yet linked
+	client := upgradeTestClient(t, byotMachine)
+
+	node := newWorkloadNode(testMachineName, "") // kubelet registered, no providerID
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	var upgrades int
+
+	reconciler := upgradeReconciler(t, client,
+		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
+		func(_ context.Context, _ string, _ []byte, image string) error {
+			upgrades++
+
+			assert.Equal(t, testInstallerV1139, image)
+
+			return nil
+		},
+	)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	machine := newOwningMachine("test-bootstrap")
+
+	// 1. Upgrade in flight: host on old version → issue Upgrade, do NOT link.
+	result, err := reconciler.reconcileAdopted(
+		t.Context(), upgradePatchHelper(t, client, byotMachine), byotMachine, machine)
+	require.NoError(t, err)
+	assert.True(t, result.RequeueAfter > 0 || result.Requeue)
+
+	updated := refreshByotMachine(t, client, byotMachine)
+	assert.Equal(t, infrav1.UpgradeStateInFlight, updated.Status.UpgradeState)
+	assert.False(t, updated.Status.NodeUpdated, "node must not be linked while upgrade in flight")
+	assert.Equal(t, 1, upgrades)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Empty(t, patched.Spec.ProviderID, "workload Node providerID must not be set before upgrade completes")
+
+	// 2. Upgrade completes → linkNode runs → Node providerID patched.
+	result, err = reconciler.reconcileAdopted(
+		t.Context(), upgradePatchHelper(t, client, updated), updated, machine)
+	require.NoError(t, err)
+	assert.False(t, result.Requeue)
+
+	updated = refreshByotMachine(t, client, byotMachine)
+	assert.Empty(t, updated.Status.UpgradeState)
+	assert.True(t, conditions.IsTrue(updated, TalosVersionReadyCondition))
+	assert.True(t, updated.Status.NodeUpdated, "node linked after upgrade completes")
+
+	patched = &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+testHostPublicIP, patched.Spec.ProviderID)
 }

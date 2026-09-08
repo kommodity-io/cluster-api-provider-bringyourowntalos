@@ -293,26 +293,25 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 }
 
 // reconcileAdopted drives the steady-state path for an already-adopted
-// ByotMachine: link the workload Node, then run the post-adoption Talos
-// upgrade (opt-in via DesiredTalosVersion). The upgrade runs after the node is
-// linked, over the cluster talosconfig (Admin), since a maintenance client
-// cannot call Upgrade (Talos authz). Returns handled=true while the upgrade
-// is in flight (InFlight) or stopped on failure.
+// ByotMachine: run the post-adoption Talos upgrade (opt-in via
+// DesiredTalosVersion) BEFORE linking the workload Node. The upgrade runs
+// over the cluster talosconfig (Admin) once the host carries the cluster PKI
+// bundle, since a maintenance client cannot call Upgrade (Talos authz).
+//
+// Upgrade-before-link is the non-disruptive rollout order: a freshly-claimed
+// host reboots onto the desired Talos version while it is still unlinked
+// (no workload, and CAPI's MachineDeployment has not yet removed the old
+// node — it waits for the new Machine's nodeRef). Only once the host is on
+// the desired version (or version management is opted out) does linkNode
+// make the node live and let the MachineDeployment roll the old node away.
+// Returns handled=true while the upgrade is in flight (InFlight) or stopped
+// on failure, so the caller returns its result instead of linking.
 func (r *ByotMachineReconciler) reconcileAdopted(
 	ctx context.Context,
 	patchHelper *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
 	machine *clusterv1.Machine,
 ) (ctrl.Result, error) {
-	linkResult, err := r.linkNode(ctx, patchHelper, byotMachine, machine)
-	if err != nil {
-		return linkResult, err
-	}
-
-	if linkResult.Requeue || linkResult.RequeueAfter > 0 {
-		return linkResult, nil
-	}
-
 	upgradeResult, handled, err := r.ensureTalosVersion(ctx, patchHelper, byotMachine, machine)
 	if err != nil {
 		return upgradeResult, err
@@ -322,7 +321,7 @@ func (r *ByotMachineReconciler) reconcileAdopted(
 		return upgradeResult, nil
 	}
 
-	return linkResult, nil
+	return r.linkNode(ctx, patchHelper, byotMachine, machine)
 }
 
 // resolveApplyAuth picks the talosconfig to authenticate the configuration
@@ -731,7 +730,65 @@ func (r *ByotMachineReconciler) markUpgradeComplete(
 		"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP,
 		"version", byotMachine.Status.CurrentTalosVersion)
 
+	// Mirror the new live version onto the owning ByotHost. The ByotHost
+	// controller only (re)discovers the version while the host is in
+	// maintenance (Available/Releasing); while Claimed probing is paused, so
+	// without this the ByotHost's recorded version goes stale across an
+	// in-place upgrade. A failure requeues (idempotent re-run).
+	err = r.syncHostTalosVersion(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, true, err
+	}
+
 	return ctrl.Result{}, false, nil
+}
+
+// syncHostTalosVersion mirrors the ByotMachine's live Talos version
+// (status.currentTalosVersion) onto the owning ByotHost's
+// status.talosVersion. The ByotHost controller only (re)discovers the version
+// while the host is in maintenance (Available/Releasing); while the host is
+// Claimed probing is paused, so without this mirror the ByotHost's recorded
+// version goes stale across an in-place upgrade. Best-effort against a
+// missing host (cleared claim); a patch failure is returned so the reconcile
+// retries the mirror.
+func (r *ByotMachineReconciler) syncHostTalosVersion(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+) error {
+	if byotMachine.Status.ResolvedHost == "" || byotMachine.Status.CurrentTalosVersion == "" {
+		return nil
+	}
+
+	host := &infrav1.ByotHost{}
+
+	err := r.Client.Get(ctx, ctrlclient.ObjectKey{
+		Namespace: byotMachine.Namespace,
+		Name:      byotMachine.Status.ResolvedHost,
+	}, host)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("failed to get ByotHost %s for version mirror: %w",
+			byotMachine.Status.ResolvedHost, err)
+	}
+
+	if host.Status.TalosVersion == byotMachine.Status.CurrentTalosVersion {
+		return nil
+	}
+
+	host.Status.TalosVersion = byotMachine.Status.CurrentTalosVersion
+
+	err = r.Client.Status().Update(ctx, host)
+	if err != nil {
+		return fmt.Errorf("failed to mirror Talos version onto ByotHost %s: %w", host.Name, err)
+	}
+
+	log.FromContext(ctx).Info("Mirrored Talos version onto ByotHost",
+		"byotHost", host.Name, "talosVersion", byotMachine.Status.CurrentTalosVersion)
+
+	return nil
 }
 
 func (r *ByotMachineReconciler) applyAndMarkAdopted(
@@ -797,7 +854,10 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 
 	logger.Info("Machine adopted", "byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP)
 
-	return r.linkNode(ctx, patchHelper, byotMachine, machine)
+	// Drive the post-adoption upgrade-then-link path in the same reconcile so
+	// a freshly-adopted host upgrades (reboots) before it is linked and goes
+	// live; see reconcileAdopted.
+	return r.reconcileAdopted(ctx, patchHelper, byotMachine, machine)
 }
 
 // linkNode drives the Machine<->Node linkage for an adopted machine: first
