@@ -199,14 +199,26 @@ func upgradeMachine(ctx context.Context, publicIP string, talosConfig []byte, im
 // the substring after the last ':' that follows the last '/'; for a ref like
 // ghcr.io/siderolabs/installer:v1.14.0 it returns v1.14.0.
 //
+// A digest delimiter ('@sha256:...') is stripped before parsing the tag, since
+// its colon would otherwise be picked up by the last-':' lookup.
+//
 // A ref without a tag (no ':' in the repo part) is returned as-is so the
 // predicate never matches a live tag and the upgrade path is skipped.
 func installerTag(ref string) string {
-	idx := strings.LastIndex(ref, "/")
+	// Strip a digest delimiter (e.g. @sha256:abc) so its colon is not picked
+	// up by the last-':' lookup below. The original ref is preserved for the
+	// no-tag return path so a digest-only ref never matches a live tag
+	// (triggering InvalidImageRef).
+	stripped := ref
+	if at := strings.LastIndex(ref, "@"); at >= 0 {
+		stripped = ref[:at]
+	}
 
-	repo := ref
+	idx := strings.LastIndex(stripped, "/")
+
+	repo := stripped
 	if idx >= 0 {
-		repo = ref[idx+1:]
+		repo = stripped[idx+1:]
 	}
 
 	colon := strings.LastIndex(repo, ":")

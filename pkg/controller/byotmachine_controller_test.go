@@ -541,7 +541,8 @@ func TestNudgeKubeletAfterSplitReadoptSucceeds(t *testing.T) {
 		true, false,
 		func(context.Context, string, []byte, string) (bool, error) { return true, nil },
 		func(context.Context, string, []byte, string) error {
-			return nil })
+			return nil
+		})
 
 	condition := conditions.Get(byotMachine, KubeletRestartNudgeCondition)
 	require.NotNil(t, condition)
@@ -647,7 +648,8 @@ func TestNudgeKubeletAfterSplitReadoptFiresOnRoundTrip(t *testing.T) {
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, false,
 		func(context.Context, string, []byte, string) (bool, error) { return true, nil },
 		func(context.Context, string, []byte, string) error {
-			return nil })
+			return nil
+		})
 
 	condition := conditions.Get(byotMachine, KubeletRestartNudgeCondition)
 	require.NotNil(t, condition)
@@ -1183,8 +1185,6 @@ func TestUpdateNodeProviderIDReturnsErrorOnPatchFailure(t *testing.T) {
 	assert.False(t, updated.Status.NodeUpdated)
 }
 
-
-
 const (
 	// testInstallerV1139 is the desired installer image ref for upgrade tests.
 	testInstallerV1139 = "ghcr.io/siderolabs/installer:v1.13.9"
@@ -1411,7 +1411,8 @@ func TestEnsureTalosVersionProbeFailureStopsAtThreshold(t *testing.T) {
 	reconciler := upgradeReconciler(t, client,
 		func(context.Context, string, []byte) (string, error) { return "", assert.AnError },
 		func(context.Context, string, []byte, string) error {
-			return nil },
+			return nil
+		},
 	)
 
 	updated := driveUpgradeUntilStopped(t, reconciler, client, byotMachine)
@@ -1433,7 +1434,8 @@ func TestEnsureTalosVersionUpgradeFailureStopsAtThreshold(t *testing.T) {
 	reconciler := upgradeReconciler(t, client,
 		func(context.Context, string, []byte) (string, error) { return "", assert.AnError },
 		func(context.Context, string, []byte, string) error {
-			return nil },
+			return nil
+		},
 	)
 
 	updated := driveUpgradeUntilStopped(t, reconciler, client, byotMachine)
@@ -1486,12 +1488,14 @@ func TestEnsureTalosVersionOptOutSkipsUpgrade(t *testing.T) {
 	var probed int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) { probed++
+		func(context.Context, string, []byte) (string, error) {
+			probed++
 
 			return "", nil
 		},
 		func(context.Context, string, []byte, string) error {
-			return nil },
+			return nil
+		},
 	)
 
 	machine := newOwningMachine("test-bootstrap")
@@ -1517,12 +1521,14 @@ func TestEnsureTalosVersionSkipsWhenNotReady(t *testing.T) {
 	var probed int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) { probed++
+		func(context.Context, string, []byte) (string, error) {
+			probed++
 
 			return "", nil
 		},
 		func(context.Context, string, []byte, string) error {
-			return nil },
+			return nil
+		},
 	)
 
 	machine := newOwningMachine("test-bootstrap")
@@ -1591,6 +1597,12 @@ func TestInstallerTag(t *testing.T) {
 		{"registry.local:5000/installer:v1.13.8", "v1.13.8"},
 		{"ghcr.io/siderolabs/installer", "ghcr.io/siderolabs/installer"},
 		{"v1.14.0", "v1.14.0"},
+		// Digest-pinned refs: tag is extracted from before the '@', and a
+		// digest-only ref (no tag) is returned whole so it never matches a
+		// live tag and the upgrade path is skipped (InvalidImageRef).
+		{"ghcr.io/siderolabs/installer:v1.14.0@sha256:abc", "v1.14.0"},
+		{"ghcr.io/siderolabs/installer@sha256:abc", "ghcr.io/siderolabs/installer@sha256:abc"},
+		{"registry.local:5000/installer:v1.13.8@sha256:abc", "v1.13.8"},
 	}
 
 	for _, tc := range cases {
@@ -1657,6 +1669,157 @@ func TestClusterControlPlaneReady(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, scenario.wantReady, ready)
 		})
+	}
+}
+
+// gateCluster builds a Cluster whose ControlPlaneReady condition matches ready
+// for the worker-adoption-gate integration tests.
+func gateCluster(ready bool) *clusterv1.Cluster {
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testNamespace},
+	}
+	if ready {
+		conditions.MarkTrue(cluster, clusterv1.ControlPlaneReadyCondition)
+	} else {
+		conditions.MarkFalse(cluster, clusterv1.ControlPlaneReadyCondition,
+			"Provisioning", clusterv1.ConditionSeverityWarning, "")
+	}
+
+	return cluster
+}
+
+// gateReconciler builds a reconciler whose host answers maintenance mode so
+// preflightJoin succeeds and the reconcile reaches the adoption gate. The
+// real config apply remains, so a non-held machine fails fast at the apply
+// (dialing 127.0.0.1, refused) instead of looping on the gate.
+func gateReconciler(client ctrlclient.Client) *ByotMachineReconciler {
+	r := NewByotMachineReconciler(client)
+	r.probeMaintenance = func(context.Context, string) bool { return true }
+	r.probeAuthenticated = func(context.Context, string, []byte) bool { return false }
+
+	return r
+}
+
+// gateAdoptionFixture builds a not-yet-adopted ByotMachine (claimed host,
+// owning Machine, bootstrap secret) ready to reach the adoption gate.
+// controlPlane labels the owning Machine as a control-plane member.
+func gateAdoptionFixture(controlPlane bool) (
+	*infrav1.ByotMachine, *clusterv1.Machine, *infrav1.ByotHost, *corev1.Secret,
+) {
+	byotMachine := newByotMachine("127.0.0.1")
+	byotMachine.Finalizers = []string{byotMachineFinalizer}
+	byotMachine.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "Machine",
+			Name:       testMachineName,
+			UID:        testMachineUID,
+		},
+	}
+
+	machine := newOwningMachine("test-bootstrap")
+	if controlPlane {
+		machine.Labels[clusterv1.MachineControlPlaneLabel] = ""
+	}
+
+	host := newClaimedByotHost("127.0.0.1")
+	secret := newBootstrapSecret("test-bootstrap", "default", []byte("machine-config"))
+
+	return byotMachine, machine, host, secret
+}
+
+// gateTestClient builds a fake client seeded with the given objects for the
+// worker-adoption-gate integration tests.
+func gateTestClient(t *testing.T, objs ...ctrlclient.Object) ctrlclient.Client {
+	t.Helper()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&infrav1.ByotMachine{}, &infrav1.ByotHost{}).
+		Build()
+}
+
+// TestReconcileWorkerHeldUntilControlPlaneReady exercises awaitControlPlaneReady
+// through the full reconcile path (not just the clusterControlPlaneReady
+// helper): a worker whose host is in maintenance mode is held with
+// MachineAdopted=False/WaitingForControlPlane and requeued while the cluster
+// control plane is not Ready.
+func TestReconcileWorkerHeldUntilControlPlaneReady(t *testing.T) {
+	t.Parallel()
+
+	byotMachine, machine, host, secret := gateAdoptionFixture(false)
+	cluster := gateCluster(false)
+	client := gateTestClient(t, byotMachine, host, machine, secret, cluster)
+
+	result, err := gateReconciler(client).Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterBootstrap, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, client.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.False(t, updated.Status.Ready, "worker must not be adopted while CP not ready")
+
+	cond := conditions.Get(updated, MachineAdoptedCondition)
+	require.NotNil(t, cond)
+	assert.Equal(t, corev1.ConditionFalse, cond.Status)
+	assert.Equal(t, "WaitingForControlPlane", cond.Reason)
+}
+
+// TestReconcileWorkerProceedsPastGateOnceControlPlaneReady shows the gate
+// opens once the control plane is Ready: the reconcile proceeds past the
+// gate to the config apply, which dials the (refused) host and fails. An
+// apply failure (not a WaitingForControlPlane requeue) proves the worker
+// was not held.
+func TestReconcileWorkerProceedsPastGateOnceControlPlaneReady(t *testing.T) {
+	t.Parallel()
+
+	byotMachine, machine, host, secret := gateAdoptionFixture(false)
+	cluster := gateCluster(true)
+	client := gateTestClient(t, byotMachine, host, machine, secret, cluster)
+
+	_, err := gateReconciler(client).Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.Error(t, err)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, client.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.False(t, updated.Status.Ready)
+
+	cond := conditions.Get(updated, MachineAdoptedCondition)
+	require.NotNil(t, cond)
+	assert.Equal(t, corev1.ConditionFalse, cond.Status)
+	assert.NotEqual(t, "WaitingForControlPlane", cond.Reason)
+}
+
+// TestReconcileControlPlaneMachineNotGated shows a control-plane machine is
+// never held at the gate: even with the control plane not Ready it proceeds
+// past the gate to the apply (which fails on the refused host), never
+// setting WaitingForControlPlane.
+func TestReconcileControlPlaneMachineNotGated(t *testing.T) {
+	t.Parallel()
+
+	byotMachine, machine, host, secret := gateAdoptionFixture(true)
+	cluster := gateCluster(false) // CP not ready, but CP machines are not gated
+	client := gateTestClient(t, byotMachine, host, machine, secret, cluster)
+
+	_, err := gateReconciler(client).Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.Error(t, err)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, client.Get(t.Context(), clusterKey(byotMachine), updated))
+
+	cond := conditions.Get(updated, MachineAdoptedCondition)
+	if cond != nil {
+		assert.NotEqual(t, "WaitingForControlPlane", cond.Reason)
 	}
 }
 

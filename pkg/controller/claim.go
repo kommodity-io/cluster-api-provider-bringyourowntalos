@@ -27,7 +27,6 @@ var ErrNoHostAvailable = errors.New("no available ByotHost matches the claim cri
 // claim it sets status.resolvedHost and status.resolvedPublicIP. handled is
 // true when the caller must return the given result (requeue waiting for a
 // host, or a CAS conflict) instead of proceeding to adoption.
-//
 func (r *ByotMachineReconciler) claimHost(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
@@ -394,4 +393,3 @@ func (r *ByotMachineReconciler) releaseHost(
 
 	return nil
 }
-
