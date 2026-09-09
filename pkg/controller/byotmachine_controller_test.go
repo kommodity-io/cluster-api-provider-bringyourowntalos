@@ -221,6 +221,64 @@ func TestByotMachineReconcileNoOpWhenConfigUnchanged(t *testing.T) {
 	assert.False(t, result.Requeue)
 }
 
+// TestByotMachineReconcileDoesNotReadoptOnFailedUpgrade verifies that a
+// Failed upgrade (host reset, config hash cleared) is not re-adopted: the
+// reset evicted the node, and re-applying the config would re-join it. The
+// Failed state is terminal until an operator retrigger.
+func TestByotMachineReconcileDoesNotReadoptOnFailedUpgrade(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	configData := []byte("cluster:\n  controlPlane: {}\n")
+
+	// Failed upgrade: Ready cleared, config hash cleared, state=Failed.
+	desired := "ghcr.io/siderolabs/installer:v1.13.9"
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "")
+	byotMachine.Status.Ready = false
+	byotMachine.Status.UpgradeState = infrav1.UpgradeStateFailed
+	byotMachine.Status.UpgradeAttemptGeneration = 1
+	byotMachine.Generation = 1
+	byotMachine.Spec.DesiredTalosVersion = &desired
+
+	host := newClaimedByotHost("203.0.113.10")
+	machine := newOwningMachine("test-bootstrap")
+	machine.Status.NodeRef = &corev1.ObjectReference{Name: "test-node"}
+	secret := newBootstrapSecret("test-bootstrap", "default", configData)
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, host, machine, secret).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	var applied int
+
+	reconciler := NewByotMachineReconciler(client)
+
+	reconciler.applyMachineConfig = func(_ context.Context, _ string, _ []byte, _ []byte) error {
+		applied++
+
+		return nil
+	}
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.NoError(t, err)
+	// reconcileAdopted stops on Failed (handled, no requeue).
+	assert.Zero(t, result.RequeueAfter)
+	assert.Equal(t, 0, applied, "config must not be re-applied on a Failed upgrade (node would re-join)")
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, client.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.False(t, updated.Status.Ready, "Ready stays cleared (node evicted)")
+	assert.Equal(t, infrav1.UpgradeStateFailed, updated.Status.UpgradeState)
+}
+
 func TestByotMachineReconcileRequeuesWhenClusterTalosConfigMissing(t *testing.T) {
 	t.Parallel()
 
@@ -1208,18 +1266,34 @@ func newUpgradeByotMachine(desired string) *infrav1.ByotMachine {
 
 // upgradeReconciler builds a ByotMachineReconciler with the upgrade seams
 // injected. The cluster talosconfig is loaded from the fake client
-// (test-cluster-talosconfig secret).
+// (test-cluster-talosconfig secret). upgradeFn returns (bootID, error):
+// bootID is the pre-reboot boot-id the real upgradeMachine captures; tests
+// return a sentinel to drive the InFlight boot-id gate, or "" to exercise the
+// reachability + version-change fallback. bootIDFn drives the InFlight
+// completion-gate probe (defaults to a permission-denied fallback when nil).
 func upgradeReconciler(
 	t *testing.T,
 	client ctrlclient.Client,
 	versionProbeFn func(context.Context, string, []byte) (string, error),
-	upgradeFn func(context.Context, string, []byte, string) error,
+	upgradeFn func(context.Context, string, []byte, string) (string, error),
+	bootIDFn ...func(context.Context, string, []byte) (string, error),
 ) *ByotMachineReconciler {
 	t.Helper()
 
 	reconciler := NewByotMachineReconciler(client)
 	reconciler.versionProbeAuthenticated = versionProbeFn
 	reconciler.upgradeMachine = upgradeFn
+
+	if len(bootIDFn) > 0 && bootIDFn[0] != nil {
+		reconciler.bootIDAuthenticated = bootIDFn[0]
+	} else {
+		// Default: boot-id read permission-denied → InFlight uses the
+		// reachability + version-change fallback (exercises the path a
+		// credential without boot-id read permission takes).
+		reconciler.bootIDAuthenticated = func(context.Context, string, []byte) (string, error) {
+			return "", errBootIDUnauthorized
+		}
+	}
 
 	return reconciler
 }
@@ -1302,12 +1376,12 @@ func TestEnsureTalosVersionMismatchUpgradeAndComplete(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ string, _ []byte, image string) error {
+		func(_ context.Context, _ string, _ []byte, image string) (string, error) {
 			upgrades++
 
 			assert.Equal(t, testInstallerV1139, image)
 
-			return nil
+			return "", nil
 		},
 	)
 
@@ -1342,20 +1416,30 @@ func TestEnsureTalosVersionMismatchUpgradeAndComplete(t *testing.T) {
 	assert.Equal(t, "Upgraded", conditions.GetReason(updated, TalosVersionReadyCondition))
 }
 
-func TestEnsureTalosVersionSameVersionSkipsUpgrade(t *testing.T) {
+func TestEnsureTalosVersionSameRefAlreadyAppliedSkipsUpgrade(t *testing.T) {
 	t.Parallel()
 
+	// With the lifecycle Upgrade migration the version-match skip is gone
+	// (custom installer tags break it). Dedup is ref+gen based: when
+	// UpgradeAppliedImageRef == DesiredTalosVersion and the attempt
+	// generation matches, the upgrade is already complete and skipped.
 	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	byotMachine.Status.UpgradeAppliedImageRef = testInstallerV1139
+	byotMachine.Status.UpgradeAttemptGeneration = 1 // matches Generation (1)
 	client := upgradeTestClient(t, byotMachine)
 
 	var upgrades int
 
 	reconciler := upgradeReconciler(t, client,
-		scriptedVersionProbe(t, "v1.13.9"),
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, string, []byte) (string, error) {
+			t.Fatal("version probe must not run on a deduped upgrade")
+
+			return "", nil
+		},
+		func(context.Context, string, []byte, string) (string, error) {
 			upgrades++
 
-			return nil
+			return "", nil
 		},
 	)
 
@@ -1369,7 +1453,6 @@ func TestEnsureTalosVersionSameVersionSkipsUpgrade(t *testing.T) {
 
 	updated := refreshByotMachine(t, client, byotMachine)
 	assert.Empty(t, updated.Status.UpgradeState)
-	assert.Equal(t, "v1.13.9", updated.Status.CurrentTalosVersion)
 	assert.True(t, conditions.IsTrue(updated, TalosVersionReadyCondition))
 	assert.Equal(t, "Upgraded", conditions.GetReason(updated, TalosVersionReadyCondition))
 	assert.Zero(t, upgrades)
@@ -1410,8 +1493,8 @@ func TestEnsureTalosVersionProbeFailureStopsAtThreshold(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		func(context.Context, string, []byte) (string, error) { return "", assert.AnError },
-		func(context.Context, string, []byte, string) error {
-			return nil
+		func(context.Context, string, []byte, string) (string, error) {
+			return "", nil
 		},
 	)
 
@@ -1433,50 +1516,93 @@ func TestEnsureTalosVersionUpgradeFailureStopsAtThreshold(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		func(context.Context, string, []byte) (string, error) { return "", assert.AnError },
-		func(context.Context, string, []byte, string) error {
-			return nil
+		func(context.Context, string, []byte, string) (string, error) {
+			return "", nil
 		},
 	)
+	reconciler.resetAdoptedHost = func(_ context.Context, _ *infrav1.ByotMachine) error { return nil }
 
 	updated := driveUpgradeUntilStopped(t, reconciler, client, byotMachine)
 
 	assert.Equal(t, infrav1.UpgradeStateFailed, updated.Status.UpgradeState)
 	assert.Equal(t, upgradeThreshold, updated.Status.UpgradeProbeFailures)
 	assert.Equal(t, "UpgradeFailed", conditions.GetReason(updated, TalosVersionReadyCondition))
+	assert.False(t, updated.Status.Ready, "Ready cleared after reset on failure")
 }
 
-func TestEnsureTalosVersionUpgradeRPCErrorRevertsInFlight(t *testing.T) {
+func TestEnsureTalosVersionUpgradeRPCErrorFailsAndResets(t *testing.T) {
 	t.Parallel()
 
-	// If the Upgrade RPC fails (e.g. Talos refuses on an etcd-quorum guard),
-	// InFlight must be reverted to "" so the next reconcile re-issues
-	// instead of polling a version that never changed.
+	// If the Upgrade RPC fails, the upgrade is finalized as Failed and the
+	// host is reset to maintenance so the node (which joined at config-apply,
+	// before the upgrade) does not linger in the cluster on the wrong Talos
+	// version. Ready is cleared so a retrigger re-applies the config.
 	byotMachine := newUpgradeByotMachine(testInstallerV1139)
 	client := upgradeTestClient(t, byotMachine)
 
-	var upgrades int
+	var upgrades, resets int
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8"),
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, string, []byte, string) (string, error) {
 			upgrades++
 
-			return assert.AnError
+			return "", assert.AnError
 		},
 	)
+	reconciler.resetAdoptedHost = func(_ context.Context, _ *infrav1.ByotMachine) error {
+		resets++
+
+		return nil
+	}
 
 	machine := newOwningMachine("test-bootstrap")
 
 	result, handled, err := reconciler.ensureTalosVersion(
 		t.Context(), upgradePatchHelper(t, client, byotMachine), byotMachine, machine)
-	require.Error(t, err)
+	require.NoError(t, err)
 	assert.True(t, handled)
-	assert.Zero(t, result.RequeueAfter) // error path: no scheduled requeue
+	assert.Zero(t, result.RequeueAfter) // finalized: stopped, no scheduled requeue
 
 	updated := refreshByotMachine(t, client, byotMachine)
-	assert.Empty(t, updated.Status.UpgradeState, "InFlight reverted on RPC error")
-	assert.Equal(t, "Upgrading", conditions.GetReason(updated, TalosVersionReadyCondition))
+	assert.Equal(t, infrav1.UpgradeStateFailed, updated.Status.UpgradeState, "Failed on RPC error")
+	assert.Equal(t, "UpgradeFailed", conditions.GetReason(updated, TalosVersionReadyCondition))
+	assert.False(t, updated.Status.Ready, "Ready cleared so retrigger re-applies config")
+	assert.Empty(t, updated.Status.LastAppliedConfigSHA, "config hash cleared to force re-apply")
 	assert.Equal(t, 1, upgrades)
+	assert.Equal(t, 1, resets, "host reset to evict the node")
+}
+
+func TestEnsureTalosVersionUpgradeRPCErrorResetFailureRetries(t *testing.T) {
+	t.Parallel()
+
+	// If the reset after a failed upgrade itself fails, finalizeUpgradeFailure
+	// requeues to retry the reset; the Failed state is already persisted so the
+	// upgrade is not re-issued meanwhile.
+	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	client := upgradeTestClient(t, byotMachine)
+
+	reconciler := upgradeReconciler(t, client,
+		scriptedVersionProbe(t, "v1.13.8"),
+		func(context.Context, string, []byte, string) (string, error) {
+			return "", assert.AnError
+		},
+	)
+	reconciler.resetAdoptedHost = func(_ context.Context, _ *infrav1.ByotMachine) error {
+		return assert.AnError
+	}
+
+	machine := newOwningMachine("test-bootstrap")
+
+	result, handled, err := reconciler.ensureTalosVersion(
+		t.Context(), upgradePatchHelper(t, client, byotMachine), byotMachine, machine)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, requeueAfterResetIssued, result.RequeueAfter, "requeue to retry the reset")
+
+	updated := refreshByotMachine(t, client, byotMachine)
+	assert.Equal(t, infrav1.UpgradeStateFailed, updated.Status.UpgradeState)
+	assert.True(t, updated.Status.Ready, "Ready not cleared until reset succeeds")
 }
 
 func TestEnsureTalosVersionOptOutSkipsUpgrade(t *testing.T) {
@@ -1493,8 +1619,8 @@ func TestEnsureTalosVersionOptOutSkipsUpgrade(t *testing.T) {
 
 			return "", nil
 		},
-		func(context.Context, string, []byte, string) error {
-			return nil
+		func(context.Context, string, []byte, string) (string, error) {
+			return "", nil
 		},
 	)
 
@@ -1526,8 +1652,8 @@ func TestEnsureTalosVersionSkipsWhenNotReady(t *testing.T) {
 
 			return "", nil
 		},
-		func(context.Context, string, []byte, string) error {
-			return nil
+		func(context.Context, string, []byte, string) (string, error) {
+			return "", nil
 		},
 	)
 
@@ -1544,6 +1670,12 @@ func TestEnsureTalosVersionSkipsWhenNotReady(t *testing.T) {
 func TestEnsureTalosVersionRetriggerAfterFailure(t *testing.T) {
 	t.Parallel()
 
+	// A Failed upgrade whose generation is stale (operator edited
+	// DesiredTalosVersion) is cleared and the state machine restarts. This
+	// models the VersionProbeFailed path (resetOnFailure=false, so the host
+	// keeps its config); an UpgradeFailed failure resets the host to
+	// maintenance first, then a retrigger re-applies the config via the
+	// adopt path (configUnchanged is false once Ready is cleared).
 	byotMachine := newUpgradeByotMachine(testInstallerV1139)
 	byotMachine.Status.UpgradeState = infrav1.UpgradeStateFailed
 	byotMachine.Status.UpgradeAttemptGeneration = 1
@@ -1561,10 +1693,10 @@ func TestEnsureTalosVersionRetriggerAfterFailure(t *testing.T) {
 
 			return "v1.13.8", nil
 		},
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, string, []byte, string) (string, error) {
 			upgrades++
 
-			return nil
+			return "", nil
 		},
 	)
 
@@ -1585,29 +1717,65 @@ func TestEnsureTalosVersionRetriggerAfterFailure(t *testing.T) {
 	assert.Equal(t, 1, upgrades)
 }
 
-func TestInstallerTag(t *testing.T) {
+func TestInstallerTagRemoved(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
-		ref  string
-		want string
-	}{
-		{"ghcr.io/siderolabs/installer:v1.14.0", "v1.14.0"},
-		{"installer:v1.13.9", "v1.13.9"},
-		{"registry.local:5000/installer:v1.13.8", "v1.13.8"},
-		{"ghcr.io/siderolabs/installer", "ghcr.io/siderolabs/installer"},
-		{"v1.14.0", "v1.14.0"},
-		// Digest-pinned refs: tag is extracted from before the '@', and a
-		// digest-only ref (no tag) is returned whole so it never matches a
-		// live tag and the upgrade path is skipped (InvalidImageRef).
-		{"ghcr.io/siderolabs/installer:v1.14.0@sha256:abc", "v1.14.0"},
-		{"ghcr.io/siderolabs/installer@sha256:abc", "ghcr.io/siderolabs/installer@sha256:abc"},
-		{"registry.local:5000/installer:v1.13.8@sha256:abc", "v1.13.8"},
-	}
+	// installerTag was removed with the lifecycle Upgrade migration: the
+	// completion gate is a boot-id change, not a version-match, so the tag
+	// is no longer parsed from the installer ref. This test is a placeholder
+	// documenting the removal; remove it if a future helper is reintroduced.
+	_ = t
+}
 
-	for _, tc := range cases {
-		assert.Equal(t, tc.want, installerTag(tc.ref), "ref=%q", tc.ref)
-	}
+// TestEnsureTalosVersionBootIDGateComplete covers the primary InFlight
+// completion path: a pre-reboot boot-id was captured at issue time, and the
+// InFlight poll sees a changed live boot-id (host rebooted) → complete. This
+// also exercises the bootIDFn variadic of upgradeReconciler.
+func TestEnsureTalosVersionBootIDGateComplete(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	client := upgradeTestClient(t, byotMachine)
+
+	const preReboot, postReboot = "boot-id-pre", "boot-id-post"
+
+	reconciler := upgradeReconciler(t, client,
+		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"), // pre-upgrade probe + post-reboot refresh in the boot-id gate
+		func(_ context.Context, _ string, _ []byte, _ string) (string, error) {
+			return preReboot, nil // capture pre-reboot boot-id
+		},
+		func(context.Context, string, []byte) (string, error) {
+			return postReboot, nil // live boot-id differs → complete
+		},
+	)
+
+	machine := newOwningMachine("test-bootstrap")
+
+	// 1. Issue: probe → upgrade → stash preReboot boot-id → InFlight.
+	result, handled, err := reconciler.ensureTalosVersion(
+		t.Context(), upgradePatchHelper(t, client, byotMachine), byotMachine, machine)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, requeueAfterUpgrade, result.RequeueAfter)
+
+	updated := refreshByotMachine(t, client, byotMachine)
+	assert.Equal(t, infrav1.UpgradeStateInFlight, updated.Status.UpgradeState)
+	assert.Equal(t, preReboot, updated.Status.UpgradePreRebootBootID)
+
+	// 2. InFlight: live boot-id differs → complete.
+	result, handled, err = reconciler.ensureTalosVersion(
+		t.Context(), upgradePatchHelper(t, client, updated), updated, machine)
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated = refreshByotMachine(t, client, byotMachine)
+	assert.Empty(t, updated.Status.UpgradeState)
+	assert.Empty(t, updated.Status.UpgradePreRebootBootID, "boot-id cleared on completion")
+	assert.Equal(t, testInstallerV1139, updated.Status.UpgradeAppliedImageRef)
+	assert.Equal(t, "v1.13.9", updated.Status.CurrentTalosVersion,
+		"boot-id gate refreshes CurrentTalosVersion on completion")
+	assert.True(t, conditions.IsTrue(updated, TalosVersionReadyCondition))
 }
 
 // TestClusterControlPlaneReady verifies the worker-adoption gate's signal:
@@ -1837,7 +2005,7 @@ func TestSyncHostTalosVersionMirrorsAfterUpgrade(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ string, _ []byte, _ string) error { return nil },
+		func(_ context.Context, _ string, _ []byte, _ string) (string, error) { return "", nil },
 	)
 
 	machine := newOwningMachine("test-bootstrap")
@@ -1889,12 +2057,12 @@ func TestReconcileAdoptedUpgradesBeforeLinking(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ string, _ []byte, image string) error {
+		func(_ context.Context, _ string, _ []byte, image string) (string, error) {
 			upgrades++
 
 			assert.Equal(t, testInstallerV1139, image)
 
-			return nil
+			return "", nil
 		},
 	)
 	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {

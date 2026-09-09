@@ -68,13 +68,17 @@ type ByotMachineSpec struct {
 	// +optional
 	FailureDomain *string `json:"failureDomain,omitempty"`
 
-	// DesiredTalosVersion is an installer image ref (e.g.
-	// ghcr.io/siderolabs/installer:v1.14.0) the claimed host is upgraded to
-	// after the machine is adopted. Empty (the default) opts out of version
-	// management: no Version probe runs and existing adoption behavior is
-	// unchanged. Stamped from the ByotMachineTemplate. Mutable; editing after
-	// Ready=true retriggers an in-place upgrade via generation bump. For the
-	// host-swap rollout model, roll a new template instead.
+	// DesiredTalosVersion is an installer image ref the claimed host is
+	// upgraded to after the machine is adopted, via the Talos
+	// LifecycleClient.Upgrade RPC. The ref may be a stock Sidero installer
+	// (ghcr.io/siderolabs/installer:v1.14.0), an Image Factory installer
+	// (factory.talos.dev/installer/<schematic>:v1.14.0), or a custom-built
+	// installer with extensions. Empty (the default) opts out
+	// of version management: no upgrade runs and existing adoption behavior
+	// is unchanged. Stamped from the ByotMachineTemplate. Mutable; editing
+	// after Ready=true retriggers an in-place upgrade via generation bump.
+	// A same-ref re-issue with a matching attempt generation is deduped
+	// (already applied); bump generation to force a same-ref reinstall.
 	// +optional
 	DesiredTalosVersion *string `json:"desiredTalosVersion,omitempty"`
 }
@@ -156,6 +160,23 @@ type ByotMachineStatus struct {
 	// mismatch and clears Failed to retry.
 	// +optional
 	UpgradeAttemptGeneration int64 `json:"upgradeAttemptGeneration,omitempty"`
+
+	// UpgradeAppliedImageRef is the installer image ref the host was last
+	// successfully upgraded to (recorded at completion). Used to dedup
+	// no-op re-issues: when DesiredTalosVersion equals this ref and the
+	// attempt generation matches, the upgrade is skipped (already applied).
+	// An operator forces a same-ref reinstall by bumping generation.
+	// +optional
+	UpgradeAppliedImageRef string `json:"upgradeAppliedImageRef,omitempty"`
+
+	// UpgradePreRebootBootID is the host boot-id captured just before the
+	// post-install Reboot RPC is issued. The InFlight poll completes when the
+	// live boot-id differs from it (the host rebooted into the new version).
+	// Empty when capture failed or read permission was denied; in that case
+	// InFlight falls back to a reachability + version-change completion
+	// check. Cleared on completion.
+	// +optional
+	UpgradePreRebootBootID string `json:"upgradePreRebootBootID,omitempty"`
 }
 
 // +kubebuilder:object:root=true
