@@ -74,50 +74,28 @@ func TestParsePlatform(t *testing.T) {
 	assert.Empty(t, parsePlatform("no cmdline here"))
 }
 
-func TestBucketMemory(t *testing.T) {
+func TestRoundQuantity(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
 		ki     int64
-		bucket string
+		label  string
 	}{
-		{3 * 1024 * 1024, "4G"},     // ~3Gi -> 4G
-		{7 * 1024 * 1024, "8G"},     // ~7Gi -> 8G
-		{15 * 1024 * 1024, "16G"},   // ~15Gi -> 16G
-		{30 * 1024 * 1024, "32G"},   // ~30Gi -> 32G
-		{60 * 1024 * 1024, "64G"},   // ~60Gi -> 64G
-		{120 * 1024 * 1024, "128G"}, // ~120Gi -> 128G
-		{200 * 1024 * 1024, "256G"}, // ~200Gi -> 256G
-		{400 * 1024 * 1024, "512G"}, // ~400Gi -> 512G
-		{800 * 1024 * 1024, "1T"},   // ~800Gi -> 1T
-		{1900 * 1024 * 1024, "2T"},  // ~1900Gi -> 2T
-		{4000 * 1024 * 1024, "2T"},  // oversized -> clamp
+		{3 * 1024 * 1024, "3G"},      // ~3Gi -> 3G
+		{7 * 1024 * 1024, "7G"},      // ~7Gi -> 7G
+		{15 * 1024 * 1024, "15G"},    // ~15Gi -> 15G
+		{64 * 1024 * 1024, "64G"},    // ~64Gi -> 64G
+		{250 * 1024 * 1024, "250G"},  // ~250Gi -> 250G
+		{800 * 1024 * 1024, "800G"},  // ~800Gi -> 800G
+		{1024 * 1024 * 1024, "1T"},   // 1Ti -> 1T
+		{1500 * 1024 * 1024, "1T"},   // ~1.46Ti -> 1T
+		{1900 * 1024 * 1024, "2T"},   // ~1.85Ti -> 2T
+		{4000 * 1024 * 1024, "4T"},   // ~3.9Ti -> 4T
 	}
 
 	for _, c := range cases {
 		q := resource.MustParse(strconv.FormatInt(c.ki, 10) + "Ki")
-		assert.Equal(t, c.bucket, bucketMemory(q))
-	}
-}
-
-func TestBucketDisk(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		gi     int64
-		bucket string
-	}{
-		{15, "20G"},
-		{80, "100G"},
-		{200, "250G"},
-		{400, "500G"},
-		{900, "1T"},
-		{5000, "1T"}, // clamp
-	}
-
-	for _, c := range cases {
-		q := resource.MustParse(strconv.FormatInt(c.gi, 10) + "Gi")
-		assert.Equal(t, c.bucket, bucketDisk(q))
+		assert.Equal(t, c.label, roundQuantity(q))
 	}
 }
 
@@ -186,9 +164,9 @@ func TestApplyDiscoveryLabelsPromotesCuratedLabels(t *testing.T) {
 	assert.Equal(t, "true", host.Labels[labelAvailable])
 	assert.Equal(t, "16", host.Labels[labelCPUCores])
 	assert.Equal(t, "amd64", host.Labels[labelCPUArch])
-	assert.Equal(t, "64G", host.Labels[labelMemoryClass])
+	assert.Equal(t, "64G", host.Labels[labelMemory])
 	assert.Equal(t, "ssd", host.Labels[labelDiskType])
-	assert.Equal(t, "250G", host.Labels[labelDiskClass])
+	assert.Equal(t, "250G", host.Labels[labelDiskSize])
 	assert.Equal(t, "scaleway", host.Labels[labelPlatform])
 	assert.Equal(t, "v1.13.8", host.Labels[labelTalosVersion])
 	assert.Equal(t, "par01", host.Labels[labelFailureDomain])

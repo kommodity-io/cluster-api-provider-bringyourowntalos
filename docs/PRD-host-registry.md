@@ -41,8 +41,8 @@ or parked-config path.
 | 6   | `ByotMachine` always claims a `ByotHost`; no direct `spec.publicIP` path                                                                                                                                                                                                                          | ByotHost is the single adoption unit; one code path; discovery always runs                                                                                                                                                               |
 | 7   | Claim by `hostRef` (explicit) or `hostSelector` (labels + `failureDomain`) against `Available` hosts; `ByotHost.status.claimRef` optimistic CAS, host finalizer blocks delete while claimed                                                                                                       | Race-protected against concurrent scale-out                                                                                                                                                                                              |
 | 8   | Selector claims are pure Kubernetes label selectors over `ByotHost` `metadata.labels`; conventionally include `byot.io/available: "true"` plus capability labels                                                                                                                                  | Standard k8s selection; no custom status-field selector. Controller lists `Available` hosts matching the selector and claims via `claimRef` CAS                                                                                          |
-| 9   | Discovered features are exposed two ways: rich typed `status` (view-only) and a curated, low-cardinality, bucketed subset promoted to `metadata.labels` (prefixed `byot.io/`, controller-managed)                                                                                                 | Labels are the only thing label selectors match; promoting a subset enables capability-based claims without operator label bookkeeping. Hardware is fixed → no label churn                                                               |
-| 10  | Promoted labels: `byot.io/available`, `cpu-cores`, `cpu-arch`, `memory-class` (4G/8G/16G/32G/64G/128G), `disk-type`, `disk-class` (20G/100G/250G/500G/1T), `platform`, `talos-version`, `failure-domain` (from `spec.failureDomain`). High-cardinality / non-selection fields stay in status only | Bucketed values stay stable and meaningful for selection; raw bytes/serials/bus paths are not selection-relevant. `failure-domain` is promoted so claim selectors can match the owning Machine's failureDomain for spread (see PLA-6629) |
+| 9   | Discovered features are exposed two ways: rich typed `status` (view-only) and a curated, low-cardinality, rounded subset promoted to `metadata.labels` (prefixed `byot.io/`, controller-managed)                                                                                                 | Labels are the only thing label selectors match; promoting a subset enables capability-based claims without operator label bookkeeping. Hardware is fixed → no label churn                                                               |
+| 10  | Promoted labels: `byot.io/available`, `cpu-cores`, `cpu-arch`, `memory` (rounded to nearest GiB/TiB), `disk-type`, `disk-size` (rounded to nearest GiB/TiB), `platform`, `talos-version`, `failure-domain` (from `spec.failureDomain`). High-cardinality / non-selection fields stay in status only | Rounded values stay stable and meaningful for selection; raw bytes/serials/bus paths are not selection-relevant. `failure-domain` is promoted so claim selectors can match the owning Machine's failureDomain for spread (see PLA-6629) |
 | 11  | `byot.io/available: "true"` is a derived index; `status.phase` is the source of truth. Controller claims only `phase=Available` hosts even if a label race leaves a stale label                                                                                                                   | Label is an optimization for cheap label-selector filtering; status gates correctness                                                                                                                                                    |
 | 12  | Release always resets (STATE+EPHEMERAL) → maintenance → `Available`                                                                                                                                                                                                                               | No `splitPolicy` choice; every release returns a clean, re-claimable maintenance host. Destructive by design                                                                                                                             |
 | 13  | Release reset reuses `resetWithResolvedAuth` candidate order (cluster talosconfig, then insecure maintenance); reset is async, the liveness probe loop flips `Releasing` → `Available` when maintenance answers                                                                                   | No separate reset-confirmation gate; reuses the probe controller                                                                                                                                                                         |
@@ -95,9 +95,9 @@ metadata:
     byot.io/available: "true"
     byot.io/cpu-cores: "3"
     byot.io/cpu-arch: "amd64"
-    byot.io/memory-class: "4G"
+    byot.io/memory: "4G"
     byot.io/disk-type: "hdd"
-    byot.io/disk-class: "20G"
+    byot.io/disk-size: "20G"
     byot.io/platform: "scaleway"
     byot.io/talos-version: "v1.13.8"
     site: copenhagen # freeform operator labels, also matchable
@@ -144,7 +144,7 @@ spec:
     matchLabels:
       byot.io/available: "true"
       byot.io/disk-type: "ssd"
-      byot.io/memory-class: "64G"
+      byot.io/memory: "64G"
       site: copenhagen
   failureDomain: "par01" # matched against ByotHost.spec.failureDomain
   # spec.publicIP REMOVED — IP resolved from claimed ByotHost
@@ -184,17 +184,17 @@ systemDisk bool, busPath string }` — from the `Disks` RPC.
 
 **Labels = curated, low-cardinality, selection-oriented.** The controller
 promotes a fixed subset to `metadata.labels` (prefixed `byot.io/`) and keeps
-them in sync with status. Bucketed, not raw, so values stay stable and
-meaningful for selection:
+them in sync with status. Rounded to nearest binary unit (GiB, or TiB at
+≥1024 GiB), not raw, so values stay stable and meaningful for selection:
 
 | Label                    | Source               | Values                                                                                                |
 | ------------------------ | -------------------- | ----------------------------------------------------------------------------------------------------- |
 | `byot.io/available`      | phase                | `"true"` only when `phase=Available`; absent otherwise (claim/filter gate)                            |
 | `byot.io/cpu-cores`      | `hardware.cpu.cores` | integer as string (e.g. `"3"`, `"16"`)                                                                |
 | `byot.io/cpu-arch`       | `Version` arch       | `amd64` / `arm64`                                                                                     |
-| `byot.io/memory-class`   | `hardware.memory`    | bucketed: `4G`, `8G`, `16G`, `32G`, `64G`, `128G`                                                     |
+| `byot.io/memory`        | `hardware.memory`    | rounded to nearest GiB/TiB (e.g. `64G`, `1T`)                                                         |
 | `byot.io/disk-type`      | system disk's `type` | `nvme`, `ssd`, `hdd`, `sd`                                                                            |
-| `byot.io/disk-class`     | system disk's `size` | bucketed: `20G`, `100G`, `250G`, `500G`, `1T`                                                         |
+| `byot.io/disk-size`     | system disk's `size` | rounded to nearest GiB/TiB (e.g. `250G`, `1T`)                                                       |
 | `byot.io/platform`       | `platform`           | `scaleway`, `azure`, ...                                                                         |
 | `byot.io/talos-version`  | `talosVersion`       | `v1.13.8`, ...                                                                                        |
 | `byot.io/failure-domain` | `spec.failureDomain` | operator-set physical FD, e.g. `par01`, `par02` (matched by claim selector for spread — see PLA-6629) |
@@ -278,7 +278,7 @@ then the `ByotHost` deletes.
 - `cluster-api-provider-bringyourowntalos`:
   - New CRD: `ByotHost` (IP-only spec, discovered status, `claimRef`,
     finalizer).
-  - New `ByotHost` controller: maintenance-mode discovery (`Version`, `Memory`, `Disks`, `Dmesg` parsing, `LS /sys/class/net`) + periodic liveness probe + promotion of curated bucketed labels. Reuses `maintenanceClient`.
+  - New `ByotHost` controller: maintenance-mode discovery (`Version`, `Memory`, `Disks`, `Dmesg` parsing, `LS /sys/class/net`) + periodic liveness probe + promotion of curated rounded labels. Reuses `maintenanceClient`.
   - `ByotMachine` controller: claim flow (`hostRef`/`hostSelector`), IP
     resolution from `ByotHost`, `claimRef` CAS, release-always-reset,
     `Releasing` → `Available` via the liveness loop. Remove `spec.publicIP`
@@ -296,7 +296,7 @@ then the `ByotHost` deletes.
 
 - Unit: discovery populates `status.hardware`/`talosVersion`/`arch`/`platform` from a mocked
   maintenance API (`Version`, `Memory`, `Disks`, `Dmesg`, `LS`); CPU cores parsed from `Dmesg`;
-  curated bucketed labels promoted and kept in sync; `byot.io/available` flipped on phase
+  curated rounded labels promoted and kept in sync; `byot.io/available` flipped on phase
   transitions; liveness flips `Available` → `Unavailable` on probe failure
   and back with re-discovery; claim race resolved by `claimRef` CAS; claim
   against a non-`Available` host requeues; release resets (mocked) and the

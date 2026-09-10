@@ -33,9 +33,9 @@ const (
 	labelAvailable     = discoveryLabelPrefix + "available"
 	labelCPUCores      = discoveryLabelPrefix + "cpu-cores"
 	labelCPUArch       = discoveryLabelPrefix + "cpu-arch"
-	labelMemoryClass   = discoveryLabelPrefix + "memory-class"
+	labelMemory        = discoveryLabelPrefix + "memory"
 	labelDiskType      = discoveryLabelPrefix + "disk-type"
-	labelDiskClass     = discoveryLabelPrefix + "disk-class"
+	labelDiskSize      = discoveryLabelPrefix + "disk-size"
 	labelGPUCount      = discoveryLabelPrefix + "gpu-count"
 	labelGPUVendor     = discoveryLabelPrefix + "gpu-vendor"
 	labelGPUModel      = discoveryLabelPrefix + "gpu-model"
@@ -565,65 +565,27 @@ func populateHardwareAddr(ctx context.Context, cosi state.CoreState, identity *i
 	}
 }
 
-// memoryBuckets are the selection-oriented memory classes, ascending.
-//
-//nolint:gochecknoglobals // static bucket table
-var memoryBuckets = []struct {
-	label string
-	bytes int64
-}{
-	{"4G", 4 << 30},
-	{"8G", 8 << 30},
-	{"16G", 16 << 30},
-	{"32G", 32 << 30},
-	{"64G", 64 << 30},
-	{"128G", 128 << 30},
-	{"256G", 256 << 30},
-	{"512G", 512 << 30},
-	{"1T", 1 << 40},
-	{"2T", 2 << 40},
-}
+// roundQuantity rounds q to the nearest binary unit (GiB, or TiB once the
+// value reaches 1024 GiB) and formats it with a G/T suffix for selection
+// labels. Unlike fixed buckets, every distinct capacity gets its own label.
+func roundQuantity(q resource.Quantity) string {
+	const (
+		gib int64 = 1 << 30
+		tib int64 = 1 << 40
+	)
 
-// diskBuckets are the selection-oriented disk-size classes, ascending.
-//
-//nolint:gochecknoglobals // static bucket table
-var diskBuckets = []struct {
-	label string
-	bytes int64
-}{
-	{"20G", 20 << 30},
-	{"100G", 100 << 30},
-	{"250G", 250 << 30},
-	{"500G", 500 << 30},
-	{"1T", 1 << 40},
-}
-
-// bucketMemory returns the smallest memory bucket at least as large as q.
-// Hosts smaller than the smallest bucket round up to it; hosts larger than the
-// largest bucket clamp to it.
-func bucketMemory(q resource.Quantity) string {
 	value := q.Value()
 
-	for _, b := range memoryBuckets {
-		if value <= b.bytes {
-			return b.label
-		}
+	// Round to the nearest GiB.
+	gibCount := (value + gib/2) / gib
+
+	if gibCount >= tib/gib {
+		// Round to the nearest TiB.
+		tibCount := (gibCount + (tib/gib)/2) / (tib / gib)
+		return strconv.FormatInt(tibCount, 10) + "T"
 	}
 
-	return memoryBuckets[len(memoryBuckets)-1].label
-}
-
-// bucketDisk returns the smallest disk bucket at least as large as q.
-func bucketDisk(q resource.Quantity) string {
-	value := q.Value()
-
-	for _, b := range diskBuckets {
-		if value <= b.bytes {
-			return b.label
-		}
-	}
-
-	return diskBuckets[len(diskBuckets)-1].label
+	return strconv.FormatInt(gibCount, 10) + "G"
 }
 
 // diskTypeLabel maps a Disk_DiskType enum name to a lowercase label value. It
@@ -688,14 +650,14 @@ func applyDiscoveryLabels(host *infrav1.ByotHost) {
 	host.Labels = labels
 }
 
-// promoteHardwareLabels lifts the curated, bucketed hardware subset to labels.
+// promoteHardwareLabels lifts the curated, rounded hardware subset to labels.
 func promoteHardwareLabels(labels map[string]string, hardware *infrav1.HostHardware) {
 	if hardware.CPU.Cores > 0 {
 		labels[labelCPUCores] = strconv.FormatInt(int64(hardware.CPU.Cores), 10)
 	}
 
 	if !hardware.Memory.IsZero() {
-		labels[labelMemoryClass] = bucketMemory(hardware.Memory)
+		labels[labelMemory] = roundQuantity(hardware.Memory)
 	}
 
 	if disk := systemDisk(hardware.Disks); disk != nil {
@@ -704,7 +666,7 @@ func promoteHardwareLabels(labels map[string]string, hardware *infrav1.HostHardw
 		}
 
 		if !disk.Size.IsZero() {
-			labels[labelDiskClass] = bucketDisk(disk.Size)
+			labels[labelDiskSize] = roundQuantity(disk.Size)
 		}
 	}
 
