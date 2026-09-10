@@ -568,13 +568,13 @@ func populateHardwareAddr(ctx context.Context, cosi state.CoreState, identity *i
 // roundQuantity rounds q to the nearest binary unit (GiB, or TiB once the
 // value reaches 1024 GiB) and formats it with a G/T suffix for selection
 // labels. Unlike fixed buckets, every distinct capacity gets its own label.
-func roundQuantity(q resource.Quantity) string {
+func roundQuantity(quantity resource.Quantity) string {
 	const (
 		gib int64 = 1 << 30
 		tib int64 = 1 << 40
 	)
 
-	value := q.Value()
+	value := quantity.Value()
 
 	// Round to the nearest GiB.
 	gibCount := (value + gib/2) / gib
@@ -582,6 +582,7 @@ func roundQuantity(q resource.Quantity) string {
 	if gibCount >= tib/gib {
 		// Round to the nearest TiB.
 		tibCount := (gibCount + (tib/gib)/2) / (tib / gib)
+
 		return strconv.FormatInt(tibCount, 10) + "T"
 	}
 
