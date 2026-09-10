@@ -109,12 +109,12 @@ const KubeletRestartNudgeCondition clusterv1.ConditionType = "KubeletRestartNudg
 
 // TalosVersionReadyCondition reports the claim-time Talos upgrade state. It is
 // only set when DesiredTalosVersion is non-empty (opt-out keeps the condition
-// list clean). Reasons: Upgrading (Reset issued or Upgrade RPC in flight),
-// Upgraded (Version RPC reports the desired tag, upgrade complete),
+// list clean). Reasons: Upgrading (lifecycle Upgrade pull+drain+reboot in
+// flight), Upgraded (boot-id changed, host rebooted into the new version),
 // UpgradeFailed (post-upgrade probe exhausted retries), VersionProbeFailed
 // (pre-upgrade probe exhausted retries), InvalidImageRef (DesiredTalosVersion
-// has no parseable tag). Never True while the machine is mid-upgrade; Ready
-// stays false throughout and is driven by the normal adoption gate.
+// is empty). Never True while the machine is mid-upgrade; Ready stays false
+// throughout and is driven by the normal adoption gate.
 const TalosVersionReadyCondition clusterv1.ConditionType = "TalosVersionReady"
 
 // nodeLinkRetriggerSelfFilter is a watch predicate that drops Update events
@@ -180,7 +180,21 @@ type ByotMachineReconciler struct {
 	// the cluster talosconfig (an adopted host no longer answers the
 	// maintenance client).
 	versionProbeAuthenticated func(ctx context.Context, publicIP string, talosConfig []byte) (string, error)
-	upgradeMachine            func(ctx context.Context, publicIP string, talosConfig []byte, image string) error
+	upgradeMachine            func(ctx context.Context, publicIP string, talosConfig []byte, image string) (string, error)
+
+	// bootIDAuthenticated is the InFlight completion-gate seam, injectable in
+	// tests. Returns the live boot-id or errBootIDUnauthorized when the
+	// credentials cannot read it (caller falls back to version-change).
+	bootIDAuthenticated func(ctx context.Context, publicIP string, talosConfig []byte) (string, error)
+
+	// resetAdoptedHost is the upgrade-failure seam, injectable in tests. It
+	// wipes an adopted host to maintenance so a failed-upgrade node leaves the
+	// cluster. See finalizeUpgradeFailure.
+	resetAdoptedHost func(ctx context.Context, byotMachine *infrav1.ByotMachine) error
+
+	// applyMachineConfig is the adoption seam, injectable in tests. It
+	// applies the bootstrap config to the host.
+	applyMachineConfig func(ctx context.Context, publicIP string, machineConfig []byte, talosConfig []byte) error
 
 	// join-preflight seams, injectable in tests; default to the real helpers.
 	// See preflightJoin / preflightForeignMachine. A maintenance-mode host is
@@ -192,16 +206,24 @@ type ByotMachineReconciler struct {
 
 // NewByotMachineReconciler creates a new ByotMachineReconciler.
 func NewByotMachineReconciler(client ctrlclient.Client) *ByotMachineReconciler {
-	return &ByotMachineReconciler{
+	reconciler := &ByotMachineReconciler{
 		Client: client,
 		Scheme: client.Scheme(),
 
 		versionProbeAuthenticated: versionProbeAuthenticated,
-		upgradeMachine:            upgradeMachine,
+		upgradeMachine:           upgradeMachine,
+		bootIDAuthenticated:      bootIDAuthenticated,
+		applyMachineConfig:       applyMachineConfig,
 
 		probeMaintenance:   probeMaintenance,
 		probeAuthenticated: probeAuthenticated,
 	}
+
+	reconciler.resetAdoptedHost = func(ctx context.Context, byotMachine *infrav1.ByotMachine) error {
+		return reconciler.resetAdoptedHostImpl(ctx, byotMachine)
+	}
+
+	return reconciler
 }
 
 // SetClusterCache wires the ClusterCache and derives the workload-client
@@ -295,6 +317,16 @@ func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.
 	}
 
 	configHash := sha256Hex(machineConfig)
+
+	// A Failed upgrade is terminal until the operator retriggers (generation
+	// bump clears it via retriggerStaleUpgradeFailure). finalizeUpgradeFailure
+	// reset the host to maintenance and cleared LastAppliedConfigSHA, so
+	// configUnchanged is false — but re-applying the config here would re-adopt
+	// and re-join the node the reset just evicted. Skip the apply and let
+	// reconcileAdopted stop on the Failed state.
+	if byotMachine.Status.UpgradeState == infrav1.UpgradeStateFailed {
+		return r.reconcileAdopted(ctx, patchHelper, byotMachine, machine)
+	}
 
 	if configUnchanged(byotMachine, configHash) {
 		return r.reconcileAdopted(ctx, patchHelper, byotMachine, machine)
@@ -436,19 +468,19 @@ func (r *ByotMachineReconciler) preflightJoin(
 // (mTLS, Admin) because a maintenance-mode client is Reader-only and cannot
 // call Upgrade (Talos authz). Returns handled=true while the upgrade is in
 // flight (InFlight) or stopped on failure, so the caller returns its result
-// instead of ending the reconcile. When opt-out or complete (version matches),
-// returns handled=false so the reconcile ends cleanly.
+// instead of ending the reconcile. When opt-out or complete, returns
+// handled=false so the reconcile ends cleanly.
 //
-// preserve=true carries the just-applied machineconfig across the upgrade
-// reboot so the node rejoins the cluster on the new version without
-// re-adoption. force=false: the predicate excludes same-version calls. No
-// semver guard — the state machine treats any tag mismatch as an upgrade,
-// but Talos's Upgrade RPC with force=false silently no-ops a downgrade
-// (install sequence runs 0 phases, no reboot, no error), so a downgrade
-// desired version leaves the host on its current version and the InFlight
-// poll never matches. Downgrade support would require force=true (a separate
-// opt-in). The pre-upgrade and in-flight Version probes both run over the
-// cluster talosconfig (the host carries the cluster PKI bundle once adopted).
+// The upgrade uses the LifecycleClient.Upgrade RPC (pull + drain + reboot,
+// synchronous in one reconcile). The machine config is carried implicitly
+// across the reboot (no preserve flag in the lifecycle API); the node
+// rejoins the cluster on the new version without re-adoption. Completion is
+// gated on a boot-id change (the host rebooted), not a version-match, so
+// custom installer tags (e.g. factory.talos.dev/installer/<schematic>:vX.Y or
+// a Corti-custom installer with extensions) work — Talos does not enforce a
+// tag convention on the upgrade source. Dedup is ref+gen based: a same-ref
+// re-issue with a matching attempt generation is skipped (already applied);
+// an operator forces a same-ref reinstall by bumping generation.
 func (r *ByotMachineReconciler) ensureTalosVersion(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -467,7 +499,6 @@ func (r *ByotMachineReconciler) ensureTalosVersion(
 	}
 
 	desired := *byotMachine.Spec.DesiredTalosVersion
-	desiredTag := installerTag(desired)
 
 	// Retrigger after a stopped failure: an operator edit bumps generation,
 	// so a Failed state whose attempt generation is stale is cleared and the
@@ -479,20 +510,34 @@ func (r *ByotMachineReconciler) ensureTalosVersion(
 
 	switch byotMachine.Status.UpgradeState {
 	case "":
-		// The tag is only validated at the start of the upgrade; once past it
-		// (InFlight) the ref was already validated.
-		if desiredTag == "" || desiredTag == desired {
-			return r.markInvalidImageRef(ctx, patchHelper, byotMachine, desired)
+		if desired == "" {
+			return r.markInvalidImageRef(ctx, patchHelper, byotMachine)
 		}
 
-		return r.upgradeProbeAndIssue(ctx, patchHelper, byotMachine, machine, desired, desiredTag)
+		if upgradeAlreadyApplied(byotMachine, desired) {
+			return r.markUpgradeComplete(ctx, patchHelper, byotMachine)
+		}
+
+		return r.upgradeProbeAndIssue(ctx, patchHelper, byotMachine, machine, desired)
 	case infrav1.UpgradeStateInFlight:
-		return r.upgradeInFlight(ctx, patchHelper, byotMachine, machine, desiredTag)
+		return r.upgradeInFlight(ctx, patchHelper, byotMachine, machine)
 	case infrav1.UpgradeStateFailed:
 		return ctrl.Result{}, true, nil // current-generation failure: stopped
 	}
 
 	return ctrl.Result{}, true, nil
+}
+
+// upgradeAlreadyApplied reports whether the desired installer ref was already
+// applied for the current generation (no-op re-issue). Dedup is ref+gen based:
+// an operator forces a same-ref reinstall by bumping generation (retrigger
+// above clears Failed); a ref change re-issues. This avoids mass same-version
+// reinstalls on a green cluster whose hosts are pre-imaged at
+// DesiredTalosVersion. The version-match short-circuit is gone (custom
+// installer tags break it; the completion gate is a boot-id change).
+func upgradeAlreadyApplied(byotMachine *infrav1.ByotMachine, desired string) bool {
+	return byotMachine.Status.UpgradeAppliedImageRef == desired &&
+		byotMachine.Status.UpgradeAttemptGeneration == byotMachine.Generation
 }
 
 // retriggerStaleUpgradeFailure clears a Failed upgrade state when the
@@ -522,16 +567,17 @@ func (r *ByotMachineReconciler) retriggerStaleUpgradeFailure(
 	return true, nil
 }
 
-// markInvalidImageRef records that DesiredTalosVersion has no parseable tag
-// and stops the upgrade (no requeue).
+// markInvalidImageRef records that DesiredTalosVersion is empty/unparseable
+// and stops the upgrade (no requeue). With the lifecycle Upgrade migration
+// the installer image tag is opaque to Talos, so the only validation is
+// "non-empty ref"; tag-shape checks are no longer applied.
 func (r *ByotMachineReconciler) markInvalidImageRef(
 	ctx context.Context,
 	patchHelper *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
-	desired string,
 ) (ctrl.Result, bool, error) {
 	conditions.MarkFalse(byotMachine, TalosVersionReadyCondition, "InvalidImageRef",
-		clusterv1.ConditionSeverityError, "DesiredTalosVersion %q has no parseable tag", desired)
+		clusterv1.ConditionSeverityError, "DesiredTalosVersion is empty")
 
 	byotMachine.Status.UpgradeAttemptGeneration = byotMachine.Generation
 
@@ -543,10 +589,14 @@ func (r *ByotMachineReconciler) markInvalidImageRef(
 	return ctrl.Result{}, true, nil
 }
 
-// recordUpgradeProbeFailure records a consecutive Version probe failure during
-// the upgrade. When the threshold is reached it moves to Failed, marks the
-// condition, and returns stop=true (no requeue). Otherwise it patches the
-// incremented counter and returns a requeue.
+// recordUpgradeProbeFailure records a consecutive upgrade probe failure.
+// When the threshold is reached it finalizes the upgrade as Failed: it marks
+// the condition and, when resetOnFailure is true, resets the host to remove
+// the node from the cluster (the upgrade was attempted, so the host is
+// reachable and resettable). Version-probe failures (pre-issue, host possibly
+// unreachable) pass resetOnFailure=false so the node is left in place for
+// recovery. Below the threshold it patches the incremented counter and
+// returns a requeue.
 func (r *ByotMachineReconciler) recordUpgradeProbeFailure(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -554,48 +604,58 @@ func (r *ByotMachineReconciler) recordUpgradeProbeFailure(
 	threshold int32,
 	reason string,
 	probeErr error,
+	resetOnFailure bool,
 ) (ctrl.Result, bool, error) {
 	byotMachine.Status.UpgradeProbeFailures++
 
-	if byotMachine.Status.UpgradeProbeFailures < threshold {
-		err := patchHelper.Patch(ctx, byotMachine)
-		if err != nil {
-			return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade probe retry: %w", err)
-		}
-
-		return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
-	}
-
-	byotMachine.Status.UpgradeState = infrav1.UpgradeStateFailed
-	byotMachine.Status.UpgradeAttemptGeneration = byotMachine.Generation
-
-	conditions.MarkFalse(byotMachine, TalosVersionReadyCondition, reason,
-		clusterv1.ConditionSeverityWarning, "probe failed %d times: %s",
-		byotMachine.Status.UpgradeProbeFailures, probeErr.Error())
-
+	// Persist the counter via the caller's helper, whose base predates the
+	// increment (so the diff is real). finalizeUpgradeFailure takes a fresh
+	// helper that would no-op the counter (its base already includes it).
 	err := patchHelper.Patch(ctx, byotMachine)
 	if err != nil {
-		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade failure: %w", err)
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade probe retry: %w", err)
 	}
 
-	log.FromContext(ctx).Info("Talos upgrade probe exhausted retries",
-		"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP)
+	if byotMachine.Status.UpgradeProbeFailures >= threshold {
+		if resetOnFailure {
+			return r.finalizeUpgradeFailure(ctx, patchHelper, byotMachine, reason, probeErr)
+		}
 
-	return ctrl.Result{}, true, nil
+		byotMachine.Status.UpgradeState = infrav1.UpgradeStateFailed
+		byotMachine.Status.UpgradeAttemptGeneration = byotMachine.Generation
+
+		conditions.MarkFalse(byotMachine, TalosVersionReadyCondition, reason,
+			clusterv1.ConditionSeverityWarning, "probe failed %d times: %s",
+			byotMachine.Status.UpgradeProbeFailures, probeErr.Error())
+
+		err = patchHelper.Patch(ctx, byotMachine, ownedTalosVersionReady())
+		if err != nil {
+			return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade failure: %w", err)
+		}
+
+		log.FromContext(ctx).Info("Talos upgrade probe exhausted retries",
+			"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP)
+
+		return ctrl.Result{}, true, nil
+	}
+
+	return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
 }
 
 // upgradeProbeAndIssue runs the pre-upgrade Version probe over the cluster
-// talosconfig. On success it sets CurrentTalosVersion and either marks the
-// upgrade complete (version already matches) or issues the Upgrade RPC and
-// moves to InFlight. Probe failures accumulate up to versionProbeThreshold
-// before the controller stops with VersionProbeFailed.
+// talosconfig. On success it records CurrentTalosVersion (for status display
+// and the InFlight reachability fallback) and issues the lifecycle Upgrade
+// (pull + drain + reboot, synchronous), stashing the pre-reboot boot-id on
+// status for the InFlight completion gate. The version-match short-circuit is
+// gone (custom installer tags break it); dedup is gen+ref based at the
+// ensureTalosVersion entry. Probe failures accumulate up to
+// versionProbeThreshold before the controller stops with VersionProbeFailed.
 func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 	ctx context.Context,
 	patchHelper *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
 	machine *clusterv1.Machine,
 	desired string,
-	desiredTag string,
 ) (ctrl.Result, bool, error) {
 	publicIP := byotMachine.Status.ResolvedPublicIP
 
@@ -610,26 +670,22 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 
 	tag, err := r.versionProbeAuthenticated(ctx, publicIP, talosConfig)
 	if err != nil {
-		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, versionProbeThreshold, "VersionProbeFailed", err)
+		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine,
+			versionProbeThreshold, "VersionProbeFailed", err, false)
 	}
 
 	byotMachine.Status.CurrentTalosVersion = tag
 	byotMachine.Status.UpgradeProbeFailures = 0
 
-	if tag == desiredTag {
-		return r.markUpgradeComplete(ctx, patchHelper, byotMachine)
-	}
-
-	// Version mismatch: Upgrade over the cluster talosconfig (preserve=true
-	// carries the just-applied machineconfig across the reboot).
-	// Set InFlight before issuing the RPC so a crash between the patch and
-	// the call is recoverable (the InFlight poll path re-probes and either
-	// completes or, still old, requeues). If the RPC itself fails (e.g. Talos
-	// refuses the upgrade on an etcd-quorum guard for a control-plane node),
-	// revert to "" so the next reconcile re-issues instead of polling a
-	// version that never changed.
+	// Set InFlight before issuing the upgrade so a crash between the patch
+	// and the call is recoverable (the InFlight poll path re-probes and
+	// either completes or, still pre-reboot, requeues). If the upgrade call
+	// itself fails, finalize as Failed and reset the host (see
+	// finalizeUpgradeFailure) so the node does not linger in the cluster on
+	// the wrong Talos version.
 	byotMachine.Status.UpgradeState = infrav1.UpgradeStateInFlight
 	byotMachine.Status.UpgradeAttemptGeneration = byotMachine.Generation
+	byotMachine.Status.UpgradePreRebootBootID = ""
 
 	conditions.MarkFalse(byotMachine, TalosVersionReadyCondition, "Upgrading",
 		clusterv1.ConditionSeverityInfo, "upgrading host to %s", desired)
@@ -639,9 +695,19 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine before upgrade: %w", err)
 	}
 
-	err = r.upgradeMachine(ctx, publicIP, talosConfig, desired)
+	bootID, err := r.upgradeMachine(ctx, publicIP, talosConfig, desired)
 	if err != nil {
-		return r.revertInFlightOnError(ctx, byotMachine, err)
+		return r.finalizeUpgradeFailure(ctx, patchHelper, byotMachine, "UpgradeFailed", err)
+	}
+
+	// Stash the pre-reboot boot-id for the InFlight completion gate. Empty
+	// when capture failed or was permission-denied; InFlight then falls back
+	// to a reachability + version-change check.
+	byotMachine.Status.UpgradePreRebootBootID = bootID
+
+	err = patchHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after upgrade: %w", err)
 	}
 
 	log.FromContext(ctx).Info("Talos upgrade issued",
@@ -650,42 +716,93 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 	return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
 }
 
-// revertInFlightOnError clears InFlight after a failed Upgrade RPC. A fresh
-// patch helper snapshots the just-patched InFlight state as its base, so the
-// revert to "" produces a real diff (the original helper's base still had
-// InFlight unset and would no-op). Without this, the InFlight poll path would
-// poll a version that never changed and never re-issue.
-func (r *ByotMachineReconciler) revertInFlightOnError(
+// finalizeUpgradeFailure marks the upgrade Failed and removes the node from
+// the cluster. The node joined when the bootstrap config was applied (before
+// the upgrade), so a failed upgrade would otherwise leave it lingering on the
+// wrong Talos version. Resetting the host wipes STATE+EPHEMERAL and reboots to
+// maintenance, evicting the node; the ByotHost stays claimed (not released) so
+// an operator retrigger (generation bump) re-applies the config and re-issues
+// the upgrade. Clearing LastAppliedConfigSHA forces that re-apply, and
+// Ready=false routes resolveApplyAuth back through maintenance preflight.
+func (r *ByotMachineReconciler) finalizeUpgradeFailure(
 	ctx context.Context,
+	_ *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
+	reason string,
 	upgradeErr error,
 ) (ctrl.Result, bool, error) {
-	revertHelper, revertErr := patch.NewHelper(byotMachine, r.Client)
-	if revertErr != nil {
-		return ctrl.Result{}, true, fmt.Errorf("failed to upgrade machine: %w (revert helper: %w)", upgradeErr, revertErr)
+	// Snapshot the current (issue-time) state as the patch base BEFORE
+	// mutating, so the diff to Failed is real. Creating the helper after the
+	// mutation would no-op (base == current).
+	failedHelper, err := patch.NewHelper(byotMachine, r.Client)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade failure: %w", err)
 	}
 
-	byotMachine.Status.UpgradeState = ""
+	byotMachine.Status.UpgradeState = infrav1.UpgradeStateFailed
+	byotMachine.Status.UpgradeAttemptGeneration = byotMachine.Generation
 
-	revertErr = revertHelper.Patch(ctx, byotMachine)
-	if revertErr != nil {
-		return ctrl.Result{}, true, fmt.Errorf("failed to upgrade machine: %w (revert InFlight failed: %w)",
-			upgradeErr, revertErr)
+	conditions.MarkFalse(byotMachine, TalosVersionReadyCondition, reason,
+		clusterv1.ConditionSeverityWarning, "upgrade failed: %s", upgradeErr.Error())
+
+	err = failedHelper.Patch(ctx, byotMachine, ownedTalosVersionReady())
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade failure: %w", err)
 	}
 
-	return ctrl.Result{}, true, fmt.Errorf("failed to upgrade machine: %w", upgradeErr)
+	resetErr := r.resetAdoptedHost(ctx, byotMachine)
+	if resetErr != nil {
+		log.FromContext(ctx).Info("upgrade-failure host reset failed; retrying",
+			"byotMachine", byotMachine.Name, "error", resetErr.Error())
+
+		return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, true, nil
+	}
+
+	clearHelper, err := patch.NewHelper(byotMachine, r.Client)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after reset: %w", err)
+	}
+
+	byotMachine.Status.Ready = false
+	byotMachine.Status.LastAppliedConfigSHA = ""
+
+	err = clearHelper.Patch(ctx, byotMachine)
+	if err != nil {
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine after reset: %w", err)
+	}
+
+	log.FromContext(ctx).Info("Talos upgrade failed; host reset to maintenance",
+		"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP, "reason", reason)
+
+	return ctrl.Result{}, true, nil
 }
 
-// upgradeInFlight polls the Version RPC (cluster talosconfig) until it reports
-// the desired tag (upgrade complete → done) or exhausts upgradeThreshold
-// retries (UpgradeFailed, stop). A probe that succeeds with a different tag
-// keeps InFlight and requeues.
+// resetAdoptedHostImpl wipes an adopted host's STATE+EPHEMERAL volumes and
+// reboots it to maintenance mode, using the cluster talosconfig (the host
+// carries the PKI bundle from its applied config). The ByotHost is not
+// released.
+func (r *ByotMachineReconciler) resetAdoptedHostImpl(ctx context.Context, byotMachine *infrav1.ByotMachine) error {
+	candidates, err := r.resetCredentialCandidates(ctx, byotMachine)
+	if err != nil {
+		return err
+	}
+
+	return attemptReset(ctx, candidates, byotMachine.Status.ResolvedPublicIP)
+}
+
+// upgradeInFlight polls for upgrade completion: the host rebooted into the
+// new version. The primary completion gate is a boot-id change (the
+// pre-reboot boot-id stashed at issue time differs from the live one). When
+// the boot-id is empty (capture failed / permission denied) or the live read
+// is permission-denied, it falls back to a reachability + version-change
+// check: the Version RPC is reachable AND the live tag differs from the
+// pre-upgrade CurrentTalosVersion. Probe failures accumulate up to
+// upgradeThreshold before the controller stops with UpgradeFailed.
 func (r *ByotMachineReconciler) upgradeInFlight(
 	ctx context.Context,
 	patchHelper *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
 	machine *clusterv1.Machine,
-	desiredTag string,
 ) (ctrl.Result, bool, error) {
 	publicIP := byotMachine.Status.ResolvedPublicIP
 
@@ -698,16 +815,85 @@ func (r *ByotMachineReconciler) upgradeInFlight(
 		return *result, true, nil
 	}
 
-	tag, err := r.versionProbeAuthenticated(ctx, publicIP, talosConfig)
+	preRebootBootID := byotMachine.Status.UpgradePreRebootBootID
+	if preRebootBootID != "" {
+		return r.upgradeInFlightBootIDGate(ctx, patchHelper, byotMachine, publicIP, talosConfig, preRebootBootID)
+	}
+
+	// Empty pre-reboot boot-id (capture failed / permission denied at issue
+	// time): use the reachability + version-change fallback.
+	return r.upgradeInFlightVersionFallback(ctx, patchHelper, byotMachine, publicIP, talosConfig)
+}
+
+// upgradeInFlightBootIDGate drives the InFlight poll when a pre-reboot boot-id
+// was captured. Completes when the live boot-id differs (reboot observed). On
+// a permission-denied live read it degrades to the version-change fallback.
+func (r *ByotMachineReconciler) upgradeInFlightBootIDGate(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	publicIP string,
+	talosConfig []byte,
+	preRebootBootID string,
+) (ctrl.Result, bool, error) {
+	liveBootID, bootErr := r.bootIDAuthenticated(ctx, publicIP, talosConfig)
+	if bootErr != nil && !errors.Is(bootErr, errBootIDUnauthorized) {
+		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, upgradeThreshold, "UpgradeFailed", bootErr, true)
+	}
+
+	// Permission-denied on the live read: degrade to the version-change
+	// fallback (same as an empty pre-reboot boot-id).
+	if errors.Is(bootErr, errBootIDUnauthorized) {
+		return r.upgradeInFlightVersionFallback(ctx, patchHelper, byotMachine, publicIP, talosConfig)
+	}
+
+	if liveBootID != "" && liveBootID != preRebootBootID {
+		// Boot-id changed: the host rebooted into the new installer. Refresh
+		// CurrentTalosVersion so status reflects the post-upgrade tag — the
+		// version-fallback path does this inline, but the boot-id gate would
+		// otherwise complete leaving CurrentTalosVersion at the pre-upgrade
+		// tag. Best-effort: a probe failure does not block completion (install
+		// already succeeded); CurrentTalosVersion stays at its last value.
+		tag, err := r.versionProbeAuthenticated(ctx, publicIP, talosConfig)
+		if err == nil && tag != "" {
+			byotMachine.Status.CurrentTalosVersion = tag
+		}
+
+		return r.markUpgradeComplete(ctx, patchHelper, byotMachine)
+	}
+
+	err := patchHelper.Patch(ctx, byotMachine)
 	if err != nil {
-		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, upgradeThreshold, "UpgradeFailed", err)
+		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade poll: %w", err)
+	}
+
+	return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
+}
+
+// upgradeInFlightVersionFallback drives the InFlight poll when no boot-id is
+// available (empty pre-reboot boot-id or permission-denied live read).
+// Completes when the Version RPC is reachable AND the live tag differs from
+// the pre-upgrade CurrentTalosVersion (recorded at issue time). A reachable
+// probe with the same tag keeps InFlight and requeues (reboot not observed).
+func (r *ByotMachineReconciler) upgradeInFlightVersionFallback(
+	ctx context.Context,
+	patchHelper *patch.Helper,
+	byotMachine *infrav1.ByotMachine,
+	publicIP string,
+	talosConfig []byte,
+) (ctrl.Result, bool, error) {
+	preUpgradeTag := byotMachine.Status.CurrentTalosVersion
+
+	tag, probeErr := r.versionProbeAuthenticated(ctx, publicIP, talosConfig)
+	if probeErr != nil {
+		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, upgradeThreshold, "UpgradeFailed", probeErr, true)
 	}
 
 	byotMachine.Status.CurrentTalosVersion = tag
 	byotMachine.Status.UpgradeProbeFailures = 0
 
-	if tag != desiredTag {
-		err = patchHelper.Patch(ctx, byotMachine)
+	if tag == "" || tag == preUpgradeTag {
+		err := patchHelper.Patch(ctx, byotMachine)
 		if err != nil {
 			return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade poll: %w", err)
 		}
@@ -727,6 +913,20 @@ func (r *ByotMachineReconciler) markUpgradeComplete(
 	byotMachine *infrav1.ByotMachine,
 ) (ctrl.Result, bool, error) {
 	byotMachine.Status.UpgradeState = ""
+	byotMachine.Status.UpgradePreRebootBootID = ""
+
+	// Record the applied ref so a subsequent same-ref+same-gen reconcile
+	// dedups (no-op re-issue). Set from the spec's DesiredTalosVersion. Also
+	// stamp the current generation: spec edits (e.g. providerID linkage,
+	// adoption status) bump generation after the upgrade was issued, so the
+	// attempt generation recorded at issue time can lag. Without this the
+	// ref+gen dedup in upgradeAlreadyApplied would see a stale attempt gen
+	// and re-issue the (already-applied) upgrade every reconcile.
+	if byotMachine.Spec.DesiredTalosVersion != nil {
+		byotMachine.Status.UpgradeAppliedImageRef = *byotMachine.Spec.DesiredTalosVersion
+	}
+
+	byotMachine.Status.UpgradeAttemptGeneration = byotMachine.Generation
 
 	conditions.Set(byotMachine, &clusterv1.Condition{
 		Type: TalosVersionReadyCondition, Status: corev1.ConditionTrue, Reason: "Upgraded",
@@ -834,7 +1034,24 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		}
 	}
 
-	err = applyMachineConfig(ctx, byotMachine.Status.ResolvedPublicIP, machineConfig, talosConfig)
+	// Detect the system disk and inject machine.install.disk into the config
+	// before applying. The Talos installer validates the machine config on
+	// upgrade and requires install.disk or diskSelector; cabpt sets neither, so
+	// BYOT auto-detects it. Best-effort: on failure, fall through to the apply
+	// (the upgrade will surface the validation error if the disk is truly
+	// unset) rather than blocking adoption.
+	disk, diskErr := detectSystemDisk(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig)
+	if diskErr != nil {
+		logger.Info("could not detect system disk; applying config without machine.install.disk",
+			"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP, "error", diskErr)
+	} else {
+		machineConfig, err = injectInstallDisk(machineConfig, disk)
+		if err != nil {
+			return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
+		}
+	}
+
+	err = r.applyMachineConfig(ctx, byotMachine.Status.ResolvedPublicIP, machineConfig, talosConfig)
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
@@ -1329,6 +1546,14 @@ func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 
 	return hex.EncodeToString(sum[:])
+}
+
+// ownedTalosVersionReady is the patch option declaring TalosVersionReady as
+// owned by this controller, so the upgrade-failure path can overwrite the
+// condition even when its patch helper's base predates the issue-time
+// "Upgrading" condition (avoids a 3-way merge conflict).
+func ownedTalosVersionReady() patch.Option {
+	return patch.WithOwnedConditions{Conditions: []clusterv1.ConditionType{TalosVersionReadyCondition}}
 }
 
 // bootstrapData reads the Talos machine configuration produced by the
