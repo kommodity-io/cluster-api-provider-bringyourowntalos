@@ -593,12 +593,29 @@ func detectSystemDisk(ctx context.Context, publicIP string, talosConfig []byte) 
 // document of a multi-doc stream; a single-doc round-trip silently drops the
 // HostnameConfig doc, leaving the host on its SMBIOS hostname.
 func injectInstallDisk(machineConfig []byte, disk string) ([]byte, error) {
+	docs, err := decodeMachineConfigDocs(machineConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	setInstallDisk(docs, disk)
+
+	return encodeMachineConfigDocs(docs)
+}
+
+// decodeMachineConfigDocs reads every YAML document in the stream, preserving
+// multi-doc streams (e.g. the CABPT HostnameConfig doc) that a single-doc
+// yaml.v3 round-trip would silently drop.
+func decodeMachineConfigDocs(machineConfig []byte) ([]map[string]any, error) {
 	dec := yamlv3.NewDecoder(bytes.NewReader(machineConfig))
 
 	var docs []map[string]any
+
 	for {
 		var doc map[string]any
-		if err := dec.Decode(&doc); err != nil {
+
+		err := dec.Decode(&doc)
+		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
@@ -609,6 +626,12 @@ func injectInstallDisk(machineConfig []byte, disk string) ([]byte, error) {
 		docs = append(docs, doc)
 	}
 
+	return docs, nil
+}
+
+// setInstallDisk injects machine.install.disk into each v1alpha1 doc when
+// neither disk nor diskSelector is operator-set; an explicit value wins.
+func setInstallDisk(docs []map[string]any, disk string) {
 	for _, doc := range docs {
 		machine, _ := doc["machine"].(map[string]any)
 		if machine == nil {
@@ -630,29 +653,25 @@ func injectInstallDisk(machineConfig []byte, disk string) ([]byte, error) {
 		machine["install"] = install
 		doc["machine"] = machine
 	}
+}
 
+// encodeMachineConfigDocs writes the docs back as a multi-doc YAML stream.
+func encodeMachineConfigDocs(docs []map[string]any) ([]byte, error) {
 	var buf bytes.Buffer
+
 	enc := yamlv3.NewEncoder(&buf)
+
 	for _, doc := range docs {
-		if err := enc.Encode(doc); err != nil {
+		err := enc.Encode(doc)
+		if err != nil {
 			return nil, fmt.Errorf("failed to serialize machine config: %w", err)
 		}
 	}
 
-	if err := enc.Close(); err != nil {
+	err := enc.Close()
+	if err != nil {
 		return nil, fmt.Errorf("failed to flush machine config: %w", err)
 	}
 
 	return buf.Bytes(), nil
-}
-
-// yamlUnmarshal decodes bytes into the target using gopkg.in/yaml.v3, which
-// preserves scalar types (int, bool) that a JSON round-trip would corrupt.
-func yamlUnmarshal(b []byte, out any) error {
-	return yamlv3.Unmarshal(b, out)
-}
-
-// yamlMarshal encodes the value to YAML.
-func yamlMarshal(in any) ([]byte, error) {
-	return yamlv3.Marshal(in)
 }
