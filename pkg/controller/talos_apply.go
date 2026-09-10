@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -586,43 +587,63 @@ func detectSystemDisk(ctx context.Context, publicIP string, talosConfig []byte) 
 	return "", fmt.Errorf("%w on %s", errNoSystemDisk, publicIP)
 }
 
-// injectInstallDisk sets machine.install.disk in the machine config bytes. It
-// merges into an existing machine.install map (preserving wipe, etc.) and
-// creates one when absent. The config is a single v1alpha1 YAML document.
+// injectInstallDisk sets machine.install.disk in the v1alpha1 machine-config
+// document, preserving every other document in the stream (e.g. the CABPT
+// HostnameConfig doc). yaml.v3 Unmarshal/Marshal only round-trip the first
+// document of a multi-doc stream; a single-doc round-trip silently drops the
+// HostnameConfig doc, leaving the host on its SMBIOS hostname.
 func injectInstallDisk(machineConfig []byte, disk string) ([]byte, error) {
-	var cfg map[string]any
+	dec := yamlv3.NewDecoder(bytes.NewReader(machineConfig))
 
-	err := yamlUnmarshal(machineConfig, &cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse machine config: %w", err)
+	var docs []map[string]any
+	for {
+		var doc map[string]any
+		if err := dec.Decode(&doc); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+
+			return nil, fmt.Errorf("failed to parse machine config: %w", err)
+		}
+
+		docs = append(docs, doc)
 	}
 
-	machine, _ := cfg["machine"].(map[string]any)
-	if machine == nil {
-		machine = map[string]any{}
+	for _, doc := range docs {
+		machine, _ := doc["machine"].(map[string]any)
+		if machine == nil {
+			continue
+		}
+
+		install, _ := machine["install"].(map[string]any)
+		if install == nil {
+			install = map[string]any{}
+		}
+
+		// Only inject when unset; an operator-provided disk/diskSelector wins.
+		if _, ok := install["disk"]; !ok {
+			if _, ok := install["diskSelector"]; !ok {
+				install["disk"] = disk
+			}
+		}
+
+		machine["install"] = install
+		doc["machine"] = machine
 	}
 
-	install, _ := machine["install"].(map[string]any)
-	if install == nil {
-		install = map[string]any{}
-	}
-
-	// Only inject when unset; an operator-provided disk/diskSelector wins.
-	if _, ok := install["disk"]; !ok {
-		if _, ok := install["diskSelector"]; !ok {
-			install["disk"] = disk
+	var buf bytes.Buffer
+	enc := yamlv3.NewEncoder(&buf)
+	for _, doc := range docs {
+		if err := enc.Encode(doc); err != nil {
+			return nil, fmt.Errorf("failed to serialize machine config: %w", err)
 		}
 	}
 
-	machine["install"] = install
-	cfg["machine"] = machine
-
-	out, err := yamlMarshal(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to serialize machine config: %w", err)
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("failed to flush machine config: %w", err)
 	}
 
-	return out, nil
+	return buf.Bytes(), nil
 }
 
 // yamlUnmarshal decodes bytes into the target using gopkg.in/yaml.v3, which
