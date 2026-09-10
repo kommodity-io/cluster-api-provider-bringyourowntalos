@@ -120,9 +120,9 @@ func TestByotHostReconcileDiscoveryPopulatesStatusAndLabels(t *testing.T) {
 	assert.Equal(t, "true", updated.Labels[labelAvailable])
 	assert.Equal(t, "4", updated.Labels[labelCPUCores])
 	assert.Equal(t, "amd64", updated.Labels[labelCPUArch])
-	assert.Equal(t, "8G", updated.Labels[labelMemoryClass])
+	assert.Equal(t, "8G", updated.Labels[labelMemory])
 	assert.Equal(t, "ssd", updated.Labels[labelDiskType])
-	assert.Equal(t, "100G", updated.Labels[labelDiskClass])
+	assert.Equal(t, "100G", updated.Labels[labelDiskSize])
 	assert.Contains(t, updated.Finalizers, byotHostFinalizer)
 }
 

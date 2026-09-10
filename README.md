@@ -10,7 +10,7 @@ configuration over the Talos machine API.
 Hosts are manually-added `ByotHost` records (IP only) of Talos machines sitting
 in **maintenance mode**, firewall-protected. The controller discovers each
 host's hardware features and Talos version from the maintenance API and probes
-liveness periodically, promoting a curated, low-cardinality, bucketed subset
+liveness periodically, promoting a curated, low-cardinality, rounded subset
 to `byot.io/` labels so `ByotMachine` objects can claim hosts by capability
 without operator label bookkeeping.
 
@@ -71,7 +71,7 @@ spec:
   # hostSelector:
   #   matchLabels:
   #     byot.io/available: "true"
-  #     byot.io/memory-class: "64G"
+  #     byot.io/memory: "64G"
   # failureDomain: "par01"
   # Only for machines already configured elsewhere (foreign takeover):
   # talosConfigSecretRef:
@@ -113,22 +113,22 @@ Available`. It discovers features from the Talos maintenance API (`Version`,
 `LS /sys/class/net` for interface names) and probes liveness (~60s), marking a
 host `Unavailable` after consecutive failures and re-discovering on recovery.
 Discovery populates a rich typed `status` (view-only) and promotes a curated,
-bucketed subset to controller-managed `byot.io/` labels:
+rounded subset to controller-managed `byot.io/` labels:
 
-| Label                    | Source                 | Values                                                                       |
-| ------------------------ | ---------------------- | ---------------------------------------------------------------------------- |
-| `byot.io/available`      | phase                  | `"true"` only when `phase=Available`                                         |
-| `byot.io/cpu-cores`      | `hardware.cpu.cores`   | integer as string                                                            |
-| `byot.io/cpu-arch`       | `Version` arch         | `amd64` / `arm64`                                                            |
-| `byot.io/memory-class`   | `hardware.memory`      | `4G` / `8G` / `16G` / `32G` / `64G` / `128G` / `256G` / `512G` / `1T` / `2T` |
-| `byot.io/disk-type`      | system disk type       | `nvme` / `ssd` / `hdd` / `sd`                                                |
-| `byot.io/disk-class`     | system disk size       | `20G` / `100G` / `250G` / `500G` / `1T`                                      |
-| `byot.io/gpu-count`      | `hardware.gpus.count`  | integer as string (omitted when no GPU)                                      |
-| `byot.io/gpu-vendor`     | `hardware.gpus.vendor` | `nvidia` / `amd` / `intel` (omitted on mixed-vendor hosts)                   |
-| `byot.io/gpu-model`      | `hardware.gpus.model`  | `h100-pcie`, `b300-sxm6`, `mi300x`, ... (omitted on unknown/mixed hosts)     |
-| `byot.io/platform`       | `platform`             | `scaleway`, `azure`, ...                                                     |
-| `byot.io/talos-version`  | `talosVersion`         | `v1.13.8`, ...                                                               |
-| `byot.io/failure-domain` | `spec.failureDomain`   | operator-set physical FD, e.g. `par01`                                       |
+| Label                    | Source                 | Values                                                                     |
+| ------------------------ | ---------------------- | -------------------------------------------------------------------------- |
+| `byot.io/available`      | phase                  | `"true"` only when `phase=Available`                                       |
+| `byot.io/cpu-cores`      | `hardware.cpu.cores`   | integer as string                                                          |
+| `byot.io/cpu-arch`       | `Version` arch         | `amd64` / `arm64`                                                          |
+| `byot.io/memory`         | `hardware.memory`      | rounded to nearest GiB (e.g. `64G`), then nearest TiB at ≥1024 GiB (`1T`)  |
+| `byot.io/disk-type`      | system disk type       | `nvme` / `ssd` / `hdd` / `sd`                                              |
+| `byot.io/disk-size`      | system disk size       | rounded to nearest GiB (e.g. `250G`), then nearest TiB at ≥1024 GiB (`1T`) |
+| `byot.io/gpu-count`      | `hardware.gpus.count`  | integer as string (omitted when no GPU)                                    |
+| `byot.io/gpu-vendor`     | `hardware.gpus.vendor` | `nvidia` / `amd` / `intel` (omitted on mixed-vendor hosts)                 |
+| `byot.io/gpu-model`      | `hardware.gpus.model`  | `h100-pcie`, `b300-sxm6`, `mi300x`, ... (omitted on unknown/mixed hosts)   |
+| `byot.io/platform`       | `platform`             | `scaleway`, `azure`, ...                                                   |
+| `byot.io/talos-version`  | `talosVersion`         | `v1.13.8`, ...                                                             |
+| `byot.io/failure-domain` | `spec.failureDomain`   | operator-set physical FD, e.g. `par01`                                     |
 
 GPU discovery scans the kernel dmesg log for PCI display-class devices from
 a known vendor (NVIDIA/AMD/Intel) and resolves the model family + per-GPU HBM
