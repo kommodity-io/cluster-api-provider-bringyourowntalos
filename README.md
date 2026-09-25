@@ -196,4 +196,11 @@ make lint
 make test
 ```
 
+Integration tests run against a real `kube-apiserver` + `etcd` via
+`setup-envtest`:
+
+```sh
+make test-integration  # downloads envtest binaries, runs TestIntegration*
+```
+
 Requires Cluster API v1.10.x (`v1beta1` contract) and Talos machinery v1.13.x.
