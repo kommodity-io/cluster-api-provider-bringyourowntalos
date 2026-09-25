@@ -352,12 +352,14 @@ func (r *ByotMachineReconciler) releaseHost(
 		return fmt.Errorf("failed to get ByotHost %s: %w", byotMachine.Status.ResolvedHost, err)
 	}
 
-	// A host that was never adopted (Ready=false) is still in maintenance
-	// mode: no config was applied, so there is nothing to wipe. Resetting it
-	// would fail anyway (the maintenance client is Reader-only and cannot
-	// Reset), and would block deletion forever. Just clear the claim and
-	// return the host to Available for immediate re-claim.
-	if !byotMachine.Status.Ready {
+	// Probe the node's actual state instead of the ByotMachine status.
+	// Ready and LastAppliedConfigSHA are set in the same atomic patch
+	// after the apply RPC; a crash or patch conflict between apply and
+	// patch leaves them false with config persisted on the node. A node
+	// in maintenance mode has no config on STATE — safe to release
+	// without reset. A node not in maintenance mode has config applied
+	// and must be reset to wipe STATE + EPHEMERAL.
+	if r.probeMaintenance(ctx, host.Spec.PublicIP) {
 		host.Status.Phase = infrav1.HostPhaseAvailable
 		host.Status.ClaimRef = nil
 
