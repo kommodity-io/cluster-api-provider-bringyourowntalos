@@ -412,6 +412,9 @@ func TestByotMachineReconcileDeleteReleasesClaimedNeverAdoptedHostWithoutReset(t
 		Build()
 
 	reconciler := NewByotMachineReconciler(client)
+	// The host is genuinely in maintenance mode (no config applied):
+	// the probe confirms this, so the reset is skipped.
+	reconciler.probeMaintenance = func(context.Context, string) bool { return true }
 
 	err = client.Delete(t.Context(), byotMachine)
 	require.NoError(t, err)
@@ -433,6 +436,66 @@ func TestByotMachineReconcileDeleteReleasesClaimedNeverAdoptedHostWithoutReset(t
 	require.NoError(t, err)
 	assert.Equal(t, infrav1.HostPhaseAvailable, released.Status.Phase)
 	assert.Nil(t, released.Status.ClaimRef)
+}
+
+// TestByotMachineReconcileDeleteResetsClaimedHostWhenNodeNotInMaintenance is the
+// regression test for the stale-etcd-data bug. A ByotMachine whose config was
+// applied but whose Ready flag was never patched (controller crash or patch
+// conflict between apply and markAdopted) must still trigger a reset on
+// release: the node is NOT in maintenance mode, so it carries a persisted
+// config and possibly etcd data that must be wiped before the host returns
+// to Available. The old code checked Ready (false here) and skipped the
+// reset, leaving stale data on the host.
+func TestByotMachineReconcileDeleteResetsClaimedHostWhenNodeNotInMaintenance(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+
+	err := clusterv1.AddToScheme(scheme)
+	require.NoError(t, err)
+
+	// Config was applied to the node but Ready is false: the adoption
+	// reconcile crashed or hit a patch conflict after the apply RPC
+	// returned but before markAdopted patched status.
+	byotMachine := newByotMachine("127.0.0.1")
+	byotMachine.Status.Ready = false
+	byotMachine.Status.LastAppliedConfigSHA = "config-hash"
+	byotMachine.Finalizers = []string{byotMachineFinalizer}
+	host := newClaimedByotHost("127.0.0.1")
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, host).
+		WithStatusSubresource(byotMachine, host).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+	// Node is NOT in maintenance mode: config is applied, so the probe
+	// must return false, forcing a reset attempt.
+	reconciler.probeMaintenance = func(context.Context, string) bool { return false }
+
+	err = client.Delete(t.Context(), byotMachine)
+	require.NoError(t, err)
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.NoError(t, err)
+	// Reset of 127.0.0.1 fails fast (connection refused): deletion stays
+	// blocked with the finalizer retained, same as an adopted host whose
+	// reset fails.
+	assert.Equal(t, requeueAfterResetIssued, result.RequeueAfter)
+
+	preserved := &infrav1.ByotMachine{}
+	err = client.Get(t.Context(), clusterKey(byotMachine), preserved)
+	require.NoError(t, err)
+	assert.Contains(t, preserved.Finalizers, byotMachineFinalizer)
+
+	// Host stays Claimed (not flipped to Available): no stale data leak.
+	released := &infrav1.ByotHost{}
+	err = client.Get(t.Context(), clusterKey(host), released)
+	require.NoError(t, err)
+	assert.Equal(t, infrav1.HostPhaseClaimed, released.Status.Phase)
 }
 
 func TestByotMachineReconcileJoinPreflightFailsWithoutCredentials(t *testing.T) {
