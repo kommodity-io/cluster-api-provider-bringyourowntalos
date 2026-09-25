@@ -55,3 +55,22 @@ jobs:
 
       - name: Test
         run: make test
+
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Setup Go
+        uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Integration Tests
+        run: make test-integration
