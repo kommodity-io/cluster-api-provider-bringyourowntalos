@@ -278,28 +278,31 @@ func discoverCPU(ctx context.Context, cosi state.CoreState, result *DiscoveryRes
 		hardware.NamespaceName, hardware.ProcessorType, "", cosiresource.VersionUndefined))
 	if err != nil {
 		log.FromContext(ctx).Error(err, "listing Processor resources from COSI")
+
 		result.CPU = cpu
+
 		return
 	}
 
 	var totalCores int32
+
 	sockets := map[string]struct{}{}
 
-	iter := procs.Iterator()
-	for iter.Next() {
-		spec := iter.Value().TypedSpec()
+	for proc := range procs.All() {
+		spec := proc.TypedSpec()
 		// Skip unpopulated sockets: Talos creates a Processor resource for
 		// every SMBIOS type-4 entry, but zeroes Socket/CoreCount when the
 		// socket is empty. An empty socket must not inflate Packages.
 		if spec.Socket == "" {
 			continue
 		}
-		totalCores += int32(spec.CoreCount)
+
+		totalCores += int32(spec.CoreCount) //nolint:gosec // bounded hardware core count
 		sockets[spec.Socket] = struct{}{}
 	}
 
 	if len(sockets) > 0 {
-		cpu.Packages = int32(len(sockets))
+		cpu.Packages = int32(len(sockets)) //nolint:gosec // bounded socket count
 	}
 
 	if totalCores > 0 {
@@ -320,14 +323,14 @@ func discoverGPUs(ctx context.Context, cosi state.CoreState, result *DiscoveryRe
 		hardware.NamespaceName, hardware.PCIDeviceType, "", cosiresource.VersionUndefined))
 	if err != nil {
 		log.FromContext(ctx).Error(err, "listing PCIDevice resources from COSI")
+
 		return
 	}
 
 	counts := map[pairKey]int32{}
 
-	iter := devs.Iterator()
-	for iter.Next() {
-		spec := iter.Value().TypedSpec()
+	for dev := range devs.All() {
+		spec := dev.TypedSpec()
 
 		// Talos reports class_id as "0x03" for display controllers.
 		if !strings.EqualFold(spec.ClassID, pciDisplayClassID) {
@@ -407,13 +410,14 @@ func populateMixedGPU(gpu *infrav1.HostGPU, counts map[pairKey]int32) {
 // discoverPlatform extracts the Talos platform from the KernelCmdline COSI
 // resource. Best-effort: a COSI error is logged and platform is left empty.
 func discoverPlatform(ctx context.Context, cosi state.CoreState, result *DiscoveryResult) {
-	kc, err := safe.StateGetByID[*runtime.KernelCmdline](ctx, cosi, runtime.KernelCmdlineID)
+	kernelCmdline, err := safe.StateGetByID[*runtime.KernelCmdline](ctx, cosi, runtime.KernelCmdlineID)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "fetching KernelCmdline from COSI")
+
 		return
 	}
 
-	result.Platform = parsePlatform(kc.TypedSpec().Cmdline)
+	result.Platform = parsePlatform(kernelCmdline.TypedSpec().Cmdline)
 }
 
 // parsePlatform extracts the Talos platform from a kernel cmdline string.
@@ -432,6 +436,7 @@ func discoverNumaNodes(ctx context.Context, client *talosclient.Client, result *
 	stream, err := client.LS(ctx, &machineapi.ListRequest{Root: "/sys/devices/system/node"})
 	if err != nil {
 		log.FromContext(ctx).Error(err, "listing /sys/devices/system/node for NUMA discovery")
+
 		return
 	}
 
@@ -444,8 +449,9 @@ func discoverNumaNodes(ctx context.Context, client *talosclient.Client, result *
 		}
 
 		if err != nil {
-			log.FromContext(ctx).Error(err, "reading NUMA node directory listing")
-			return
+		log.FromContext(ctx).Error(err, "reading NUMA node directory listing")
+
+		return
 		}
 
 		if info == nil {
@@ -518,10 +524,11 @@ func discoverNetInterfaces(
 			name = info.GetName()
 		}
 
-	// Skip loopback and the directory itself (LS returns "." for the root).
-	if name == "" || name == "lo" || name == "." {
-		continue
-	}
+		// Skip loopback and the directory itself (LS returns "." for the root).
+		if name == "" || name == "lo" || name == "." {
+			continue
+		}
+
 		ifaces = append(ifaces, name)
 	}
 

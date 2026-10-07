@@ -25,6 +25,13 @@ import (
 // testNICName is the fixed NIC name used across identity discovery tests.
 const testNICName = "eth0"
 
+// testSocketCPU0 and testSocketCPU1 are the fixed socket names used across
+// CPU discovery tests.
+const (
+	testSocketCPU0 = "CPU0"
+	testSocketCPU1 = "CPU1"
+)
+
 func TestDiscoverCPUDefaultsToSingleCPU(t *testing.T) {
 	t.Parallel()
 
@@ -40,14 +47,14 @@ func TestDiscoverCPUFromProcessors(t *testing.T) {
 
 	cosi := newTestCOSI()
 
-	p0 := hardware.NewProcessorInfo("CPU0")
-	p0.TypedSpec().Socket = "CPU0"
+	p0 := hardware.NewProcessorInfo(testSocketCPU0)
+	p0.TypedSpec().Socket = testSocketCPU0
 	p0.TypedSpec().CoreCount = 64
 	p0.TypedSpec().ThreadCount = 128
 	require.NoError(t, cosi.Create(t.Context(), p0))
 
-	p1 := hardware.NewProcessorInfo("CPU1")
-	p1.TypedSpec().Socket = "CPU1"
+	p1 := hardware.NewProcessorInfo(testSocketCPU1)
+	p1.TypedSpec().Socket = testSocketCPU1
 	p1.TypedSpec().CoreCount = 64
 	p1.TypedSpec().ThreadCount = 128
 	require.NoError(t, cosi.Create(t.Context(), p1))
@@ -65,8 +72,8 @@ func TestDiscoverCPUSingleProcessor(t *testing.T) {
 
 	cosi := newTestCOSI()
 
-	p := hardware.NewProcessorInfo("CPU0")
-	p.TypedSpec().Socket = "CPU0"
+	p := hardware.NewProcessorInfo(testSocketCPU0)
+	p.TypedSpec().Socket = testSocketCPU0
 	p.TypedSpec().CoreCount = 4
 	require.NoError(t, cosi.Create(t.Context(), p))
 
@@ -83,13 +90,13 @@ func TestDiscoverCPUSkipsUnpopulatedSocket(t *testing.T) {
 	cosi := newTestCOSI()
 
 	// Populated socket.
-	p0 := hardware.NewProcessorInfo("CPU0")
-	p0.TypedSpec().Socket = "CPU0"
+	p0 := hardware.NewProcessorInfo(testSocketCPU0)
+	p0.TypedSpec().Socket = testSocketCPU0
 	p0.TypedSpec().CoreCount = 64
 	require.NoError(t, cosi.Create(t.Context(), p0))
 
 	// Unpopulated socket: Talos creates a Processor with empty Socket/CoreCount.
-	p1 := hardware.NewProcessorInfo("CPU1")
+	p1 := hardware.NewProcessorInfo(testSocketCPU1)
 	p1.TypedSpec().Socket = ""
 	p1.TypedSpec().CoreCount = 0
 	require.NoError(t, cosi.Create(t.Context(), p1))
@@ -282,6 +289,7 @@ func TestDiscoverHostFailsOnUnreachable(t *testing.T) {
 // makeTestPCIDevice creates a PCIDevice resource in the given COSI state.
 func makeTestPCIDevice(t *testing.T, cosi state.CoreState, id string, classID, vendorID, productID string) {
 	t.Helper()
+
 	dev := hardware.NewPCIDeviceInfo(id)
 	dev.TypedSpec().ClassID = classID
 	dev.TypedSpec().VendorID = vendorID
