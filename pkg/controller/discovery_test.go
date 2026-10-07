@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
+	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -23,48 +25,106 @@ import (
 // testNICName is the fixed NIC name used across identity discovery tests.
 const testNICName = "eth0"
 
-func TestParseCPUDefaultsToSingleCPU(t *testing.T) {
+func TestDiscoverCPUDefaultsToSingleCPU(t *testing.T) {
 	t.Parallel()
 
-	cpu := parseCPU("")
-	assert.Equal(t, infrav1.HostCPU{Cores: 1, Packages: 1, NumaNodes: 1}, cpu)
+	cosi := newTestCOSI()
+	result := DiscoveryResult{}
+	discoverCPU(t.Context(), cosi, &result)
+
+	assert.Equal(t, infrav1.HostCPU{Cores: 1, Packages: 1, NumaNodes: 1}, result.CPU)
 }
 
-func TestParseCPUCoresFromNrCpuIds(t *testing.T) {
+func TestDiscoverCPUFromProcessors(t *testing.T) {
 	t.Parallel()
 
-	cpu := parseCPU("Linux version ... [ 0.000000] smpboot: nr_cpu_ids: 16")
-	assert.Equal(t, int32(16), cpu.Cores)
+	cosi := newTestCOSI()
+
+	p0 := hardware.NewProcessorInfo("CPU0")
+	p0.TypedSpec().Socket = "CPU0"
+	p0.TypedSpec().CoreCount = 64
+	p0.TypedSpec().ThreadCount = 128
+	require.NoError(t, cosi.Create(t.Context(), p0))
+
+	p1 := hardware.NewProcessorInfo("CPU1")
+	p1.TypedSpec().Socket = "CPU1"
+	p1.TypedSpec().CoreCount = 64
+	p1.TypedSpec().ThreadCount = 128
+	require.NoError(t, cosi.Create(t.Context(), p1))
+
+	result := DiscoveryResult{}
+	discoverCPU(t.Context(), cosi, &result)
+
+	assert.Equal(t, int32(128), result.CPU.Cores)   // 64 + 64
+	assert.Equal(t, int32(2), result.CPU.Packages)  // 2 distinct sockets
+	assert.Equal(t, int32(1), result.CPU.NumaNodes) // NUMA set later by discoverNumaNodes
 }
 
-func TestParseCPUIgnoresInvalidCores(t *testing.T) {
+func TestDiscoverCPUSingleProcessor(t *testing.T) {
 	t.Parallel()
 
-	cpu := parseCPU("nr_cpu_ids: 0")
-	assert.Equal(t, int32(1), cpu.Cores)
+	cosi := newTestCOSI()
+
+	p := hardware.NewProcessorInfo("CPU0")
+	p.TypedSpec().Socket = "CPU0"
+	p.TypedSpec().CoreCount = 4
+	require.NoError(t, cosi.Create(t.Context(), p))
+
+	result := DiscoveryResult{}
+	discoverCPU(t.Context(), cosi, &result)
+
+	assert.Equal(t, int32(4), result.CPU.Cores)
+	assert.Equal(t, int32(1), result.CPU.Packages)
 }
 
-func TestParseCPUPackages(t *testing.T) {
+func TestDiscoverCPUSkipsUnpopulatedSocket(t *testing.T) {
 	t.Parallel()
 
-	cpu := parseCPU("sockets: 2")
-	assert.Equal(t, int32(2), cpu.Packages)
+	cosi := newTestCOSI()
+
+	// Populated socket.
+	p0 := hardware.NewProcessorInfo("CPU0")
+	p0.TypedSpec().Socket = "CPU0"
+	p0.TypedSpec().CoreCount = 64
+	require.NoError(t, cosi.Create(t.Context(), p0))
+
+	// Unpopulated socket: Talos creates a Processor with empty Socket/CoreCount.
+	p1 := hardware.NewProcessorInfo("CPU1")
+	p1.TypedSpec().Socket = ""
+	p1.TypedSpec().CoreCount = 0
+	require.NoError(t, cosi.Create(t.Context(), p1))
+
+	result := DiscoveryResult{}
+	discoverCPU(t.Context(), cosi, &result)
+
+	assert.Equal(t, int32(64), result.CPU.Cores)  // only populated socket
+	assert.Equal(t, int32(1), result.CPU.Packages)
 }
 
-func TestParseCPUNumaNodes(t *testing.T) {
+func TestDiscoverPlatformFromCmdline(t *testing.T) {
 	t.Parallel()
 
-	cpu := parseCPU("Node 0 Node 1 Node 2")
-	assert.Equal(t, int32(3), cpu.NumaNodes)
+	cosi := newTestCOSI()
+
+	kc := runtime.NewKernelCmdline()
+	kc.TypedSpec().Cmdline = "talos.platform=metal console=tty0 printk.devkmsg=on"
+	require.NoError(t, cosi.Create(t.Context(), kc))
+
+	result := DiscoveryResult{}
+	discoverPlatform(t.Context(), cosi, &result)
+
+	assert.Equal(t, "metal", result.Platform)
 }
 
-func TestParseCPUIgnoresTscLine(t *testing.T) {
+func TestDiscoverPlatformEmptyWhenNoCmdline(t *testing.T) {
 	t.Parallel()
 
-	// TSC frequency is not captured (field removed); the line must not
-	// disturb the default single-CPU topology.
-	cpu := parseCPU("tsc: Detected 1996.250 MHz host clock")
-	assert.Equal(t, infrav1.HostCPU{Cores: 1, Packages: 1, NumaNodes: 1}, cpu)
+	cosi := newTestCOSI()
+
+	result := DiscoveryResult{}
+	discoverPlatform(t.Context(), cosi, &result)
+
+	assert.Empty(t, result.Platform)
 }
 
 func TestParsePlatform(t *testing.T) {
@@ -219,106 +279,191 @@ func TestDiscoverHostFailsOnUnreachable(t *testing.T) {
 		strings.Contains(err.Error(), "maintenance client"))
 }
 
-// h100DmesgLine is a real kernel dmesg line captured from a Scaleway H100-1-80G
-// host in Talos maintenance mode (PLA-6633 probe). 10de:2331 = NVIDIA GH100
-// (H100 PCIe 80G), class 0x030200 (headless 3D controller).
-const h100DmesgLine = "pci 0000:01:00.0: [10de:2331] type 00 class 0x030200 PCIe Endpoint"
-
-// b300DmesgLine is a synthetic line for the Blackwell B300. The format mirrors
-// the verified H100 line; 10de:3182 = GB110 [B300 SXM6 AC] per the pci.ids
-// database, but the device id has not been live-verified on a B300 node.
-const b300DmesgLine = "pci 0000:41:00.0: [10de:3182] type 00 class 0x030200 PCIe Endpoint"
-
-func TestParseGPUsH100(t *testing.T) {
-	t.Parallel()
-
-	gpu := parseGPUs(h100DmesgLine)
-	require.NotNil(t, gpu)
-	assert.Equal(t, int32(1), gpu.Count)
-	assert.Equal(t, "nvidia", gpu.Vendor)
-	assert.Equal(t, "h100-pcie", gpu.Model)
-	assert.Equal(t, "2331", gpu.DeviceID)
-	assert.False(t, gpu.Mixed)
-	assert.Equal(t, "80Gi", gpu.MemoryPerGPU.String())
-	assert.Equal(t, "80Gi", gpu.TotalMemory.String())
+// makeTestPCIDevice creates a PCIDevice resource in the given COSI state.
+func makeTestPCIDevice(t *testing.T, cosi state.CoreState, id string, classID, vendorID, productID string) {
+	t.Helper()
+	dev := hardware.NewPCIDeviceInfo(id)
+	dev.TypedSpec().ClassID = classID
+	dev.TypedSpec().VendorID = vendorID
+	dev.TypedSpec().ProductID = productID
+	require.NoError(t, cosi.Create(t.Context(), dev))
 }
 
-func TestParseGPUsMultiGPU(t *testing.T) {
+func TestDiscoverGPUsH100(t *testing.T) {
 	t.Parallel()
 
-	// Eight identical B300 lines (one per GPU) collapse to a single summary.
-	dmesg := strings.Repeat(b300DmesgLine+"\n", 8)
-	gpu := parseGPUs(dmesg)
-	require.NotNil(t, gpu)
-	assert.Equal(t, int32(8), gpu.Count)
-	assert.Equal(t, "nvidia", gpu.Vendor)
-	assert.Equal(t, "b300-sxm6", gpu.Model)
-	assert.Equal(t, "3182", gpu.DeviceID)
-	assert.False(t, gpu.Mixed)
-	assert.Equal(t, "288Gi", gpu.MemoryPerGPU.String())
-	assert.Equal(t, "2304Gi", gpu.TotalMemory.String()) // 8 * 288Gi
+	cosi := newTestCOSI()
+	// 10de:2331 = NVIDIA H100 PCIe 80G, display class 0x03.
+	makeTestPCIDevice(t, cosi, "0000:01:00.0", "0x03", "0x10de", "0x2331")
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.GPUs)
+	assert.Equal(t, int32(1), result.GPUs.Count)
+	assert.Equal(t, "nvidia", result.GPUs.Vendor)
+	assert.Equal(t, "h100-pcie", result.GPUs.Model)
+	assert.Equal(t, "2331", result.GPUs.DeviceID)
+	assert.False(t, result.GPUs.Mixed)
+	assert.Equal(t, "80Gi", result.GPUs.MemoryPerGPU.String())
+	assert.Equal(t, "80Gi", result.GPUs.TotalMemory.String())
 }
 
-func TestParseGPUsMixedModels(t *testing.T) {
+func TestDiscoverGPUsMultiB300(t *testing.T) {
 	t.Parallel()
 
-	dmesg := h100DmesgLine + "\n" + b300DmesgLine
-	gpu := parseGPUs(dmesg)
-	require.NotNil(t, gpu)
-	assert.Equal(t, int32(2), gpu.Count)
-	assert.Equal(t, "nvidia", gpu.Vendor) // same vendor
-	assert.Empty(t, gpu.Model)
-	assert.Empty(t, gpu.DeviceID)
-	assert.True(t, gpu.Mixed)
-	assert.True(t, gpu.MemoryPerGPU.IsZero())
-	assert.True(t, gpu.TotalMemory.IsZero())
+	cosi := newTestCOSI()
+	// 10de:3182 = B300 SXM6, 8 identical GPUs.
+	for i := range 8 {
+		makeTestPCIDevice(t, cosi, fmt.Sprintf("0000:%02x:00.0", 0x1a+i*2), "0x03", "0x10de", "0x3182")
+	}
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.GPUs)
+	assert.Equal(t, int32(8), result.GPUs.Count)
+	assert.Equal(t, "nvidia", result.GPUs.Vendor)
+	assert.Equal(t, "b300-sxm6", result.GPUs.Model)
+	assert.Equal(t, "3182", result.GPUs.DeviceID)
+	assert.False(t, result.GPUs.Mixed)
+	assert.Equal(t, "288Gi", result.GPUs.MemoryPerGPU.String())
+	assert.Equal(t, "2304Gi", result.GPUs.TotalMemory.String()) // 8 * 288Gi
 }
 
-func TestParseGPUsMixedVendors(t *testing.T) {
+func TestDiscoverGPUsMixedModels(t *testing.T) {
 	t.Parallel()
 
-	amdLine := "pci 0000:03:00.0: [1002:740f] type 00 class 0x030000 PCIe Endpoint"
-	dmesg := h100DmesgLine + "\n" + amdLine
-	gpu := parseGPUs(dmesg)
-	require.NotNil(t, gpu)
-	assert.Equal(t, int32(2), gpu.Count)
-	assert.Empty(t, gpu.Vendor) // mixed vendor -> omitted
-	assert.Empty(t, gpu.Model)
-	assert.True(t, gpu.Mixed)
+	cosi := newTestCOSI()
+	makeTestPCIDevice(t, cosi, "0000:01:00.0", "0x03", "0x10de", "0x2331") // H100
+	makeTestPCIDevice(t, cosi, "0000:02:00.0", "0x03", "0x10de", "0x3182") // B300
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.GPUs)
+	assert.Equal(t, int32(2), result.GPUs.Count)
+	assert.Equal(t, "nvidia", result.GPUs.Vendor) // same vendor
+	assert.Empty(t, result.GPUs.Model)
+	assert.Empty(t, result.GPUs.DeviceID)
+	assert.True(t, result.GPUs.Mixed)
+	assert.True(t, result.GPUs.MemoryPerGPU.IsZero())
+	assert.True(t, result.GPUs.TotalMemory.IsZero())
 }
 
-func TestParseGPUsIgnoresNonDisplayNvidia(t *testing.T) {
+func TestDiscoverGPUsMixedVendors(t *testing.T) {
 	t.Parallel()
 
-	// NVIDIA HDA audio controller on the same GPU function: vendor 10de but
-	// class 0x0403 (audio), not display. Must not be counted as a GPU.
-	hdaLine := "pci 0000:01:00.1: [10de:22f1] type 00 class 0x040300 PCIe Endpoint"
-	gpu := parseGPUs(hdaLine)
-	assert.Nil(t, gpu)
+	cosi := newTestCOSI()
+	makeTestPCIDevice(t, cosi, "0000:01:00.0", "0x03", "0x10de", "0x2331") // NVIDIA
+	makeTestPCIDevice(t, cosi, "0000:03:00.0", "0x03", "0x1002", "0x740f") // AMD
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.GPUs)
+	assert.Equal(t, int32(2), result.GPUs.Count)
+	assert.Empty(t, result.GPUs.Vendor) // mixed vendor -> omitted
+	assert.Empty(t, result.GPUs.Model)
+	assert.True(t, result.GPUs.Mixed)
 }
 
-func TestParseGPUsNoGPU(t *testing.T) {
+func TestDiscoverGPUsIgnoresNonDisplayNvidia(t *testing.T) {
 	t.Parallel()
 
-	// dmesg with PCI lines but no display-class device from a known vendor.
-	dmesg := "pci 0000:00:1f.2: [8086:2922] type 00 class 0x010601 conventional PCI endpoint"
-	assert.Nil(t, parseGPUs(dmesg))
-	assert.Nil(t, parseGPUs(""))
+	cosi := newTestCOSI()
+	// NVIDIA HDA audio controller: vendor 10de, class 0x04 (audio), not display.
+	makeTestPCIDevice(t, cosi, "0000:01:00.1", "0x04", "0x10de", "0x22f1")
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	assert.Nil(t, result.GPUs)
 }
 
-func TestParseGPUsUnknownNvidiaDevice(t *testing.T) {
+func TestDiscoverGPUsNoGPU(t *testing.T) {
 	t.Parallel()
 
-	// A display-class NVIDIA device not in the model table: vendor and count
-	// are promoted, model and memory are empty, raw device id is recorded.
-	unknownLine := "pci 0000:02:00.0: [10de:ffff] type 00 class 0x030200 PCIe Endpoint"
-	gpu := parseGPUs(unknownLine)
-	require.NotNil(t, gpu)
-	assert.Equal(t, int32(1), gpu.Count)
-	assert.Equal(t, "nvidia", gpu.Vendor)
-	assert.Empty(t, gpu.Model)
-	assert.Equal(t, "ffff", gpu.DeviceID)
-	assert.True(t, gpu.MemoryPerGPU.IsZero())
+	cosi := newTestCOSI()
+	// Intel SATA controller: known vendor (8086), non-display class.
+	makeTestPCIDevice(t, cosi, "0000:00:1f.2", "0x01", "0x8086", "0x2922")
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	assert.Nil(t, result.GPUs)
+}
+
+func TestDiscoverGPUsEmptyCOSI(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+	assert.Nil(t, result.GPUs)
+}
+
+func TestDiscoverGPUsUnknownNvidiaDevice(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+	makeTestPCIDevice(t, cosi, "0000:02:00.0", "0x03", "0x10de", "0xffff")
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.GPUs)
+	assert.Equal(t, int32(1), result.GPUs.Count)
+	assert.Equal(t, "nvidia", result.GPUs.Vendor)
+	assert.Empty(t, result.GPUs.Model)
+	assert.Equal(t, "ffff", result.GPUs.DeviceID)
+	assert.True(t, result.GPUs.MemoryPerGPU.IsZero())
+}
+
+func TestDiscoverGPUsAMDInstinct(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+	// MI300X: 1002:74a1, display class 0x03. HBM 192GB per vendor specs.
+	makeTestPCIDevice(t, cosi, "0000:43:00.0", "0x03", "0x1002", "0x74a1")
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	require.NotNil(t, result.GPUs)
+	assert.Equal(t, int32(1), result.GPUs.Count)
+	assert.Equal(t, "amd", result.GPUs.Vendor)
+	assert.Equal(t, "mi300x", result.GPUs.Model)
+	assert.Equal(t, "74a1", result.GPUs.DeviceID)
+	assert.False(t, result.GPUs.Mixed)
+	assert.Equal(t, "192Gi", result.GPUs.MemoryPerGPU.String())
+	assert.Equal(t, "192Gi", result.GPUs.TotalMemory.String())
+}
+
+func TestDiscoverGPUsIgnoresBMCVGA(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+	// ASPEED BMC VGA: vendor 1a03, display class 0x03 — not a known GPU vendor.
+	makeTestPCIDevice(t, cosi, "0000:29:00.0", "0x03", "0x1a03", "0x2000")
+
+	result := DiscoveryResult{}
+	discoverGPUs(t.Context(), cosi, &result)
+
+	assert.Nil(t, result.GPUs, "BMC VGA from unknown vendor must not be counted")
+}
+
+func TestIsNumaNodeDir(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, isNumaNodeDir("node0"))
+	assert.True(t, isNumaNodeDir("node1"))
+	assert.True(t, isNumaNodeDir("node12"))
+	assert.False(t, isNumaNodeDir("node"))
+	assert.False(t, isNumaNodeDir("node0a"))
+	assert.False(t, isNumaNodeDir("online"))
+	assert.False(t, isNumaNodeDir("has_memory"))
+	assert.False(t, isNumaNodeDir(""))
 }
 
 func TestApplyDiscoveryLabelsGPUs(t *testing.T) {
@@ -518,21 +663,6 @@ func TestPopulateFromDiscoveryOverwritesIdentityOnNewResult(t *testing.T) {
 	assert.Equal(t, "new-uuid", host.Status.Identity.SystemUUID)
 }
 
-func TestParseGPUsAMDInstinct(t *testing.T) {
-	t.Parallel()
-
-	// MI300X: 1002:74a1, class 0x030000. HBM 192GB per vendor specs.
-	mi300xLine := "pci 0000:43:00.0: [1002:74a1] type 00 class 0x030000 PCIe Endpoint"
-	gpu := parseGPUs(mi300xLine)
-	require.NotNil(t, gpu)
-	assert.Equal(t, int32(1), gpu.Count)
-	assert.Equal(t, "amd", gpu.Vendor)
-	assert.Equal(t, "mi300x", gpu.Model)
-	assert.Equal(t, "74a1", gpu.DeviceID)
-	assert.False(t, gpu.Mixed)
-	assert.Equal(t, "192Gi", gpu.MemoryPerGPU.String())
-	assert.Equal(t, "192Gi", gpu.TotalMemory.String())
-}
 
 // newTestCOSI builds a multi-namespace in-memory COSI state for identity
 // discovery tests. The hardware and network namespaces hold the
