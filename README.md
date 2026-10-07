@@ -109,9 +109,11 @@ The controller:
 The `ByotHost` controller drives each host through a phase state machine:
 `Probing → Available ↔ Unavailable`, `Available → Claimed → Releasing →
 Available`. It discovers features from the Talos maintenance API (`Version`,
-`Memory`, `Disks`, `Dmesg` for CPU topology + platform + GPU PCI devices,
-`LS /sys/class/net` for interface names) and probes liveness (~60s), marking a
-host `Unavailable` after consecutive failures and re-discovering on recovery.
+`Memory`, `Disks`, COSI `hardware.Processor` for CPU topology, COSI
+`hardware.PCIDevice` for GPU PCI devices, COSI `runtime.KernelCmdline` for
+platform, `LS /sys/devices/system/node` for NUMA, `LS /sys/class/net` for
+interface names) and probes liveness (~60s), marking a host `Unavailable`
+after consecutive failures and re-discovering on recovery.
 Discovery populates a rich typed `status` (view-only) and promotes a curated,
 rounded subset to controller-managed `byot.io/` labels:
 
@@ -130,9 +132,10 @@ rounded subset to controller-managed `byot.io/` labels:
 | `byot.io/talos-version`  | `talosVersion`         | `v1.13.8`, ...                                                             |
 | `byot.io/failure-domain` | `spec.failureDomain`   | operator-set physical FD, e.g. `par01`                                     |
 
-GPU discovery scans the kernel dmesg log for PCI display-class devices from
-a known vendor (NVIDIA/AMD/Intel) and resolves the model family + per-GPU HBM
-from a PCI device-id table (derived from [pci.ids database](https://pci-ids.ucw.cz)).
+GPU discovery reads COSI `hardware.PCIDevice` resources for display-class
+devices (PCI class 0x03) from a known vendor (NVIDIA/AMD/Intel) and resolves
+the model family + per-GPU HBM from a PCI device-id table (derived from
+[pci.ids database](https://pci-ids.ucw.cz)).
 A host with GPUs of more than one `vendor:device` pair is marked
 `HostDiscovered=False/MixedGPUModels` and stays non-`Available`, so a
 `ByotMachine` cannot claim a mislabeled mixed node. No GPU → `hardware.gpus`

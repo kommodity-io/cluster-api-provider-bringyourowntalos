@@ -35,7 +35,7 @@ or parked-config path.
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | `ByotHost` is a manually-added, IP-only record; controller discovers features and probes liveness                                                                                                                                                                                                 | Operator owns host lifecycle; byot owns observation. No host auto-discovery/scanning                                                                                                                                                     |
 | 2   | Hosts sit in maintenance mode, firewall-protected (not authenticated standby)                                                                                                                                                                                                                     | No standby bundle, no park config, no "configured but not joined" state. Simplest secure wait state                                                                                                                                      |
-| 3   | Controller discovers features via the Talos maintenance API (`Version`, `Memory`, `Disks`, `Dmesg`, `LS`) using the existing insecure client                                                                                                                                                      | Same maintenance client byot already builds (`maintenanceClient`); no new Talos plumbing. `Read` is restricted in maintenance mode, so CPU comes from `Dmesg` parsing and interface names from `LS /sys/class/net`                       |
+| 3   | Controller discovers features via the Talos maintenance API (`Version`, `Memory`, `Disks`, COSI `hardware.Processor`/`hardware.PCIDevice`/`runtime.KernelCmdline`, `LS`) using the existing insecure client                                                                                                                                                      | Same maintenance client byot already builds (`maintenanceClient`); no new Talos plumbing. `Read` is restricted in maintenance mode, so CPU comes from COSI `Processor` resources, GPU from COSI `PCIDevice` resources, platform from COSI `KernelCmdline`, NUMA from `LS /sys/devices/system/node`, and interface names from `LS /sys/class/net`                       |
 | 4   | Controller probes liveness periodically (~60s) and marks hosts `Unavailable` after consecutive failures; re-discovers features on recovery (`Unavailable` → `Available`)                                                                                                                          | Catches dead hosts before claim; keeps features fresh after outages                                                                                                                                                                      |
 | 5   | A host is `Available` (claimable) only when maintenance-liveness is confirmed **and** features are discovered                                                                                                                                                                                     | Uniform claim gate; no claiming an undiscovered host, even via explicit `hostRef`                                                                                                                                                        |
 | 6   | `ByotMachine` always claims a `ByotHost`; no direct `spec.publicIP` path                                                                                                                                                                                                                          | ByotHost is the single adoption unit; one code path; discovery always runs                                                                                                                                                               |
@@ -108,9 +108,9 @@ status:
   phase: Probing | Available | Claimed | Releasing | Unavailable
   talosVersion: "v1.13.8" # discovered via Version RPC
   arch: amd64 # discovered via Version RPC
-  platform: scaleway # discovered from Dmesg kernel cmdline (talos.platform=)
+  platform: scaleway # discovered from COSI KernelCmdline (talos.platform=)
   hardware: # discovered — typed, detailed (view-only)
-    cpu: # parsed from Dmesg (nr_cpu_ids / Num. cores per package)
+    cpu: # from COSI Processor resources (CoreCount per socket, summed)
       cores: 3
       packages: 1
       numaNodes: 1
@@ -171,7 +171,7 @@ fields under `status`:
 
 - `status.talosVersion`, `status.arch`, `status.platform`: string.
 - `status.hardware.cpu`: `{ cores int32, packages int32, numaNodes int32 }`
-  — parsed from `Dmesg` (`nr_cpu_ids` / `Num. cores per package`).
+  — from COSI `Processor` resources (physical `CoreCount` per socket, summed).
 - `status.hardware.memory`: `resource.Quantity` (idiomatic for RAM; from
   `Memory` RPC `Meminfo.Memtotal`).
 - `status.hardware.disks[]`: `{ name, size resource.Quantity, type, model,
@@ -219,7 +219,7 @@ race leaves a stale `available: true`).
    and the controller runs initial discovery immediately. Build the maintenance
    client (`maintenanceClient`, insecure) against `spec.publicIP` and call the
    confirmed maintenance-mode surface: `Version` (Talos version + arch),
-   `Memory` (RAM total), `Disks` (disk inventory), `Dmesg` (CPU cores/packages/NUMA via parsing `nr_cpu_ids` / `Num. cores per package`; platform via `talos.platform=` kernel cmdline), and `LS /sys/class/net` (interface names). `Read` is restricted in maintenance mode and returns empty; it is not used.
+   `Memory` (RAM total), `Disks` (disk inventory), COSI `hardware.Processor` (CPU cores/packages), COSI `hardware.PCIDevice` (GPU PCI devices), COSI `runtime.KernelCmdline` (platform via `talos.platform=`), `LS /sys/devices/system/node` (NUMA), and `LS /sys/class/net` (interface names). `Read` is restricted in maintenance mode and returns empty; it is not used.
    On success populate `status.talosVersion`, `status.arch`, `status.platform`, `status.hardware` (cpu, memory, disks, networkInterfaces), `status.maintenanceMode=true`, set `phase=Available`. On failure set `phase=Probing` and requeue.
 2. Periodically (~60s): probe maintenance liveness (`probeMaintenance`). On
    consecutive failures (e.g. 3) set `phase=Unavailable`,
@@ -278,7 +278,7 @@ then the `ByotHost` deletes.
 - `cluster-api-provider-bringyourowntalos`:
   - New CRD: `ByotHost` (IP-only spec, discovered status, `claimRef`,
     finalizer).
-  - New `ByotHost` controller: maintenance-mode discovery (`Version`, `Memory`, `Disks`, `Dmesg` parsing, `LS /sys/class/net`) + periodic liveness probe + promotion of curated rounded labels. Reuses `maintenanceClient`.
+  - New `ByotHost` controller: maintenance-mode discovery (`Version`, `Memory`, `Disks`, COSI `hardware.Processor`/`PCIDevice`/`KernelCmdline`, `LS`) + periodic liveness probe + promotion of curated rounded labels. Reuses `maintenanceClient`.
   - `ByotMachine` controller: claim flow (`hostRef`/`hostSelector`), IP
     resolution from `ByotHost`, `claimRef` CAS, release-always-reset,
     `Releasing` → `Available` via the liveness loop. Remove `spec.publicIP`
@@ -295,7 +295,7 @@ then the `ByotHost` deletes.
 ## Verification
 
 - Unit: discovery populates `status.hardware`/`talosVersion`/`arch`/`platform` from a mocked
-  maintenance API (`Version`, `Memory`, `Disks`, `Dmesg`, `LS`); CPU cores parsed from `Dmesg`;
+  maintenance API (`Version`, `Memory`, `Disks`, COSI hardware resources, `LS`); CPU cores from COSI `Processor` resources;
   curated rounded labels promoted and kept in sync; `byot.io/available` flipped on phase
   transitions; liveness flips `Available` → `Unavailable` on probe failure
   and back with re-discovery; claim race resolved by `claimRef` CAS; claim
