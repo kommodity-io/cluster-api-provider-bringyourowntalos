@@ -518,11 +518,10 @@ func discoverNetInterfaces(
 			name = info.GetName()
 		}
 
-		// Skip the loopback interface; only external interfaces matter.
-		if name == "" || name == "lo" {
-			continue
-		}
-
+	// Skip loopback and the directory itself (LS returns "." for the root).
+	if name == "" || name == "lo" || name == "." {
+		continue
+	}
 		ifaces = append(ifaces, name)
 	}
 
