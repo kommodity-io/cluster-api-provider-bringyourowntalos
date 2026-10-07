@@ -50,9 +50,10 @@ type HostClaimRef struct {
 	UID string `json:"uid"`
 }
 
-// HostCPU holds discovered CPU topology, parsed from the kernel dmesg log.
+// HostCPU holds discovered CPU topology, queried from Talos COSI Processor
+// resources and /sys/devices/system/node for NUMA.
 type HostCPU struct {
-	// Cores is the total number of logical CPUs (nr_cpu_ids).
+	// Cores is the total number of physical CPU cores across all sockets.
 	Cores int32 `json:"cores"`
 	// Packages is the number of physical CPU packages.
 	Packages int32 `json:"packages"`
@@ -130,9 +131,9 @@ type HostHardware struct {
 	GPUs *HostGPU `json:"gpus,omitempty"`
 }
 
-// HostGPU is the aggregated GPU summary discovered from the PCI bus via the
-// kernel dmesg log. Nodes are assumed homogeneous; a mixed-GPU host keeps
-// count/vendor but omits model and sets Mixed=true.
+// HostGPU is the aggregated GPU summary discovered from the PCI bus via
+// Talos COSI PCIDevice resources. Nodes are assumed homogeneous; a mixed-GPU
+// host keeps count/vendor but omits model and sets Mixed=true.
 type HostGPU struct {
 	// Vendor is the lowercase GPU vendor (nvidia, amd, intel). Omitted when
 	// the host has GPUs from more than one vendor.
