@@ -68,3 +68,15 @@ func TestInjectInstallDiskCreatesInstallWhenMissing(t *testing.T) {
 	assert.Contains(t, string(out), "disk: /dev/sda")
 	assert.Contains(t, string(out), "kubelet:v1.35.0")
 }
+
+func TestInjectInstallDiskWithRAIDOverride(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("machine:\n  install:\n    wipe: false\n")
+
+	out, err := injectInstallDisk(config, "/dev/md127")
+	require.NoError(t, err)
+
+	assert.Contains(t, string(out), "disk: /dev/md127")
+	assert.Contains(t, string(out), "wipe: false")
+}

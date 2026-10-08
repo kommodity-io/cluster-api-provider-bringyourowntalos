@@ -81,6 +81,12 @@ type ByotMachineSpec struct {
 	// (already applied); bump generation to force a same-ref reinstall.
 	// +optional
 	DesiredTalosVersion *string `json:"desiredTalosVersion,omitempty"`
+	// InstallDisk overrides auto-detection of the system install disk. When
+	// set (e.g. /dev/md127), it is injected as machine.install.disk directly,
+	// skipping the Talos storage API query. When empty, the controller
+	// auto-detects the system disk, preferring md (RAID) devices.
+	// +optional
+	InstallDisk *string `json:"installDisk,omitempty"`
 }
 
 // ByotMachineStatus defines the observed state of ByotMachine.

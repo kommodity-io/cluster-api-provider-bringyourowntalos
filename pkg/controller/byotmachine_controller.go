@@ -1034,18 +1034,27 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		}
 	}
 
-	// Detect the system disk and inject machine.install.disk into the config
-	// before applying. The Talos installer validates the machine config on
-	// upgrade and requires install.disk or diskSelector; cabpt sets neither, so
-	// BYOT auto-detects it. Best-effort: on failure, fall through to the apply
-	// (the upgrade will surface the validation error if the disk is truly
-	// unset) rather than blocking adoption.
-	disk, diskErr := detectSystemDisk(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig)
-	if diskErr != nil {
-		logger.Info("could not detect system disk; applying config without machine.install.disk",
-			"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP, "error", diskErr)
+	// Resolve the install disk: an explicit spec.installDisk wins; otherwise
+	// auto-detect via the Talos storage API (preferring md/RAID devices). The
+	// Talos installer validates machine.install.disk on upgrade; cabpt sets
+	// neither disk nor diskSelector, so BYOT injects it here. Best-effort:
+	// on detection failure, fall through to the apply (the upgrade will
+	// surface the validation error if the disk is truly unset) rather than
+	// blocking adoption.
+	var installDisk string
+	if byotMachine.Spec.InstallDisk != nil && *byotMachine.Spec.InstallDisk != "" {
+		installDisk = *byotMachine.Spec.InstallDisk
 	} else {
-		machineConfig, err = injectInstallDisk(machineConfig, disk)
+		detected, diskErr := detectSystemDisk(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig)
+		if diskErr != nil {
+			logger.Info("could not detect system disk; applying config without machine.install.disk",
+				"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP, "error", diskErr)
+		} else {
+			installDisk = detected
+		}
+	}
+	if installDisk != "" {
+		machineConfig, err = injectInstallDisk(machineConfig, installDisk)
 		if err != nil {
 			return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 		}
