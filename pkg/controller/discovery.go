@@ -644,17 +644,21 @@ func diskTypeLabel(typeName string) string {
 // over raw block devices to avoid installing onto a RAID member.
 func systemDisk(disks []infrav1.HostDisk) *infrav1.HostDisk {
 	var fallback *infrav1.HostDisk
-	for i := range disks {
-		if !disks[i].SystemDisk {
+
+	for idx := range disks {
+		if !disks[idx].SystemDisk {
 			continue
 		}
-		if isRAIDDevice(disks[i].Name) {
-			return &disks[i]
+
+		if isRAIDDevice(disks[idx].Name) {
+			return &disks[idx]
 		}
+
 		if fallback == nil {
-			fallback = &disks[i]
+			fallback = &disks[idx]
 		}
 	}
+
 	return fallback
 }
 

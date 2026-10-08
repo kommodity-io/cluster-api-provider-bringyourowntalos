@@ -13,6 +13,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	storageapi "github.com/siderolabs/talos/pkg/machinery/api/storage"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"google.golang.org/grpc/codes"
@@ -577,30 +578,46 @@ func detectSystemDisk(ctx context.Context, publicIP string, talosConfig []byte) 
 	}
 
 	for _, msg := range resp.GetMessages() {
-		var fallback string
-		for _, disk := range msg.GetDisks() {
-			if !disk.GetSystemDisk() {
-				continue
-			}
-			name := disk.GetDeviceName()
-			// Talos may return either a bare name ("sda") or a full
-			// path ("/dev/sda"); normalise without doubling the prefix.
-			if !strings.HasPrefix(name, "/dev/") {
-				name = "/dev/" + name
-			}
-			if isRAIDDevice(name) {
-				return name, nil
-			}
-			if fallback == "" {
-				fallback = name
-			}
-		}
-		if fallback != "" {
-			return fallback, nil
+		if selected, ok := selectSystemDisk(msg.GetDisks()); ok {
+			return selected, nil
 		}
 	}
 
 	return "", fmt.Errorf("%w on %s", errNoSystemDisk, publicIP)
+}
+
+// selectSystemDisk picks the install disk from a Talos Disks response, preferring
+// md (RAID) devices over raw block devices to avoid installing onto a RAID member.
+func selectSystemDisk(disks []*storageapi.Disk) (string, bool) {
+	var fallback string
+
+	for _, disk := range disks {
+		if !disk.GetSystemDisk() {
+			continue
+		}
+
+		name := disk.GetDeviceName()
+
+		// Talos may return either a bare name ("sda") or a full path
+		// ("/dev/sda"); normalise without doubling the prefix.
+		if !strings.HasPrefix(name, "/dev/") {
+			name = "/dev/" + name
+		}
+
+		if isRAIDDevice(name) {
+			return name, true
+		}
+
+		if fallback == "" {
+			fallback = name
+		}
+	}
+
+	if fallback != "" {
+		return fallback, true
+	}
+
+	return "", false
 }
 
 // injectInstallDisk sets machine.install.disk in the v1alpha1 machine-config
