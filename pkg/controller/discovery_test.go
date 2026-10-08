@@ -15,6 +15,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
+	storageapi "github.com/siderolabs/talos/pkg/machinery/api/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -770,4 +771,55 @@ func TestDiscoverIdentitySkipsAllZeroMAC(t *testing.T) {
 	discoverIdentity(t.Context(), cosi, &result)
 
 	assert.Nil(t, result.Identity, "all-zero MAC must not be stored as a valid identity")
+}
+
+func TestDiskDeviceNameBareName(t *testing.T) {
+	t.Parallel()
+
+	disk := &storageapi.Disk{DeviceName: "sda"}
+	assert.Equal(t, "/dev/sda", diskDeviceName(disk))
+}
+
+func TestDiskDeviceNameFullPathNoDoublePrefix(t *testing.T) {
+	t.Parallel()
+
+	disk := &storageapi.Disk{DeviceName: "/dev/sda"}
+	assert.Equal(t, "/dev/sda", diskDeviceName(disk))
+}
+
+func TestDiskDeviceNameEmptyFallsBackToName(t *testing.T) {
+	t.Parallel()
+
+	disk := &storageapi.Disk{Name: "fallback-model"}
+	assert.Equal(t, "fallback-model", diskDeviceName(disk))
+}
+
+func TestDiskToHostDiskNormalisesNvmePath(t *testing.T) {
+	t.Parallel()
+
+	disk := &storageapi.Disk{
+		DeviceName: "/dev/nvme0n1",
+		Size:       4000 * 1024 * 1024 * 1024,
+		Type:       storageapi.Disk_NVME,
+		SystemDisk: true,
+	}
+	hostDisk := diskToHostDisk(disk)
+	assert.Equal(t, "/dev/nvme0n1", hostDisk.Name)
+	assert.True(t, hostDisk.SystemDisk)
+	assert.Equal(t, "NVME", hostDisk.Type)
+}
+
+func TestDiskToHostDiskBareSdaName(t *testing.T) {
+	t.Parallel()
+
+	disk := &storageapi.Disk{
+		DeviceName: "sda",
+		Size:       93 * 1024 * 1024 * 1024,
+		Type:       storageapi.Disk_HDD,
+		SystemDisk: true,
+	}
+	hostDisk := diskToHostDisk(disk)
+	assert.Equal(t, "/dev/sda", hostDisk.Name)
+	assert.True(t, hostDisk.SystemDisk)
+	assert.Equal(t, "HDD", hostDisk.Type)
 }
