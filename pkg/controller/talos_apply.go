@@ -579,7 +579,14 @@ func detectSystemDisk(ctx context.Context, publicIP string, talosConfig []byte) 
 	for _, msg := range resp.GetMessages() {
 		for _, disk := range msg.GetDisks() {
 			if disk.GetSystemDisk() {
-				return "/dev/" + disk.GetDeviceName(), nil
+				name := disk.GetDeviceName()
+				// Talos may return either a bare name ("sda") or a full
+				// path ("/dev/sda"); normalise without doubling the prefix.
+				if strings.HasPrefix(name, "/dev/") {
+					return name, nil
+				}
+
+				return "/dev/" + name, nil
 			}
 		}
 	}

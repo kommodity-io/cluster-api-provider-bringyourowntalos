@@ -174,6 +174,12 @@ func diskToHostDisk(disk *storageapi.Disk) infrav1.HostDisk {
 
 func diskDeviceName(disk *storageapi.Disk) string {
 	if name := disk.GetDeviceName(); name != "" {
+		// Talos may return either a bare name ("sda") or a full path
+		// ("/dev/sda"); normalise to the full /dev/ path without doubling.
+		if strings.HasPrefix(name, "/dev/") {
+			return name
+		}
+
 		return "/dev/" + name
 	}
 
