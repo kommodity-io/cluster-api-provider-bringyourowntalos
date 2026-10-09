@@ -640,14 +640,32 @@ func diskTypeLabel(typeName string) string {
 }
 
 // systemDisk returns the system disk from a discovery result, or nil.
+// When multiple disks report SystemDisk, md (RAID) devices are preferred
+// over raw block devices to avoid installing onto a RAID member.
 func systemDisk(disks []infrav1.HostDisk) *infrav1.HostDisk {
-	for i := range disks {
-		if disks[i].SystemDisk {
-			return &disks[i]
+	var fallback *infrav1.HostDisk
+
+	for idx := range disks {
+		if !disks[idx].SystemDisk {
+			continue
+		}
+
+		if isRAIDDevice(disks[idx].Name) {
+			return &disks[idx]
+		}
+
+		if fallback == nil {
+			fallback = &disks[idx]
 		}
 	}
 
-	return nil
+	return fallback
+}
+
+// isRAIDDevice reports whether the device name looks like a Linux md RAID
+// array (e.g. /dev/md127, /dev/md0).
+func isRAIDDevice(name string) bool {
+	return strings.HasPrefix(name, "/dev/md") || strings.HasPrefix(name, "md")
 }
 
 // applyDiscoveryLabels syncs the controller-managed byot.io/ labels on host

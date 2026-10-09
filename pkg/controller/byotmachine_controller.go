@@ -1034,21 +1034,9 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		}
 	}
 
-	// Detect the system disk and inject machine.install.disk into the config
-	// before applying. The Talos installer validates the machine config on
-	// upgrade and requires install.disk or diskSelector; cabpt sets neither, so
-	// BYOT auto-detects it. Best-effort: on failure, fall through to the apply
-	// (the upgrade will surface the validation error if the disk is truly
-	// unset) rather than blocking adoption.
-	disk, diskErr := detectSystemDisk(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig)
-	if diskErr != nil {
-		logger.Info("could not detect system disk; applying config without machine.install.disk",
-			"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP, "error", diskErr)
-	} else {
-		machineConfig, err = injectInstallDisk(machineConfig, disk)
-		if err != nil {
-			return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
-		}
+	machineConfig, err = resolveInstallDisk(ctx, byotMachine, machineConfig, talosConfig)
+	if err != nil {
+		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
 
 	err = r.applyMachineConfig(ctx, byotMachine.Status.ResolvedPublicIP, machineConfig, talosConfig)
@@ -1086,6 +1074,40 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	// a freshly-adopted host upgrades (reboots) before it is linked and goes
 	// live; see reconcileAdopted.
 	return r.reconcileAdopted(ctx, patchHelper, byotMachine, machine)
+}
+
+// resolveInstallDisk injects machine.install.disk into the machine config.
+// An explicit spec.installDisk wins; otherwise the system disk is auto-detected
+// via the Talos storage API (preferring md/RAID devices). Best-effort: on
+// detection failure, the config is returned unchanged (the upgrade will surface
+// the validation error if the disk is truly unset) rather than blocking adoption.
+func resolveInstallDisk(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+	machineConfig []byte,
+	talosConfig []byte,
+) ([]byte, error) {
+	logger := log.FromContext(ctx)
+
+	var installDisk string
+
+	if byotMachine.Spec.InstallDisk != nil && *byotMachine.Spec.InstallDisk != "" {
+		installDisk = *byotMachine.Spec.InstallDisk
+	} else {
+		detected, diskErr := detectSystemDisk(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig)
+		if diskErr != nil {
+			logger.Info("could not detect system disk; applying config without machine.install.disk",
+				"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP, "error", diskErr)
+		} else {
+			installDisk = detected
+		}
+	}
+
+	if installDisk == "" {
+		return machineConfig, nil
+	}
+
+	return injectInstallDisk(machineConfig, installDisk)
 }
 
 // linkNode drives the Machine<->Node linkage for an adopted machine: first

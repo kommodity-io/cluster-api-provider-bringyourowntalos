@@ -198,6 +198,47 @@ func TestSystemDiskNilWhenNone(t *testing.T) {
 	assert.Nil(t, systemDisk(disks))
 }
 
+func TestSystemDiskPrefersRAID(t *testing.T) {
+	t.Parallel()
+
+	disks := []infrav1.HostDisk{
+		{Name: "/dev/md127", SystemDisk: true},
+		{Name: "/dev/nvme0n1", SystemDisk: true},
+		{Name: "/dev/nvme1n1", SystemDisk: true},
+	}
+
+	disk := systemDisk(disks)
+	require.NotNil(t, disk)
+	assert.Equal(t, "/dev/md127", disk.Name)
+}
+
+func TestSystemDiskPrefersRAIDRegardlessOfOrder(t *testing.T) {
+	t.Parallel()
+
+	disks := []infrav1.HostDisk{
+		{Name: "/dev/nvme0n1", SystemDisk: true},
+		{Name: "/dev/md0", SystemDisk: true},
+		{Name: "/dev/nvme1n1", SystemDisk: true},
+	}
+
+	disk := systemDisk(disks)
+	require.NotNil(t, disk)
+	assert.Equal(t, "/dev/md0", disk.Name)
+}
+
+func TestSystemDiskFallsBackToFirstWhenNoRAID(t *testing.T) {
+	t.Parallel()
+
+	disks := []infrav1.HostDisk{
+		{Name: "/dev/nvme0n1", SystemDisk: true},
+		{Name: "/dev/nvme1n1", SystemDisk: true},
+	}
+
+	disk := systemDisk(disks)
+	require.NotNil(t, disk)
+	assert.Equal(t, "/dev/nvme0n1", disk.Name)
+}
+
 func TestApplyDiscoveryLabelsPromotesCuratedLabels(t *testing.T) {
 	t.Parallel()
 
