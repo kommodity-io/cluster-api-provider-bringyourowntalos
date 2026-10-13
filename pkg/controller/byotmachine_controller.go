@@ -1039,6 +1039,15 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
 
+	// Inject the resolved public IP into machine.certSANs so the Talos apid
+	// certificate includes the NAT'd public IP the BYOT provider connects
+	// through. Without this, the TLS handshake fails on NAT'd hosts whose
+	// public IP is not bound to any network interface.
+	machineConfig, err = injectCertSANs(machineConfig, byotMachine.Status.ResolvedPublicIP)
+	if err != nil {
+		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
+	}
+
 	err = r.applyMachineConfig(ctx, byotMachine.Status.ResolvedPublicIP, machineConfig, talosConfig)
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
