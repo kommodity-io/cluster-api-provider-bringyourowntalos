@@ -641,20 +641,20 @@ func injectInstallDisk(machineConfig []byte, disk string) ([]byte, error) {
 // If the IP is already present, the config is returned unchanged. Uses the
 // same multi-doc decode/encode helpers as injectInstallDisk to avoid
 // dropping the CABPT HostnameConfig doc.
-func injectCertSANs(machineConfig []byte, ip string) ([]byte, error) {
+func injectCertSANs(machineConfig []byte, ipAddress string) ([]byte, error) {
 	docs, err := decodeMachineConfigDocs(machineConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	setCertSANs(docs, ip)
+	setCertSANs(docs, ipAddress)
 
 	return encodeMachineConfigDocs(docs)
 }
 
 // setCertSANs appends ip to machine.certSANs in each v1alpha1 doc when not
 // already present. Existing operator-provided SANs are preserved.
-func setCertSANs(docs []map[string]any, ip string) {
+func setCertSANs(docs []map[string]any, ipAddress string) {
 	for _, doc := range docs {
 		machine, _ := doc["machine"].(map[string]any)
 		if machine == nil {
@@ -663,12 +663,12 @@ func setCertSANs(docs []map[string]any, ip string) {
 
 		sans, _ := machine["certSANs"].([]any)
 		for _, san := range sans {
-			if s, ok := san.(string); ok && s == ip {
+			if s, ok := san.(string); ok && s == ipAddress {
 				return
 			}
 		}
 
-		machine["certSANs"] = append(sans, ip)
+		machine["certSANs"] = append(sans, ipAddress)
 		doc["machine"] = machine
 	}
 }
