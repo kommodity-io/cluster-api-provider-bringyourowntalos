@@ -636,6 +636,43 @@ func injectInstallDisk(machineConfig []byte, disk string) ([]byte, error) {
 	return encodeMachineConfigDocs(docs)
 }
 
+// injectCertSANs idempotently adds ip to machine.certSANs in the v1alpha1
+// machine-config document, preserving every other document in the stream.
+// If the IP is already present, the config is returned unchanged. Uses the
+// same multi-doc decode/encode helpers as injectInstallDisk to avoid
+// dropping the CABPT HostnameConfig doc.
+func injectCertSANs(machineConfig []byte, ipAddress string) ([]byte, error) {
+	docs, err := decodeMachineConfigDocs(machineConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	setCertSANs(docs, ipAddress)
+
+	return encodeMachineConfigDocs(docs)
+}
+
+// setCertSANs appends ip to machine.certSANs in each v1alpha1 doc when not
+// already present. Existing operator-provided SANs are preserved.
+func setCertSANs(docs []map[string]any, ipAddress string) {
+	for _, doc := range docs {
+		machine, _ := doc["machine"].(map[string]any)
+		if machine == nil {
+			continue
+		}
+
+		sans, _ := machine["certSANs"].([]any)
+		for _, san := range sans {
+			if s, ok := san.(string); ok && s == ipAddress {
+				return
+			}
+		}
+
+		machine["certSANs"] = append(sans, ipAddress)
+		doc["machine"] = machine
+	}
+}
+
 // decodeMachineConfigDocs reads every YAML document in the stream, preserving
 // multi-doc streams (e.g. the CABPT HostnameConfig doc) that a single-doc
 // yaml.v3 round-trip would silently drop.

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -79,4 +80,85 @@ func TestInjectInstallDiskWithRAIDOverride(t *testing.T) {
 
 	assert.Contains(t, string(out), "disk: /dev/md127")
 	assert.Contains(t, string(out), "wipe: false")
+}
+
+func TestInjectCertSANsAddsWhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("machine:\n  kubelet:\n    image: kubelet:v1.35.0\n")
+
+	out, err := injectCertSANs(config, "130.226.165.252")
+	require.NoError(t, err)
+
+	assert.Contains(t, string(out), "130.226.165.252")
+	assert.Contains(t, string(out), "kubelet:v1.35.0")
+}
+
+func TestInjectCertSANsPreservesExistingSANs(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("machine:\n  certSANs:\n    - 10.10.53.50\n    - 127.0.0.1\n")
+
+	out, err := injectCertSANs(config, "130.226.165.252")
+	require.NoError(t, err)
+
+	assert.Contains(t, string(out), "10.10.53.50")
+	assert.Contains(t, string(out), "127.0.0.1")
+	assert.Contains(t, string(out), "130.226.165.252")
+}
+
+func TestInjectCertSANsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("machine:\n  certSANs:\n    - 10.10.53.50\n    - 130.226.165.252\n")
+
+	out, err := injectCertSANs(config, "130.226.165.252")
+	require.NoError(t, err)
+
+	assert.Contains(t, string(out), "10.10.53.50")
+	assert.Contains(t, string(out), "130.226.165.252")
+	// Count occurrences of the IP — should be exactly 1 (not duplicated).
+	assert.Equal(t, 1, strings.Count(string(out), "130.226.165.252"))
+}
+
+func TestInjectCertSANsPreservesEmptyList(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("machine:\n  certSANs: []\n  kubelet:\n    image: kubelet:v1.35.0\n")
+
+	out, err := injectCertSANs(config, "130.226.165.252")
+	require.NoError(t, err)
+
+	assert.Contains(t, string(out), "130.226.165.252")
+	assert.Contains(t, string(out), "kubelet:v1.35.0")
+}
+
+func TestInjectCertSANsPreservesMultiDoc(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("version: v1alpha1\nmachine:\n  certSANs: []\n" +
+		"---\napiVersion: v1alpha1\nkind: HostnameConfig\n" +
+		"auto: \"off\"\nhostname: prd-cph04-controlplane-112ba5-wvrqq\n")
+
+	out, err := injectCertSANs(config, "130.226.165.252")
+	require.NoError(t, err)
+
+	rendered := string(out)
+	assert.Contains(t, rendered, "130.226.165.252")
+	assert.Contains(t, rendered, "HostnameConfig")
+	assert.Contains(t, rendered, "prd-cph04-controlplane-112ba5-wvrqq")
+}
+
+func TestInjectCertSANsSkipsNonMachineDocs(t *testing.T) {
+	t.Parallel()
+
+	config := []byte("---\napiVersion: v1alpha1\nkind: VolumeConfig\nname: STATE\n" +
+		"---\nversion: v1alpha1\nmachine:\n  certSANs: []\n")
+
+	out, err := injectCertSANs(config, "130.226.165.252")
+	require.NoError(t, err)
+
+	rendered := string(out)
+	assert.Contains(t, rendered, "130.226.165.252")
+	assert.Contains(t, rendered, "VolumeConfig")
 }
