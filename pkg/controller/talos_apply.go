@@ -702,14 +702,7 @@ func setClusterAPIServerCertSANs(docs []map[string]any, ipAddress string) {
 		}
 
 		sans, _ := apiServer["certSANs"].([]any)
-		found := false
-		for _, san := range sans {
-			if s, ok := san.(string); ok && s == ipAddress {
-				found = true
-				break
-			}
-		}
-		if found {
+		if containsString(sans, ipAddress) {
 			continue
 		}
 
@@ -790,4 +783,15 @@ func encodeMachineConfigDocs(docs []map[string]any) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// containsString reports whether values contains ipAddress as a string.
+func containsString(values []any, ipAddress string) bool {
+	for _, v := range values {
+		if s, ok := v.(string); ok && s == ipAddress {
+			return true
+		}
+	}
+
+	return false
 }

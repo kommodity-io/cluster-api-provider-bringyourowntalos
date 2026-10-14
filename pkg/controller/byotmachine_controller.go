@@ -1075,20 +1075,9 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
-
-	// Inject the resolved public IP into machine.certSANs so the Talos apid
-	// certificate includes the NAT'd public IP the BYOT provider connects
-	// through. Without this, the TLS handshake fails on NAT'd hosts whose
-	// public IP is not bound to any network interface.
-	machineConfig, err = injectCertSANs(machineConfig, byotMachine.Status.ResolvedPublicIP)
-	if err != nil {
-		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
-	}
-
-	// Inject all host IPs (internal + external) into cluster.apiServer.certSANs
-	// so the Kubernetes API server serving certificate includes every address
-	// clients may use to reach it, including NAT'd external IPs.
-	machineConfig, err = injectClusterAPIServerCertSANs(machineConfig, machineEndpoints(byotMachine))
+	// Inject host IPs into machine.certSANs (apid cert) and
+	// cluster.apiServer.certSANs (kube-apiserver serving cert).
+	machineConfig, err = injectHostCertSANs(machineConfig, byotMachine)
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
@@ -1162,6 +1151,22 @@ func resolveInstallDisk(
 	}
 
 	return injectInstallDisk(machineConfig, installDisk)
+}
+
+// injectHostCertSANs injects host IPs into both machine.certSANs (the Talos
+// apid certificate) and cluster.apiServer.certSANs (the kube-apiserver
+// serving certificate). The public IP goes into machine.certSANs so the TLS
+// handshake succeeds on NAT'd hosts whose public IP is not bound to any
+// network interface. All host IPs (internal + external) go into
+// cluster.apiServer.certSANs so the API server serving certificate covers
+// every address clients may use.
+func injectHostCertSANs(machineConfig []byte, byotMachine *infrav1.ByotMachine) ([]byte, error) {
+	config, err := injectCertSANs(machineConfig, byotMachine.Status.ResolvedPublicIP)
+	if err != nil {
+		return nil, err
+	}
+
+	return injectClusterAPIServerCertSANs(config, machineEndpoints(byotMachine))
 }
 
 // linkNode drives the Machine<->Node linkage for an adopted machine: first
