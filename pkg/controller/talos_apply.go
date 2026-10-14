@@ -668,6 +668,57 @@ func setCertSANs(docs []map[string]any, ipAddress string) {
 	}
 }
 
+// injectClusterAPIServerCertSANs idempotently adds each IP to
+// cluster.apiServer.certSANs in the v1alpha1 machine-config document,
+// preserving every other document in the stream. Existing operator-provided
+// SANs are preserved. Uses the same multi-doc decode/encode helpers as
+// injectInstallDisk to avoid dropping the CABPT HostnameConfig doc.
+func injectClusterAPIServerCertSANs(machineConfig []byte, ipAddresses []string) ([]byte, error) {
+	docs, err := decodeMachineConfigDocs(machineConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ip := range ipAddresses {
+		setClusterAPIServerCertSANs(docs, ip)
+	}
+
+	return encodeMachineConfigDocs(docs)
+}
+
+// setClusterAPIServerCertSANs appends ip to cluster.apiServer.certSANs in
+// each v1alpha1 doc when not already present. Existing operator-provided
+// SANs are preserved.
+func setClusterAPIServerCertSANs(docs []map[string]any, ipAddress string) {
+	for _, doc := range docs {
+		cluster, _ := doc["cluster"].(map[string]any)
+		if cluster == nil {
+			continue
+		}
+
+		apiServer, _ := cluster["apiServer"].(map[string]any)
+		if apiServer == nil {
+			apiServer = map[string]any{}
+		}
+
+		sans, _ := apiServer["certSANs"].([]any)
+		found := false
+		for _, san := range sans {
+			if s, ok := san.(string); ok && s == ipAddress {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+
+		apiServer["certSANs"] = append(sans, ipAddress)
+		cluster["apiServer"] = apiServer
+		doc["cluster"] = cluster
+	}
+}
+
 // decodeMachineConfigDocs reads every YAML document in the stream, preserving
 // multi-doc streams (e.g. the CABPT HostnameConfig doc) that a single-doc
 // yaml.v3 round-trip would silently drop.

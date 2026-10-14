@@ -1085,6 +1085,14 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
 
+	// Inject all host IPs (internal + external) into cluster.apiServer.certSANs
+	// so the Kubernetes API server serving certificate includes every address
+	// clients may use to reach it, including NAT'd external IPs.
+	machineConfig, err = injectClusterAPIServerCertSANs(machineConfig, machineEndpoints(byotMachine))
+	if err != nil {
+		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
+	}
+
 	err = r.applyMachineConfig(ctx, machineEndpoints(byotMachine), machineConfig, talosConfig)
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
