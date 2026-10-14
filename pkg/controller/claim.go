@@ -372,7 +372,7 @@ func (r *ByotMachineReconciler) releaseHost(
 	// in maintenance mode has no config on STATE — safe to release
 	// without reset. A node not in maintenance mode has config applied
 	// and must be reset to wipe STATE + EPHEMERAL.
-	if r.probeMaintenance(ctx, host.Spec.PublicIP) {
+	if r.probeMaintenance(ctx, hostEndpoints(host)) {
 		host.Status.Phase = infrav1.HostPhaseAvailable
 		host.Status.ClaimRef = nil
 
@@ -389,11 +389,11 @@ func (r *ByotMachineReconciler) releaseHost(
 		return err
 	}
 
-	publicIP := byotMachine.Status.ResolvedPublicIP
+	addrList := machineEndpoints(byotMachine)
 
-	err = attemptReset(ctx, candidates, publicIP)
+	err = attemptReset(ctx, candidates, addrList)
 	if err != nil {
-		return fmt.Errorf("failed to reset host %s (%s): %w", host.Name, publicIP, err)
+		return fmt.Errorf("failed to reset host %s (%v): %w", host.Name, addrList, err)
 	}
 
 	// Reset issued: clear the claim and let the liveness loop flip

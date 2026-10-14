@@ -34,7 +34,7 @@ func newByotHost(publicIP string) *infrav1.ByotHost {
 }
 
 type discoverFunc func(context.Context, string) (DiscoveryResult, error)
-type probeFunc func(context.Context, string) bool
+type probeFunc func(context.Context, []string) bool
 
 func newHostReconciler(
 	t *testing.T,
@@ -92,7 +92,7 @@ func TestByotHostReconcileDiscoveryPopulatesStatusAndLabels(t *testing.T) {
 	reconciler := newHostReconciler(t,
 		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
 		func(context.Context, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
-		func(context.Context, string) bool { return true },
+		func(context.Context, []string) bool { return true },
 	)
 
 	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
@@ -139,7 +139,7 @@ func TestByotHostReconcileDiscoveryFailureStaysProbing(t *testing.T) {
 		func(context.Context, string) (DiscoveryResult, error) {
 			return DiscoveryResult{}, errTestUnreachable
 		},
-		func(context.Context, string) bool { return false },
+		func(context.Context, []string) bool { return false },
 	)
 
 	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
@@ -164,7 +164,7 @@ func TestByotHostReconcileAvailableFlipsToUnavailableAfterThreshold(t *testing.T
 	reconciler := newHostReconciler(t,
 		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
 		func(context.Context, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
-		func(context.Context, string) bool { return false },
+		func(context.Context, []string) bool { return false },
 	)
 
 	// First failure: below threshold -> ProbeFailed info, stays Available.
@@ -202,7 +202,7 @@ func TestByotHostReconcileUnavailableRecoversToAvailableWithRediscovery(t *testi
 	reconciler := newHostReconciler(t,
 		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
 		func(context.Context, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
-		func(context.Context, string) bool { return true },
+		func(context.Context, []string) bool { return true },
 	)
 
 	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
@@ -228,7 +228,7 @@ func TestByotHostReconcileReleasingFlipsToAvailableWhenMaintenanceAnswers(t *tes
 	reconciler := newHostReconciler(t,
 		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
 		func(context.Context, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
-		func(context.Context, string) bool { return true },
+		func(context.Context, []string) bool { return true },
 	)
 
 	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
@@ -253,7 +253,7 @@ func TestByotHostReconcileReleasingRequeuesWhenStillDown(t *testing.T) {
 	reconciler := newHostReconciler(t,
 		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
 		func(context.Context, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
-		func(context.Context, string) bool { return false },
+		func(context.Context, []string) bool { return false },
 	)
 
 	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
@@ -282,7 +282,7 @@ func TestByotHostReconcileClaimedRequeuesWithoutProbing(t *testing.T) {
 
 			return DiscoveryResult{}, nil
 		},
-		func(context.Context, string) bool {
+		func(context.Context, []string) bool {
 			probeCalled = true
 
 			return true
@@ -308,7 +308,7 @@ func TestByotHostReconcileDeleteBlockedWhileClaimed(t *testing.T) {
 	reconciler := newHostReconciler(t,
 		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
 		func(context.Context, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
-		func(context.Context, string) bool { return true },
+		func(context.Context, []string) bool { return true },
 	)
 
 	require.NoError(t, reconciler.Client.Delete(t.Context(), host))
@@ -335,7 +335,7 @@ func TestByotHostReconcileDeleteCompletesWhenUnclaimed(t *testing.T) {
 	reconciler := newHostReconciler(t,
 		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
 		func(context.Context, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
-		func(context.Context, string) bool { return true },
+		func(context.Context, []string) bool { return true },
 	)
 
 	require.NoError(t, reconciler.Client.Delete(t.Context(), host))

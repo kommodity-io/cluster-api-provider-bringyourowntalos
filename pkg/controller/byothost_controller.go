@@ -58,7 +58,7 @@ type ByotHostReconciler struct {
 
 	// ProbeMaintenance reports maintenance liveness. Defaults to
 	// probeMaintenance; injectable for tests.
-	ProbeMaintenance func(context.Context, string) bool
+	ProbeMaintenance func(context.Context, []string) bool
 
 	// LivenessInterval overrides the steady-state probe requeue delay.
 	LivenessInterval time.Duration
@@ -217,7 +217,7 @@ func (r *ByotHostReconciler) reconcileAvailable(
 	patchHelper *patch.Helper,
 	host *infrav1.ByotHost,
 ) (ctrl.Result, error) {
-	if r.ProbeMaintenance(ctx, host.Spec.PublicIP) {
+	if r.ProbeMaintenance(ctx, []string{host.Spec.PublicIP}) {
 		host.Status.MaintenanceMode = true
 		host.Status.LastProbedAt = nowPtr()
 		host.Status.ProbeFailureCount = 0
@@ -242,7 +242,7 @@ func (r *ByotHostReconciler) reconcileUnavailable(
 	patchHelper *patch.Helper,
 	host *infrav1.ByotHost,
 ) (ctrl.Result, error) {
-	if !r.ProbeMaintenance(ctx, host.Spec.PublicIP) {
+	if !r.ProbeMaintenance(ctx, []string{host.Spec.PublicIP}) {
 		host.Status.LastProbedAt = nowPtr()
 		applyDiscoveryLabels(host)
 
@@ -285,7 +285,7 @@ func (r *ByotHostReconciler) reconcileReleasing(
 	patchHelper *patch.Helper,
 	host *infrav1.ByotHost,
 ) (ctrl.Result, error) {
-	if !r.ProbeMaintenance(ctx, host.Spec.PublicIP) {
+	if !r.ProbeMaintenance(ctx, []string{host.Spec.PublicIP}) {
 		host.Status.LastProbedAt = nowPtr()
 		applyDiscoveryLabels(host)
 

@@ -69,14 +69,14 @@ type DiscoveryResult struct {
 // /sys/class/net, and IP addresses (COSI AddressStatus, classified against
 // publicIP). It reuses the insecure maintenance client.
 func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error) {
-	client, err := maintenanceClient(ctx, publicIP)
+	client, err := maintenanceClient(ctx, []string{publicIP})
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	ctx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), applyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
 	result := DiscoveryResult{}

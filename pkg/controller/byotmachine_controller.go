@@ -179,13 +179,13 @@ type ByotMachineReconciler struct {
 	// See ensureTalosVersion. The pre-upgrade and in-flight probes run over
 	// the cluster talosconfig (an adopted host no longer answers the
 	// maintenance client).
-	versionProbeAuthenticated func(ctx context.Context, publicIP string, talosConfig []byte) (string, error)
-	upgradeMachine            func(ctx context.Context, publicIP string, talosConfig []byte, image string) (string, error)
+	versionProbeAuthenticated func(ctx context.Context, addrList []string, talosConfig []byte) (string, error)
+	upgradeMachine            func(ctx context.Context, addrList []string, talosConfig []byte, image string) (string, error)
 
 	// bootIDAuthenticated is the InFlight completion-gate seam, injectable in
 	// tests. Returns the live boot-id or errBootIDUnauthorized when the
 	// credentials cannot read it (caller falls back to version-change).
-	bootIDAuthenticated func(ctx context.Context, publicIP string, talosConfig []byte) (string, error)
+	bootIDAuthenticated func(ctx context.Context, addrList []string, talosConfig []byte) (string, error)
 
 	// resetAdoptedHost is the upgrade-failure seam, injectable in tests. It
 	// wipes an adopted host to maintenance so a failed-upgrade node leaves the
@@ -194,14 +194,14 @@ type ByotMachineReconciler struct {
 
 	// applyMachineConfig is the adoption seam, injectable in tests. It
 	// applies the bootstrap config to the host.
-	applyMachineConfig func(ctx context.Context, publicIP string, machineConfig []byte, talosConfig []byte) error
+	applyMachineConfig func(ctx context.Context, addrList []string, machineConfig []byte, talosConfig []byte) error
 
 	// join-preflight seams, injectable in tests; default to the real helpers.
 	// See preflightJoin / preflightForeignMachine. A maintenance-mode host is
 	// adopted over the unauthenticated client; a bundle-matching host over the
 	// cluster talosconfig.
-	probeMaintenance   func(ctx context.Context, publicIP string) bool
-	probeAuthenticated func(ctx context.Context, publicIP string, talosConfig []byte) bool
+	probeMaintenance   func(ctx context.Context, addrList []string) bool
+	probeAuthenticated func(ctx context.Context, addrList []string, talosConfig []byte) bool
 }
 
 // NewByotMachineReconciler creates a new ByotMachineReconciler.
@@ -224,6 +224,43 @@ func NewByotMachineReconciler(client ctrlclient.Client) *ByotMachineReconciler {
 	}
 
 	return reconciler
+}
+
+// machineEndpoints builds the list of machine addresses to pass as Talos
+// client endpoints, matching cabpt's talosconfigForMachines which passes all
+// machine addresses (external + internal). The Talos gRPC client
+// round-robins across endpoints, so a NAT'd host reachable via its internal
+// IP but not its public IP still connects. Addresses without a port get
+// :50000 appended by the Talos client resolver. Returns at least the public
+// IP; the internal IP is prepended when discovered.
+func machineEndpoints(byotMachine *infrav1.ByotMachine) []string {
+	var addrList []string
+
+	if byotMachine.Status.ResolvedInternalIP != "" {
+		addrList = append(addrList, byotMachine.Status.ResolvedInternalIP)
+	}
+
+	if byotMachine.Status.ResolvedPublicIP != "" {
+		addrList = append(addrList, byotMachine.Status.ResolvedPublicIP)
+	}
+
+	return addrList
+}
+
+// hostEndpoints builds the list of addresses for a ByotHost, using the
+// spec public IP and the discovered internal IP (when available).
+func hostEndpoints(host *infrav1.ByotHost) []string {
+	var addrList []string
+
+	if hostInternal := hostInternalIP(host); hostInternal != "" {
+		addrList = append(addrList, hostInternal)
+	}
+
+	if host.Spec.PublicIP != "" {
+		addrList = append(addrList, host.Spec.PublicIP)
+	}
+
+	return addrList
 }
 
 // SetClusterCache wires the ClusterCache and derives the workload-client
@@ -423,9 +460,9 @@ func (r *ByotMachineReconciler) preflightJoin(
 	machine *clusterv1.Machine,
 	byotMachine *infrav1.ByotMachine,
 ) ([]byte, bool, *ctrl.Result, error) {
-	publicIP := byotMachine.Status.ResolvedPublicIP
+	addrList := machineEndpoints(byotMachine)
 
-	if r.probeMaintenance(ctx, publicIP) {
+	if r.probeMaintenance(ctx, addrList) {
 		conditions.Set(byotMachine, &clusterv1.Condition{
 			Type:   JoinPreflightCondition,
 			Status: corev1.ConditionTrue,
@@ -447,7 +484,7 @@ func (r *ByotMachineReconciler) preflightJoin(
 		return nil, false, nil, err
 	}
 
-	if r.probeAuthenticated(ctx, publicIP, talosConfig) {
+	if r.probeAuthenticated(ctx, addrList, talosConfig) {
 		conditions.Set(byotMachine, &clusterv1.Condition{
 			Type:   JoinPreflightCondition,
 			Status: corev1.ConditionTrue,
@@ -657,7 +694,7 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 	machine *clusterv1.Machine,
 	desired string,
 ) (ctrl.Result, bool, error) {
-	publicIP := byotMachine.Status.ResolvedPublicIP
+	addrList := machineEndpoints(byotMachine)
 
 	talosConfig, result, err := r.awaitClusterTalosConfig(ctx, machine.Spec.ClusterName, byotMachine)
 	if err != nil {
@@ -668,7 +705,7 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 		return *result, true, nil
 	}
 
-	tag, err := r.versionProbeAuthenticated(ctx, publicIP, talosConfig)
+	tag, err := r.versionProbeAuthenticated(ctx, addrList, talosConfig)
 	if err != nil {
 		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine,
 			versionProbeThreshold, "VersionProbeFailed", err, false)
@@ -695,7 +732,7 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine before upgrade: %w", err)
 	}
 
-	bootID, err := r.upgradeMachine(ctx, publicIP, talosConfig, desired)
+	bootID, err := r.upgradeMachine(ctx, addrList, talosConfig, desired)
 	if err != nil {
 		return r.finalizeUpgradeFailure(ctx, patchHelper, byotMachine, "UpgradeFailed", err)
 	}
@@ -711,7 +748,7 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 	}
 
 	log.FromContext(ctx).Info("Talos upgrade issued",
-		"byotMachine", byotMachine.Name, "publicIP", publicIP, "desired", desired)
+		"byotMachine", byotMachine.Name, "addresses", addrList, "desired", desired)
 
 	return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
 }
@@ -787,7 +824,7 @@ func (r *ByotMachineReconciler) resetAdoptedHostImpl(ctx context.Context, byotMa
 		return err
 	}
 
-	return attemptReset(ctx, candidates, byotMachine.Status.ResolvedPublicIP)
+	return attemptReset(ctx, candidates, machineEndpoints(byotMachine))
 }
 
 // upgradeInFlight polls for upgrade completion: the host rebooted into the
@@ -804,7 +841,7 @@ func (r *ByotMachineReconciler) upgradeInFlight(
 	byotMachine *infrav1.ByotMachine,
 	machine *clusterv1.Machine,
 ) (ctrl.Result, bool, error) {
-	publicIP := byotMachine.Status.ResolvedPublicIP
+	addrList := machineEndpoints(byotMachine)
 
 	talosConfig, result, err := r.awaitClusterTalosConfig(ctx, machine.Spec.ClusterName, byotMachine)
 	if err != nil {
@@ -817,12 +854,12 @@ func (r *ByotMachineReconciler) upgradeInFlight(
 
 	preRebootBootID := byotMachine.Status.UpgradePreRebootBootID
 	if preRebootBootID != "" {
-		return r.upgradeInFlightBootIDGate(ctx, patchHelper, byotMachine, publicIP, talosConfig, preRebootBootID)
+		return r.upgradeInFlightBootIDGate(ctx, patchHelper, byotMachine, addrList, talosConfig, preRebootBootID)
 	}
 
 	// Empty pre-reboot boot-id (capture failed / permission denied at issue
 	// time): use the reachability + version-change fallback.
-	return r.upgradeInFlightVersionFallback(ctx, patchHelper, byotMachine, publicIP, talosConfig)
+	return r.upgradeInFlightVersionFallback(ctx, patchHelper, byotMachine, addrList, talosConfig)
 }
 
 // upgradeInFlightBootIDGate drives the InFlight poll when a pre-reboot boot-id
@@ -832,11 +869,11 @@ func (r *ByotMachineReconciler) upgradeInFlightBootIDGate(
 	ctx context.Context,
 	patchHelper *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
-	publicIP string,
+	addrList []string,
 	talosConfig []byte,
 	preRebootBootID string,
 ) (ctrl.Result, bool, error) {
-	liveBootID, bootErr := r.bootIDAuthenticated(ctx, publicIP, talosConfig)
+	liveBootID, bootErr := r.bootIDAuthenticated(ctx, addrList, talosConfig)
 	if bootErr != nil && !errors.Is(bootErr, errBootIDUnauthorized) {
 		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, upgradeThreshold, "UpgradeFailed", bootErr, true)
 	}
@@ -844,7 +881,7 @@ func (r *ByotMachineReconciler) upgradeInFlightBootIDGate(
 	// Permission-denied on the live read: degrade to the version-change
 	// fallback (same as an empty pre-reboot boot-id).
 	if errors.Is(bootErr, errBootIDUnauthorized) {
-		return r.upgradeInFlightVersionFallback(ctx, patchHelper, byotMachine, publicIP, talosConfig)
+		return r.upgradeInFlightVersionFallback(ctx, patchHelper, byotMachine, addrList, talosConfig)
 	}
 
 	if liveBootID != "" && liveBootID != preRebootBootID {
@@ -854,7 +891,7 @@ func (r *ByotMachineReconciler) upgradeInFlightBootIDGate(
 		// otherwise complete leaving CurrentTalosVersion at the pre-upgrade
 		// tag. Best-effort: a probe failure does not block completion (install
 		// already succeeded); CurrentTalosVersion stays at its last value.
-		tag, err := r.versionProbeAuthenticated(ctx, publicIP, talosConfig)
+		tag, err := r.versionProbeAuthenticated(ctx, addrList, talosConfig)
 		if err == nil && tag != "" {
 			byotMachine.Status.CurrentTalosVersion = tag
 		}
@@ -879,12 +916,12 @@ func (r *ByotMachineReconciler) upgradeInFlightVersionFallback(
 	ctx context.Context,
 	patchHelper *patch.Helper,
 	byotMachine *infrav1.ByotMachine,
-	publicIP string,
+	addrList []string,
 	talosConfig []byte,
 ) (ctrl.Result, bool, error) {
 	preUpgradeTag := byotMachine.Status.CurrentTalosVersion
 
-	tag, probeErr := r.versionProbeAuthenticated(ctx, publicIP, talosConfig)
+	tag, probeErr := r.versionProbeAuthenticated(ctx, addrList, talosConfig)
 	if probeErr != nil {
 		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, upgradeThreshold, "UpgradeFailed", probeErr, true)
 	}
@@ -1048,7 +1085,7 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
 
-	err = r.applyMachineConfig(ctx, byotMachine.Status.ResolvedPublicIP, machineConfig, talosConfig)
+	err = r.applyMachineConfig(ctx, machineEndpoints(byotMachine), machineConfig, talosConfig)
 	if err != nil {
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
@@ -1103,10 +1140,10 @@ func resolveInstallDisk(
 	if byotMachine.Spec.InstallDisk != nil && *byotMachine.Spec.InstallDisk != "" {
 		installDisk = *byotMachine.Spec.InstallDisk
 	} else {
-		detected, diskErr := detectSystemDisk(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig)
+		detected, diskErr := detectSystemDisk(ctx, machineEndpoints(byotMachine), talosConfig)
 		if diskErr != nil {
 			logger.Info("could not detect system disk; applying config without machine.install.disk",
-				"byotMachine", byotMachine.Name, "publicIP", byotMachine.Status.ResolvedPublicIP, "error", diskErr)
+				"byotMachine", byotMachine.Name, "addresses", machineEndpoints(byotMachine), "error", diskErr)
 		} else {
 			installDisk = detected
 		}
@@ -1330,8 +1367,8 @@ func nudgeKubeletAfterReadopt(
 	talosConfig []byte,
 	bundleMatch bool,
 	wasReady bool,
-	running func(context.Context, string, []byte, string) (bool, error),
-	restart func(context.Context, string, []byte, string) error,
+	running func(context.Context, []string, []byte, string) (bool, error),
+	restart func(context.Context, []string, []byte, string) error,
 ) {
 	logger := log.FromContext(ctx)
 
@@ -1339,14 +1376,16 @@ func nudgeKubeletAfterReadopt(
 		return
 	}
 
+	addrList := machineEndpoints(byotMachine)
+
 	// Only restart a kubelet that is already Running.
-	isRunning, err := running(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig, kubeletServiceID)
+	isRunning, err := running(ctx, addrList, talosConfig, kubeletServiceID)
 	if err != nil {
 		// A probe failure is non-fatal: the kubelet registers on boot
 		// regardless. Record nothing to avoid a spurious condition.
 		logger.Info("Skipping kubelet restart nudge; service probe failed (non-fatal)",
 			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Status.ResolvedPublicIP,
+			"addresses", addrList,
 			"error", err.Error())
 
 		return
@@ -1355,12 +1394,12 @@ func nudgeKubeletAfterReadopt(
 	if !isRunning {
 		logger.Info("Skipping kubelet restart nudge; kubelet not yet running (will register on boot)",
 			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Status.ResolvedPublicIP)
+			"addresses", addrList)
 
 		return
 	}
 
-	err = restart(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig, kubeletServiceID)
+	err = restart(ctx, addrList, talosConfig, kubeletServiceID)
 	if err != nil {
 		conditions.MarkFalse(
 			byotMachine,
@@ -1373,7 +1412,7 @@ func nudgeKubeletAfterReadopt(
 
 		logger.Info("Kubelet restart nudge failed (non-fatal); kubelet registers on boot",
 			"byotMachine", byotMachine.Name,
-			"publicIP", byotMachine.Status.ResolvedPublicIP,
+			"addresses", addrList,
 			"error", err.Error())
 
 		return
@@ -1383,7 +1422,7 @@ func nudgeKubeletAfterReadopt(
 
 	logger.Info("Kubelet restarted after re-adoption",
 		"byotMachine", byotMachine.Name,
-		"publicIP", byotMachine.Status.ResolvedPublicIP)
+		"addresses", addrList)
 }
 
 // reconcileDelete releases the claimed ByotHost. Release always resets the
@@ -1434,11 +1473,11 @@ func (r *ByotMachineReconciler) reconcileDelete(
 
 // attemptReset tries each credential candidate (a nil candidate selects the
 // insecure maintenance client) and returns the last error if all fail.
-func attemptReset(ctx context.Context, candidates [][]byte, publicIP string) error {
+func attemptReset(ctx context.Context, candidates [][]byte, addrList []string) error {
 	var lastErr error
 
 	for _, candidate := range candidates {
-		err := resetMachine(ctx, publicIP, candidate)
+		err := resetMachine(ctx, addrList, candidate)
 		if err == nil {
 			return nil
 		}
@@ -1447,10 +1486,10 @@ func attemptReset(ctx context.Context, candidates [][]byte, publicIP string) err
 	}
 
 	if lastErr != nil {
-		return fmt.Errorf("failed to reset machine %s with any available credentials: %w", publicIP, lastErr)
+		return fmt.Errorf("failed to reset machine %v with any available credentials: %w", addrList, lastErr)
 	}
 
-	return fmt.Errorf("%w: %s", ErrNoResetCredentials, publicIP)
+	return fmt.Errorf("%w: %v", ErrNoResetCredentials, addrList)
 }
 
 // resetCredentialCandidates returns talosconfig candidates for the reset, in
@@ -1659,7 +1698,7 @@ func (r *ByotMachineReconciler) preflightForeignMachine(
 		return nil, nil, err
 	}
 
-	if r.probeAuthenticated(ctx, byotMachine.Status.ResolvedPublicIP, talosConfig) {
+	if r.probeAuthenticated(ctx, machineEndpoints(byotMachine), talosConfig) {
 		return nil, nil, r.recordPreflightFailure(ctx, patchHelper, byotMachine, "BundleMismatch", ErrJoinBundleMismatch)
 	}
 
