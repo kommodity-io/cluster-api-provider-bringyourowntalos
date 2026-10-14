@@ -24,9 +24,10 @@ var ErrNoHostAvailable = errors.New("no available ByotHost matches the claim cri
 
 // claimHost ensures the ByotMachine has claimed an Available ByotHost. It is
 // idempotent: a ByotMachine that already holds a host keeps it. On a successful
-// claim it sets status.resolvedHost and status.resolvedPublicIP. handled is
-// true when the caller must return the given result (requeue waiting for a
-// host, or a CAS conflict) instead of proceeding to adoption.
+// claim it sets status.resolvedHost, status.resolvedPublicIP, and
+// status.resolvedInternalIP. handled is true when the caller must return
+// the given result (requeue waiting for a host, or a CAS conflict)
+// instead of proceeding to adoption.
 func (r *ByotMachineReconciler) claimHost(
 	ctx context.Context,
 	byotMachine *infrav1.ByotMachine,
@@ -65,6 +66,7 @@ func (r *ByotMachineReconciler) claimHost(
 
 	byotMachine.Status.ResolvedHost = host.Name
 	byotMachine.Status.ResolvedPublicIP = host.Spec.PublicIP
+	byotMachine.Status.ResolvedInternalIP = hostInternalIP(host)
 
 	err = patchHelper.Patch(ctx, byotMachine)
 	if err != nil {
@@ -139,6 +141,7 @@ func (r *ByotMachineReconciler) clearResolvedHost(
 ) error {
 	byotMachine.Status.ResolvedHost = ""
 	byotMachine.Status.ResolvedPublicIP = ""
+	byotMachine.Status.ResolvedInternalIP = ""
 
 	err := patchHelper.Patch(ctx, byotMachine)
 	if err != nil {
@@ -146,6 +149,16 @@ func (r *ByotMachineReconciler) clearResolvedHost(
 	}
 
 	return nil
+}
+
+// hostInternalIP returns the discovered internal IP from the host's hardware
+// status, or empty when discovery hasn't run or found no private IPv4.
+func hostInternalIP(host *infrav1.ByotHost) string {
+	if host.Status.Hardware == nil {
+		return ""
+	}
+
+	return host.Status.Hardware.InternalIP
 }
 
 // resolveClaimCandidate picks the ByotHost to claim: the host named by

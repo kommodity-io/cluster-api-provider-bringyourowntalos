@@ -422,6 +422,8 @@ func (r *ByotHostReconciler) populateFromDiscovery(host *infrav1.ByotHost, resul
 		Memory:            result.Memory,
 		Disks:             result.Disks,
 		NetworkInterfaces: result.NetworkInterfaces,
+		ExternalIP:        result.ExternalIP,
+		InternalIP:        result.InternalIP,
 		GPUs:              result.GPUs,
 	}
 	host.Status.LastProbedAt = nowPtr()

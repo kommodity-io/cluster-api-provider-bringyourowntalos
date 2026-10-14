@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -863,4 +864,164 @@ func TestDiskToHostDiskBareSdaName(t *testing.T) {
 	assert.Equal(t, "/dev/sda", hostDisk.Name)
 	assert.True(t, hostDisk.SystemDisk)
 	assert.Equal(t, "HDD", hostDisk.Type)
+}
+
+// makeTestAddressStatus creates an AddressStatus resource in the given COSI state.
+func makeTestAddressStatus(
+	t *testing.T,
+	cosi state.CoreState,
+	identifier string,
+	addr netip.Prefix,
+	linkName string,
+	family nethelpers.Family,
+	scope nethelpers.Scope,
+) {
+	t.Helper()
+
+	a := network.NewAddressStatus(network.NamespaceName, identifier)
+	a.TypedSpec().Address = addr
+	a.TypedSpec().LinkName = linkName
+	a.TypedSpec().Family = family
+	a.TypedSpec().Scope = scope
+	require.NoError(t, cosi.Create(t.Context(), a))
+}
+
+func TestDiscoverAddressesClassifiesExternalAndInternal(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	// External: 78.232.4.134 on eth0 (scope global, inet4)
+	makeTestAddressStatus(t, cosi, "eth0/78.232.4.134/32",
+		netip.MustParsePrefix("78.232.4.134/32"), "eth0",
+		nethelpers.FamilyInet4, nethelpers.ScopeGlobal)
+
+	// Internal: 172.16.16.2 on eth1 (scope global, inet4)
+	makeTestAddressStatus(t, cosi, "eth1/172.16.16.2/22",
+		netip.MustParsePrefix("172.16.16.2/22"), "eth1",
+		nethelpers.FamilyInet4, nethelpers.ScopeGlobal)
+
+	// Loopback: must be skipped
+	makeTestAddressStatus(t, cosi, "lo/127.0.0.1/8",
+		netip.MustParsePrefix("127.0.0.1/8"), "lo",
+		nethelpers.FamilyInet4, nethelpers.ScopeHost)
+
+	// Link-local IPv6: must be skipped (not inet4)
+	makeTestAddressStatus(t, cosi, "eth0/fe80::1/64",
+		netip.MustParsePrefix("fe80::1/64"), "eth0",
+		nethelpers.FamilyInet6, nethelpers.ScopeLink)
+
+	result := DiscoveryResult{}
+	discoverAddresses(t.Context(), cosi, "78.232.4.134", &result)
+
+	assert.Equal(t, "78.232.4.134", result.ExternalIP)
+	assert.Equal(t, "172.16.16.2", result.InternalIP)
+}
+
+func TestDiscoverAddressesExternalNotOnInterface(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	// NAT'd host: public IP 78.232.4.134 not bound to any interface.
+	makeTestAddressStatus(t, cosi, "eth0/10.0.0.5/24",
+		netip.MustParsePrefix("10.0.0.5/24"), "eth0",
+		nethelpers.FamilyInet4, nethelpers.ScopeGlobal)
+
+	result := DiscoveryResult{}
+	discoverAddresses(t.Context(), cosi, "78.232.4.134", &result)
+
+	assert.Empty(t, result.ExternalIP, "public IP not on interface")
+	assert.Equal(t, "10.0.0.5", result.InternalIP)
+}
+
+func TestDiscoverAddressesNoInternalIP(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	// Public-only host: external on interface, no RFC1918 address.
+	makeTestAddressStatus(t, cosi, "eth0/203.0.113.5/24",
+		netip.MustParsePrefix("203.0.113.5/24"), "eth0",
+		nethelpers.FamilyInet4, nethelpers.ScopeGlobal)
+
+	result := DiscoveryResult{}
+	discoverAddresses(t.Context(), cosi, "203.0.113.5", &result)
+
+	assert.Equal(t, "203.0.113.5", result.ExternalIP)
+	assert.Empty(t, result.InternalIP, "no RFC1918 address")
+}
+
+func TestDiscoverAddressesSkipsLinkLocalScope(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	// Link-local scope IPv4 must be skipped.
+	makeTestAddressStatus(t, cosi, "eth0/169.254.1.1/16",
+		netip.MustParsePrefix("169.254.1.1/16"), "eth0",
+		nethelpers.FamilyInet4, nethelpers.ScopeLink)
+
+	result := DiscoveryResult{}
+	discoverAddresses(t.Context(), cosi, "78.232.4.134", &result)
+
+	assert.Empty(t, result.ExternalIP)
+	assert.Empty(t, result.InternalIP)
+}
+
+func TestDiscoverAddressesEmptyCOSI(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	result := DiscoveryResult{}
+	discoverAddresses(t.Context(), cosi, "78.232.4.134", &result)
+
+	assert.Empty(t, result.ExternalIP)
+	assert.Empty(t, result.InternalIP)
+}
+
+func TestDiscoverAddressesFirstRFC1918Wins(t *testing.T) {
+	t.Parallel()
+
+	cosi := newTestCOSI()
+
+	// External on eth0
+	makeTestAddressStatus(t, cosi, "eth0/78.232.4.134/32",
+		netip.MustParsePrefix("78.232.4.134/32"), "eth0",
+		nethelpers.FamilyInet4, nethelpers.ScopeGlobal)
+
+	// Two private addresses; first one seen by COSI iteration wins (order
+	// is deterministic in inmem state).
+	makeTestAddressStatus(t, cosi, "eth1/172.16.16.2/22",
+		netip.MustParsePrefix("172.16.16.2/22"), "eth1",
+		nethelpers.FamilyInet4, nethelpers.ScopeGlobal)
+	makeTestAddressStatus(t, cosi, "eth2/10.0.0.5/24",
+		netip.MustParsePrefix("10.0.0.5/24"), "eth2",
+		nethelpers.FamilyInet4, nethelpers.ScopeGlobal)
+
+	result := DiscoveryResult{}
+	discoverAddresses(t.Context(), cosi, "78.232.4.134", &result)
+
+	assert.Equal(t, "78.232.4.134", result.ExternalIP)
+	// Either private IP is valid; just verify it's one of them.
+	assert.Contains(t, []string{"172.16.16.2", "10.0.0.5"}, result.InternalIP)
+}
+
+func TestPopulateFromDiscoveryCopiesIPs(t *testing.T) {
+	t.Parallel()
+
+	reconciler := &ByotHostReconciler{}
+	host := &infrav1.ByotHost{ObjectMeta: metav1.ObjectMeta{Name: "h"}}
+	result := DiscoveryResult{
+		TalosVersion: "v1.13.8",
+		ExternalIP:   "78.232.4.134",
+		InternalIP:   "172.16.16.2",
+	}
+
+	reconciler.populateFromDiscovery(host, result)
+
+	require.NotNil(t, host.Status.Hardware)
+	assert.Equal(t, "78.232.4.134", host.Status.Hardware.ExternalIP)
+	assert.Equal(t, "172.16.16.2", host.Status.Hardware.InternalIP)
 }

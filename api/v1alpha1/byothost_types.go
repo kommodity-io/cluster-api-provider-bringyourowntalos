@@ -125,6 +125,15 @@ type HostHardware struct {
 	// machine identity is in status.identity.hardwareAddr.
 	// +optional
 	NetworkInterfaces []string `json:"networkInterfaces,omitempty"`
+	// ExternalIP is the discovered IPv4 address matching spec.publicIP (the
+	// operator-provided adoption target). Empty when the public IP is not
+	// bound to any interface (e.g. NAT without the public IP on the host).
+	// +optional
+	ExternalIP string `json:"externalIP,omitempty"`
+	// InternalIP is the first discovered RFC1918 IPv4 address that is not
+	// the external IP. Empty when no private IPv4 address is found.
+	// +optional
+	InternalIP string `json:"internalIP,omitempty"`
 	// GPUs is the discovered GPU summary (count, vendor, model, memory).
 	// Nil when no GPU is present. Mixed models collapse to count+vendor only.
 	// +optional
