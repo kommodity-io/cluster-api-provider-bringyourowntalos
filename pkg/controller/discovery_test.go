@@ -870,7 +870,7 @@ func TestDiskToHostDiskBareSdaName(t *testing.T) {
 func makeTestAddressStatus(
 	t *testing.T,
 	cosi state.CoreState,
-	id string,
+	identifier string,
 	addr netip.Prefix,
 	linkName string,
 	family nethelpers.Family,
@@ -878,7 +878,7 @@ func makeTestAddressStatus(
 ) {
 	t.Helper()
 
-	a := network.NewAddressStatus(network.NamespaceName, id)
+	a := network.NewAddressStatus(network.NamespaceName, identifier)
 	a.TypedSpec().Address = addr
 	a.TypedSpec().LinkName = linkName
 	a.TypedSpec().Family = family
