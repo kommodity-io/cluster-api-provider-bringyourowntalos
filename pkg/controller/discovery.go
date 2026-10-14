@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
 	"sort"
 	"strconv"
@@ -56,14 +57,17 @@ type DiscoveryResult struct {
 	Memory            resource.Quantity
 	Disks             []infrav1.HostDisk
 	NetworkInterfaces []string
+	ExternalIP        string
+	InternalIP        string
 	GPUs              *infrav1.HostGPU
 	Identity          *infrav1.HostIdentity
 }
 
 // discoverHost runs the maintenance-mode discovery surface against publicIP:
 // Version, Memory, Disks, CPU + GPU (COSI hardware resources), Platform
-// (COSI KernelCmdline), NUMA (LS /sys/devices/system/node), and LS
-// /sys/class/net. It reuses the insecure maintenance client.
+// (COSI KernelCmdline), NUMA (LS /sys/devices/system/node), LS
+// /sys/class/net, and IP addresses (COSI AddressStatus, classified against
+// publicIP). It reuses the insecure maintenance client.
 func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error) {
 	client, err := maintenanceClient(ctx, publicIP)
 	if err != nil {
@@ -102,6 +106,8 @@ func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error)
 	if err != nil {
 		return result, fmt.Errorf("net discovery: %w", err)
 	}
+
+	discoverAddresses(ctx, client.COSI, publicIP, &result)
 
 	// Identity is best-effort: a host without SMBIOS UUID and without a
 	// physical NIC still completes discovery, just with an empty Identity.
@@ -542,6 +548,67 @@ func discoverNetInterfaces(
 	result.NetworkInterfaces = ifaces
 
 	return nil
+}
+
+// discoverAddresses populates ExternalIP and InternalIP from Talos COSI
+// AddressStatus resources. ExternalIP is the IPv4 address matching publicIP;
+// InternalIP is the first RFC1918 IPv4 address that is not the external IP.
+// Loopback and link-local addresses are skipped. Best-effort: a COSI error
+// is logged and both fields are left empty.
+func discoverAddresses(
+	ctx context.Context,
+	cosi state.CoreState,
+	publicIP string,
+	result *DiscoveryResult,
+) {
+	addrs, err := safe.StateList[*network.AddressStatus](ctx, cosi, cosiresource.NewMetadata(
+		network.NamespaceName, network.AddressStatusType, "", cosiresource.VersionUndefined))
+	if err != nil {
+		log.FromContext(ctx).Error(err, "listing AddressStatus resources from COSI")
+
+		return
+	}
+
+	for addr := range addrs.All() {
+		spec := addr.TypedSpec()
+
+		// IPv4 only.
+		if spec.Family != nethelpers.FamilyInet4 {
+			continue
+		}
+
+		// Skip loopback and link-local scopes.
+		if spec.Scope == nethelpers.ScopeLink || spec.LinkName == "lo" {
+			continue
+		}
+
+		ipStr := spec.Address.Addr().String()
+		if ipStr == "" {
+			continue
+		}
+
+		if ipStr == publicIP {
+			result.ExternalIP = ipStr
+
+			continue
+		}
+
+		// First RFC1918 address wins as internal IP.
+		if result.InternalIP == "" && isRFC1918(ipStr) {
+			result.InternalIP = ipStr
+		}
+	}
+}
+
+// isRFC1918 reports whether ipStr is a private IPv4 address (10/8, 172.16/12,
+// 192.168/16).
+func isRFC1918(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+
+	return ip.IsPrivate()
 }
 
 // discoverIdentity fetches the reboot-stable hardware identity of the host:

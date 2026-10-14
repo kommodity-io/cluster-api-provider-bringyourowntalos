@@ -2164,3 +2164,30 @@ func TestReconcileAdoptedUpgradesBeforeLinking(t *testing.T) {
 	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
 	assert.Equal(t, infrav1.ProviderIDPrefix+testHostPublicIP, patched.Spec.ProviderID)
 }
+
+func TestMarkAdoptedSetsExternalAndInternalIP(t *testing.T) {
+	t.Parallel()
+
+	machine := newByotMachine(testHostPublicIP)
+	machine.Status.ResolvedInternalIP = "172.16.16.2"
+
+	markAdopted(machine, "abc123")
+
+	require.Len(t, machine.Status.Addresses, 2)
+	assert.Equal(t, clusterv1.MachineExternalIP, machine.Status.Addresses[0].Type)
+	assert.Equal(t, testHostPublicIP, machine.Status.Addresses[0].Address)
+	assert.Equal(t, clusterv1.MachineInternalIP, machine.Status.Addresses[1].Type)
+	assert.Equal(t, "172.16.16.2", machine.Status.Addresses[1].Address)
+}
+
+func TestMarkAdoptedOmitsInternalIPWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	machine := newByotMachine(testHostPublicIP)
+
+	markAdopted(machine, "abc123")
+
+	require.Len(t, machine.Status.Addresses, 1)
+	assert.Equal(t, clusterv1.MachineExternalIP, machine.Status.Addresses[0].Type)
+	assert.Equal(t, testHostPublicIP, machine.Status.Addresses[0].Address)
+}

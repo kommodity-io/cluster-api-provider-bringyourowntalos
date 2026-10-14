@@ -1555,12 +1555,21 @@ func markAdopted(byotMachine *infrav1.ByotMachine, configHash string) {
 	byotMachine.Spec.ProviderID = &providerID
 	byotMachine.Status.Ready = true
 	byotMachine.Status.LastAppliedConfigSHA = configHash
-	byotMachine.Status.Addresses = []clusterv1.MachineAddress{
+	addresses := []clusterv1.MachineAddress{
 		{
 			Type:    clusterv1.MachineExternalIP,
 			Address: byotMachine.Status.ResolvedPublicIP,
 		},
 	}
+
+	if byotMachine.Status.ResolvedInternalIP != "" {
+		addresses = append(addresses, clusterv1.MachineAddress{
+			Type:    clusterv1.MachineInternalIP,
+			Address: byotMachine.Status.ResolvedInternalIP,
+		})
+	}
+
+	byotMachine.Status.Addresses = addresses
 
 	conditions.MarkTrue(byotMachine, MachineAdoptedCondition)
 }
