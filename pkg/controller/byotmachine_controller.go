@@ -180,7 +180,8 @@ type ByotMachineReconciler struct {
 	// the cluster talosconfig (an adopted host no longer answers the
 	// maintenance client).
 	versionProbeAuthenticated func(ctx context.Context, addrList []string, talosConfig []byte) (string, error)
-	upgradeMachine            func(ctx context.Context, addrList []string, talosConfig []byte, image string) (string, error)
+	upgradeMachine            func(ctx context.Context,
+		addrList []string, talosConfig []byte, image string) (string, error)
 
 	// bootIDAuthenticated is the InFlight completion-gate seam, injectable in
 	// tests. Returns the live boot-id or errBootIDUnauthorized when the
