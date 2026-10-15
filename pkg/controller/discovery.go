@@ -63,14 +63,9 @@ type DiscoveryResult struct {
 	Identity          *infrav1.HostIdentity
 }
 
-// discoverHost runs the maintenance-mode discovery surface against the
-// given endpoints: Version, Memory, Disks, CPU + GPU (COSI hardware
-// resources), Platform (COSI KernelCmdline), NUMA (LS /sys/devices/system/
-// node), LS /sys/class/net, and IP addresses (COSI AddressStatus, classified
-// against publicIP). It reuses the insecure maintenance client. All
-// endpoints are passed to the client so the gRPC round-robin can reach the
-// node via any address; publicIP is used only to classify which discovered
-// address is external.
+// discoverHost runs maintenance-mode discovery (Version, Memory, Disks,
+// CPU, GPU, Platform, NUMA, NICs, IPs) over all endpoints via the insecure
+// client. publicIP classifies which discovered address is external.
 func discoverHost(ctx context.Context, endpoints Endpoints, publicIP string) (DiscoveryResult, error) {
 	client, err := maintenanceClient(ctx, endpoints)
 	if err != nil {

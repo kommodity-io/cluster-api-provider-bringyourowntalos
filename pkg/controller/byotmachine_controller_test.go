@@ -39,6 +39,9 @@ const (
 
 	// testHostPublicIP is the example address used for resolved hosts in tests.
 	testHostPublicIP = "203.0.113.10"
+
+	// testHostInternalIP is the example RFC1918 address for resolved hosts.
+	testHostInternalIP = "10.0.0.5"
 )
 
 func clusterKey(obj metav1.Object) types.NamespacedName {
@@ -1016,7 +1019,9 @@ func workloadClientBuilder(t *testing.T) *fake.ClientBuilder {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 
-	return fake.NewClientBuilder().WithScheme(scheme)
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Node{})
 }
 
 func TestUpdateNodeProviderIDPatchesNodeAndSetsFlag(t *testing.T) {
@@ -1304,6 +1309,253 @@ func TestUpdateNodeProviderIDReturnsErrorOnPatchFailure(t *testing.T) {
 	updated := &infrav1.ByotMachine{}
 	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
 	assert.False(t, updated.Status.NodeUpdated)
+}
+
+func TestUpdateNodeProviderIDPatchesAddressesWithInternalIP(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Status.ResolvedInternalIP = testHostInternalIP
+	machine := newOwningMachine("test-bootstrap")
+	node := newWorkloadNode(testMachineName, "")
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+	assertHasNodeAddress(t, patched, corev1.NodeInternalIP, testHostInternalIP)
+}
+
+func TestUpdateNodeProviderIDPatchesExternalIPPreservingInternalIP(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Status.ResolvedInternalIP = testHostInternalIP
+	machine := newOwningMachine("test-bootstrap")
+
+	node := newWorkloadNode(testMachineName, "")
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: testHostInternalIP},
+		{Type: corev1.NodeHostName, Address: "test-machine"},
+	}
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+	assertHasNodeAddress(t, patched, corev1.NodeInternalIP, testHostInternalIP)
+	assertHasNodeAddress(t, patched, corev1.NodeHostName, "test-machine")
+}
+
+func TestUpdateNodeProviderIDPatchesAddressesWhenProviderIDSet(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	machine := newOwningMachine("test-bootstrap")
+
+	// providerID already set by a prior run, but addresses missing.
+	node := newWorkloadNode(testMachineName, infrav1.ProviderIDPrefix+"203.0.113.10")
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+}
+
+func TestUpdateNodeProviderIDNoopWhenProviderIDAndAddressesSet(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Status.ResolvedInternalIP = testHostInternalIP
+	machine := newOwningMachine("test-bootstrap")
+
+	node := newWorkloadNode(testMachineName, infrav1.ProviderIDPrefix+"203.0.113.10")
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+		{Type: corev1.NodeInternalIP, Address: testHostInternalIP},
+	}
+
+	patchCalls := 0
+	workload := workloadClientBuilder(t).WithObjects(node).
+		WithInterceptorFuncs(patchCountInterceptor(&patchCalls)).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Zero(t, patchCalls)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+}
+
+// TestUpdateNodeProviderIDPatchesOnlyExternalIPWhenNoInternalIP is the test
+// for case 9: resolvedInternalIP empty (no RFC1918 discovered) -> only
+// ExternalIP patched.
+func TestUpdateNodeProviderIDPatchesOnlyExternalIPWhenNoInternalIP(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	// ResolvedInternalIP intentionally left empty.
+	machine := newOwningMachine("test-bootstrap")
+	node := newWorkloadNode(testMachineName, "")
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+
+	for _, addr := range patched.Status.Addresses {
+		assert.NotEqual(t, corev1.NodeInternalIP, addr.Type,
+			"must not patch InternalIP when resolvedInternalIP is empty")
+	}
+}
+
+// assertHasNodeAddress asserts that a Node's status.addresses contains an
+// entry of the given type with the given address.
+func assertHasNodeAddress(
+	t *testing.T, node *corev1.Node, addrType corev1.NodeAddressType, address string,
+) {
+	t.Helper()
+
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == addrType && addr.Address == address {
+			return
+		}
+	}
+
+	t.Fatalf("Node %s missing address %s=%s; have %v",
+		node.Name, addrType, address, node.Status.Addresses)
+}
+
+// patchCountInterceptor returns interceptor.Funcs whose Patch and
+// SubResourcePatch both increment *calls, for asserting no patches issued.
+func patchCountInterceptor(calls *int) interceptor.Funcs {
+	return interceptor.Funcs{
+		Patch: func(
+			context.Context,
+			ctrlclient.WithWatch,
+			ctrlclient.Object,
+			ctrlclient.Patch,
+			...ctrlclient.PatchOption,
+		) error {
+			*calls++
+
+			return nil
+		},
+		SubResourcePatch: func(
+			_ context.Context,
+			_ ctrlclient.Client,
+			_ string,
+			_ ctrlclient.Object,
+			_ ctrlclient.Patch,
+			_ ...ctrlclient.SubResourcePatchOption,
+		) error {
+			*calls++
+
+			return nil
+		},
+	}
 }
 
 const (

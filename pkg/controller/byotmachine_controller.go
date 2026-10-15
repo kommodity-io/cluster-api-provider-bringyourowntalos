@@ -14,7 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
+
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util"
@@ -293,6 +293,8 @@ func (r *ByotMachineReconciler) SetupWithManager(
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines;machines/status,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=nodes/status,verbs=get;update;patch
 
 // Reconcile adopts the Talos machine referenced by the ByotMachine.
 func (r *ByotMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -1169,13 +1171,9 @@ func injectHostCertSANs(machineConfig []byte, endpoints Endpoints) ([]byte, erro
 	return injectClusterAPIServerCertSANs(config, endpoints)
 }
 
-// linkNode drives the Machine<->Node linkage for an adopted machine: first
-// patch the workload Node's providerID (byot has no CCM, so the controller
-// owns it), then retrigger the owning CAPI Machine's node-link reconciliation
-// until status.nodeRef is set. updateNodeProviderID runs once (gated by
-// status.nodeUpdated); ensureNodeLinked keeps retriggerring until the link
-// completes. A requeue from either step short-circuits the other, which is
-// fine since both re-run on the next reconcile.
+// linkNode patches the workload Node's providerID and addresses, then
+// retriggers CAPI's node-link until nodeRef is set. Both steps are gated
+// by status.nodeUpdated and re-run on requeue.
 func (r *ByotMachineReconciler) linkNode(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -1197,18 +1195,10 @@ func (r *ByotMachineReconciler) linkNode(
 // errWorkloadNodePending signals the workload Node is not registered yet;
 // the kubelet registers it on boot. updateNodeProviderID requeues on it.
 var errWorkloadNodePending = errors.New("workload node not registered")
-
-// updateNodeProviderID patches the workload cluster Node's spec.providerID to
-// byot://<resolvedPublicIP> so CAPI's Machine controller can link the Machine
-// to its Node. byot has no cloud-controller-manager, so unlike cloud providers
-// the controller owns the Machine<->Node providerID linkage: the kubelet
-// reports an empty providerID (the host-registry model resolves the IP at
-// claim time, so neither the chart nor CABPT can bake it into the config), so
-// CAPI's Machine.spec.providerID <-> Node.spec.providerID match never fires
-// and status.nodeRef is never set. Mirrors the kubevirt provider
-// (KubevirtMachineReconciler.updateNodeProviderID). Gated by
-// status.nodeUpdated so it runs once. When no ClusterCache is wired it is a
-// no-op and ensureNodeLinked's retrigger annotation is the fallback.
+// updateNodeProviderID patches Node spec.providerID and status.addresses
+// (ExternalIP always, InternalIP when missing) so CAPI can link the Machine
+// and downstream consumers can discover the external address. No CCM in byot,
+// so the controller owns both. Gated by status.nodeUpdated.
 func (r *ByotMachineReconciler) updateNodeProviderID(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -1259,51 +1249,136 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine after Node providerID update: %w", err)
 	}
 
-	log.FromContext(ctx).Info("Patched workload Node providerID",
+	log.FromContext(ctx).Info("Patched workload Node providerID and addresses",
 		"byotMachine", byotMachine.Name, "machine", machine.Name)
 
 	return ctrl.Result{}, nil
 }
 
-// patchWorkloadNode gets the workload Node named after the ByotMachine
-// (CABPT sets hostname.source=InfrastructureName, so the Node name equals
-// the infrastructureRef name == ByotMachine.Name) and patches its
-// spec.providerID when it does not already match. It returns alreadySet=true
-// when the Node already carries the providerID (a prior run), so the caller
-// marks status.nodeUpdated without a redundant patch. errWorkloadNodePending
-// means the Node is not registered yet.
+// patchWorkloadNode patches the Node's spec.providerID and status.addresses
+// via patch.NewHelper. The kubelet only advertises interface-bound IPs, so
+// NAT'd hosts need the controller to patch ExternalIP. Returns alreadySet
+// when no patch was needed.
 func (r *ByotMachineReconciler) patchWorkloadNode(
 	ctx context.Context,
 	workloadClient ctrlclient.Client,
 	byotMachine *infrav1.ByotMachine,
 	providerID string,
 ) (bool, error) {
-	node := &corev1.Node{}
-
-	err := workloadClient.Get(ctx, ctrlclient.ObjectKey{Name: byotMachine.Name}, node)
+	node, err := getWorkloadNode(ctx, workloadClient, byotMachine.Name)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, errWorkloadNodePending
-		}
-
-		return false, fmt.Errorf("failed to get workload Node %s: %w", byotMachine.Name, err)
+		return false, err
 	}
 
-	if node.Spec.ProviderID == providerID {
+	providerIDMismatch, externalIPMissing, internalIPMissing := needsNodePatch(
+		node, providerID, byotMachine.Status.ResolvedPublicIP, byotMachine.Status.ResolvedInternalIP)
+
+	// Both providerID and addresses already correct — no patch needed.
+	if !providerIDMismatch && !externalIPMissing && !internalIPMissing {
 		return true, nil
 	}
 
-	// Patch the Node providerID. Usually a cloud-controller-manager does
-	// this, but byot has no CCM.
-	patchBytes := fmt.Sprintf(`{"spec":{"providerID":%q}}`, providerID)
-	mergePatch := ctrlclient.RawPatch(types.MergePatchType, []byte(patchBytes))
-
-	err = workloadClient.Patch(ctx, node, mergePatch)
+	// Use patch.NewHelper so spec (providerID) and status (addresses) are
+	// patched in one call, routed to their respective subresources.
+	patchHelper, err := patch.NewHelper(node, workloadClient)
 	if err != nil {
-		return false, fmt.Errorf("failed to patch workload Node %s providerID: %w", byotMachine.Name, err)
+		return false, fmt.Errorf("failed to create patch helper for workload Node %s: %w", byotMachine.Name, err)
 	}
 
-	return false, nil
+	if providerIDMismatch {
+		// Patch the Node providerID. Usually a cloud-controller-manager does
+		// this, but byot has no CCM.
+		node.Spec.ProviderID = providerID
+	}
+
+	if externalIPMissing || internalIPMissing {
+		applyNodeAddresses(node, byotMachine, externalIPMissing, internalIPMissing)
+	}
+
+	err = patchHelper.Patch(ctx, node)
+	if err != nil {
+		return false, fmt.Errorf("failed to patch workload Node %s: %w", byotMachine.Name, err)
+	}
+
+	return !providerIDMismatch, nil
+}
+
+// getWorkloadNode fetches the workload Node named after the ByotMachine.
+// Returns errWorkloadNodePending when the Node is not registered yet.
+func getWorkloadNode(
+	ctx context.Context, workloadClient ctrlclient.Client, name string,
+) (*corev1.Node, error) {
+	node := &corev1.Node{}
+
+	err := workloadClient.Get(ctx, ctrlclient.ObjectKey{Name: name}, node)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, errWorkloadNodePending
+		}
+
+		return nil, fmt.Errorf("failed to get workload Node %s: %w", name, err)
+	}
+
+	return node, nil
+}
+// applyNodeAddresses upserts ExternalIP and InternalIP into the Node's
+// address list, preserving kubelet-managed entries of other types.
+func applyNodeAddresses(
+	node *corev1.Node,
+	byotMachine *infrav1.ByotMachine,
+	externalIPMissing, internalIPMissing bool,
+) {
+	if externalIPMissing {
+		node.Status.Addresses = upsertNodeAddress(
+			node.Status.Addresses, corev1.NodeExternalIP, byotMachine.Status.ResolvedPublicIP)
+	}
+
+	if internalIPMissing {
+		node.Status.Addresses = upsertNodeAddress(
+			node.Status.Addresses, corev1.NodeInternalIP, byotMachine.Status.ResolvedInternalIP)
+	}
+}
+
+// needsNodePatch reports which Node fields need patching: providerID
+// mismatch, missing ExternalIP, or missing InternalIP (false when
+// resolvedInternalIP is empty).
+func needsNodePatch(
+	node *corev1.Node,
+	providerID, resolvedPublicIP, resolvedInternalIP string,
+) (bool, bool, bool) {
+	mismatch := node.Spec.ProviderID != providerID
+	extMissing := !hasNodeAddress(node, corev1.NodeExternalIP, resolvedPublicIP)
+	intMissing := resolvedInternalIP != "" &&
+		!hasNodeAddress(node, corev1.NodeInternalIP, resolvedInternalIP)
+
+	return mismatch, extMissing, intMissing
+}
+
+// hasNodeAddress reports whether the Node already has the given address.
+func hasNodeAddress(node *corev1.Node, addrType corev1.NodeAddressType, address string) bool {
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == addrType && addr.Address == address {
+			return true
+		}
+	}
+
+	return false
+}
+
+// upsertNodeAddress adds or replaces the address of the given type,
+// preserving entries of other types.
+func upsertNodeAddress(
+	addrs []corev1.NodeAddress, addrType corev1.NodeAddressType, address string,
+) []corev1.NodeAddress {
+	for i := range addrs {
+		if addrs[i].Type == addrType {
+			addrs[i].Address = address
+
+			return addrs
+		}
+	}
+
+	return append(addrs, corev1.NodeAddress{Type: addrType, Address: address})
 }
 
 // ensureNodeLinked retriggers the owning CAPI Machine's node-link
