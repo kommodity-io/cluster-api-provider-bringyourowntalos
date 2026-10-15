@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"testing"
+	"time"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
@@ -432,4 +433,31 @@ func TestClaimHostInternalIPEmptyWhenNoHardware(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Empty(t, machine.Status.ResolvedInternalIP)
+}
+
+func TestClaimHostCustomRequeueAfterBootstrapFlowsThrough(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	machine := newClaimingByotMachine("no-such-host")
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(machine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	r := NewByotMachineReconciler(client)
+	custom := 42 * time.Second
+	r.RequeueAfterBootstrap = custom
+
+	patchHelper, err := patch.NewHelper(machine, client)
+	require.NoError(t, err)
+
+	result, handled, err := r.claimHost(t.Context(), machine, patchHelper)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, custom, result.RequeueAfter)
 }

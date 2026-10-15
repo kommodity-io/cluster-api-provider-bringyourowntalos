@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"testing"
+	"time"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
@@ -2442,4 +2443,179 @@ func TestMarkAdoptedOmitsInternalIPWhenEmpty(t *testing.T) {
 	require.Len(t, machine.Status.Addresses, 1)
 	assert.Equal(t, clusterv1.MachineExternalIP, machine.Status.Addresses[0].Type)
 	assert.Equal(t, testHostPublicIP, machine.Status.Addresses[0].Address)
+}
+
+func TestByotMachineReconcileCustomRequeueAfterBootstrapFlowsThrough(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	byotMachine := newByotMachine("203.0.113.10")
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine).
+		WithStatusSubresource(byotMachine).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+	custom := 42 * time.Second
+	reconciler.RequeueAfterBootstrap = custom
+
+	// No Machine owner yet: the reconciler adds the finalizer and requeues.
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+func TestEnsureTalosVersionCustomVersionProbeThresholdStopsEarly(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	client := upgradeTestClient(t, byotMachine)
+
+	reconciler := upgradeReconciler(t, client,
+		func(context.Context, Endpoints, []byte) (string, error) { return "", assert.AnError },
+		func(context.Context, Endpoints, []byte, string) (string, error) {
+			return "", nil
+		},
+	)
+	reconciler.VersionProbeThreshold = 2
+
+	updated := driveUpgradeUntilStopped(t, reconciler, client, byotMachine)
+
+	assert.Equal(t, infrav1.UpgradeStateFailed, updated.Status.UpgradeState)
+	assert.Equal(t, int32(2), updated.Status.UpgradeProbeFailures)
+	assert.Equal(t, "VersionProbeFailed", conditions.GetReason(updated, TalosVersionReadyCondition))
+}
+
+func TestEnsureTalosVersionCustomUpgradeThresholdStopsEarly(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	byotMachine.Status.UpgradeState = infrav1.UpgradeStateInFlight
+
+	client := upgradeTestClient(t, byotMachine)
+
+	reconciler := upgradeReconciler(t, client,
+		func(context.Context, Endpoints, []byte) (string, error) { return "", assert.AnError },
+		func(context.Context, Endpoints, []byte, string) (string, error) {
+			return "", nil
+		},
+	)
+	reconciler.UpgradeThreshold = 3
+
+	updated := driveUpgradeUntilStopped(t, reconciler, client, byotMachine)
+
+	assert.Equal(t, infrav1.UpgradeStateFailed, updated.Status.UpgradeState)
+	assert.Equal(t, int32(3), updated.Status.UpgradeProbeFailures)
+	assert.Equal(t, "UpgradeFailed", conditions.GetReason(updated, TalosVersionReadyCondition))
+}
+
+func TestEnsureTalosVersionCustomRequeueAfterUpgradeFlowsThrough(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newUpgradeByotMachine(testInstallerV1139)
+	client := upgradeTestClient(t, byotMachine)
+
+	reconciler := upgradeReconciler(t, client,
+		scriptedVersionProbe(t, "v1.13.8"),
+		func(_ context.Context, _ Endpoints, _ []byte, _ string) (string, error) {
+			return "", nil
+		},
+	)
+	custom := 42 * time.Second
+	reconciler.RequeueAfterUpgrade = custom
+
+	machine := newOwningMachine("test-bootstrap")
+
+	result, handled, err := reconciler.ensureTalosVersion(
+		t.Context(), upgradePatchHelper(t, client, byotMachine), byotMachine, machine)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+func TestByotMachineSetOptionsAppliesNonZeroOnly(t *testing.T) {
+	t.Parallel()
+
+	r := &ByotMachineReconciler{}
+	r.SetOptions(ByotMachineOptions{
+		RequeueAfterBootstrap:   42 * time.Second,
+		RequeueAfterResetIssued: 0, // zero: kept as default
+		RequeueAfterNodeLink:    7 * time.Second,
+		RequeueAfterUpgrade:     99 * time.Second,
+		VersionProbeThreshold:   0, // zero: kept as default
+		UpgradeThreshold:        3,
+	})
+
+	assert.Equal(t, 42*time.Second, r.RequeueAfterBootstrap)
+	assert.Zero(t, r.RequeueAfterResetIssued)
+	assert.Equal(t, 7*time.Second, r.RequeueAfterNodeLink)
+	assert.Equal(t, 99*time.Second, r.RequeueAfterUpgrade)
+	assert.Zero(t, r.VersionProbeThreshold)
+	assert.Equal(t, int32(3), r.UpgradeThreshold)
+
+	// Accessors return defaults for zero-valued fields.
+	assert.Equal(t, requeueAfterResetIssued, r.requeueAfterResetIssued())
+	assert.Equal(t, versionProbeThreshold, r.versionProbeThreshold())
+}
+
+func TestByotMachineReconcileCustomRequeueAfterResetIssuedFlowsThrough(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	byotMachine := newAdoptedByotMachine("127.0.0.1", "config-hash")
+	host := newClaimedByotHost("127.0.0.1")
+	byotMachine.Finalizers = []string{byotMachineFinalizer}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, host).
+		WithStatusSubresource(byotMachine, host).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+	custom := 42 * time.Second
+	reconciler.RequeueAfterResetIssued = custom
+
+	require.NoError(t, client.Delete(t.Context(), byotMachine))
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{
+		NamespacedName: clusterKey(byotMachine),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+func TestEnsureNodeLinkedCustomRequeueAfterNodeLinkFlowsThrough(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	machine := newOwningMachine("test-bootstrap") // no NodeRef
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(client)
+	custom := 42 * time.Second
+	reconciler.RequeueAfterNodeLink = custom
+
+	patchHelper, err := patch.NewHelper(byotMachine, client)
+	require.NoError(t, err)
+
+	result, err := reconciler.ensureNodeLinked(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Equal(t, custom, result.RequeueAfter)
 }

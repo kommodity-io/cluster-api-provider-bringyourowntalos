@@ -66,6 +66,13 @@ type ByotHostReconciler struct {
 	// FailureThreshold overrides the consecutive-failure count that flips a
 	// host to Unavailable.
 	FailureThreshold int32
+
+	// ProbeRequeue overrides the requeue delay used while probing,
+	// recovering, or failing.
+	ProbeRequeue time.Duration
+
+	// ClaimedRequeue overrides the requeue delay while a host is Claimed.
+	ClaimedRequeue time.Duration
 }
 
 // NewByotHostReconciler creates a new ByotHostReconciler with default probes.
@@ -131,6 +138,35 @@ func (r *ByotHostReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return r.reconcileHost(ctx, patchHelper, host)
 }
 
+// ByotHostOptions configures ByotHostReconciler tunables. Zero values keep
+// defaults; SetOptions assigns only non-zero fields.
+type ByotHostOptions struct {
+	LivenessInterval time.Duration
+	ProbeRequeue     time.Duration
+	ClaimedRequeue   time.Duration
+	FailureThreshold  int32
+}
+
+// SetOptions applies non-zero options to the reconciler, preserving defaults
+// for zero-valued fields. Mirrors the SetClusterCache setter pattern.
+func (r *ByotHostReconciler) SetOptions(opts ByotHostOptions) {
+	if opts.LivenessInterval > 0 {
+		r.LivenessInterval = opts.LivenessInterval
+	}
+
+	if opts.ProbeRequeue > 0 {
+		r.ProbeRequeue = opts.ProbeRequeue
+	}
+
+	if opts.ClaimedRequeue > 0 {
+		r.ClaimedRequeue = opts.ClaimedRequeue
+	}
+
+	if opts.FailureThreshold > 0 {
+		r.FailureThreshold = opts.FailureThreshold
+	}
+}
+
 // reconcileDelete blocks deletion while a host is claimed; once the claim is
 // cleared (by deleting the owning ByotMachine, which releases + clears
 // claimRef), the finalizer is removed.
@@ -142,7 +178,7 @@ func (r *ByotHostReconciler) reconcileDelete(ctx context.Context, host *infrav1.
 	if host.Status.ClaimRef != nil {
 		// Still claimed: keep the host until the owning ByotMachine is
 		// deleted and releases it.
-		return ctrl.Result{RequeueAfter: hostProbeRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.probeRequeue()}, nil
 	}
 
 	if controllerutil.RemoveFinalizer(host, byotHostFinalizer) {
@@ -171,7 +207,7 @@ func (r *ByotHostReconciler) reconcileHost(
 	case infrav1.HostPhaseClaimed:
 		// Probing paused while the host is being adopted. The ByotMachine
 		// controller sets phase=Releasing and clears claimRef on release.
-		return ctrl.Result{RequeueAfter: hostClaimedRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.claimedRequeue()}, nil
 	case infrav1.HostPhaseReleasing:
 		return r.reconcileReleasing(ctx, patchHelper, host)
 	default:
@@ -251,7 +287,7 @@ func (r *ByotHostReconciler) reconcileUnavailable(
 			return ctrl.Result{}, err
 		}
 
-		return ctrl.Result{RequeueAfter: hostProbeRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.probeRequeue()}, nil
 	}
 
 	// Recovered: re-discover features (they may have changed after an outage).
@@ -294,7 +330,7 @@ func (r *ByotHostReconciler) reconcileReleasing(
 			return ctrl.Result{}, err
 		}
 
-		return ctrl.Result{RequeueAfter: hostProbeRequeue}, nil
+		return ctrl.Result{RequeueAfter: r.probeRequeue()}, nil
 	}
 
 	result, err := r.Discover(ctx, hostEndpoints(host), host.Spec.PublicIP)
@@ -357,7 +393,7 @@ func (r *ByotHostReconciler) recordDiscoveryFailure(
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: hostProbeRequeue}, nil
+	return ctrl.Result{RequeueAfter: r.probeRequeue()}, nil
 }
 
 // recordProbeFailure increments the consecutive failure count and flips the
@@ -399,7 +435,7 @@ func (r *ByotHostReconciler) recordProbeFailure(
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{RequeueAfter: hostProbeRequeue}, nil
+	return ctrl.Result{RequeueAfter: r.probeRequeue()}, nil
 }
 
 // populateFromDiscovery copies a discovery result into the host status and
@@ -467,6 +503,22 @@ func (r *ByotHostReconciler) failureThreshold() int32 {
 	}
 
 	return hostFailureThreshold
+}
+
+func (r *ByotHostReconciler) probeRequeue() time.Duration {
+	if r.ProbeRequeue > 0 {
+		return r.ProbeRequeue
+	}
+
+	return hostProbeRequeue
+}
+
+func (r *ByotHostReconciler) claimedRequeue() time.Duration {
+	if r.ClaimedRequeue > 0 {
+		return r.ClaimedRequeue
+	}
+
+	return hostClaimedRequeue
 }
 
 func nowPtr() *metav1.Time {
