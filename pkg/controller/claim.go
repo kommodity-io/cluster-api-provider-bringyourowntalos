@@ -389,11 +389,11 @@ func (r *ByotMachineReconciler) releaseHost(
 		return err
 	}
 
-	addrList := machineEndpoints(byotMachine)
+	endpoints := machineEndpoints(byotMachine)
 
-	err = attemptReset(ctx, candidates, addrList)
+	err = attemptReset(ctx, candidates, endpoints)
 	if err != nil {
-		return fmt.Errorf("failed to reset host %s (%v): %w", host.Name, addrList, err)
+		return fmt.Errorf("failed to reset host %s (%s): %w", host.Name, endpoints, err)
 	}
 
 	// Reset issued: clear the claim and let the liveness loop flip

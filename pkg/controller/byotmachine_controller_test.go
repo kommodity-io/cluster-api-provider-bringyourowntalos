@@ -259,7 +259,7 @@ func TestByotMachineReconcileDoesNotReadoptOnFailedUpgrade(t *testing.T) {
 
 	reconciler := NewByotMachineReconciler(client)
 
-	reconciler.applyMachineConfig = func(_ context.Context, _ []string, _ []byte, _ []byte) error {
+	reconciler.applyMachineConfig = func(_ context.Context, _ Endpoints, _ []byte, _ []byte) error {
 		applied++
 
 		return nil
@@ -414,7 +414,7 @@ func TestByotMachineReconcileDeleteReleasesClaimedNeverAdoptedHostWithoutReset(t
 	reconciler := NewByotMachineReconciler(client)
 	// The host is genuinely in maintenance mode (no config applied):
 	// the probe confirms this, so the reset is skipped.
-	reconciler.probeMaintenance = func(context.Context, []string) bool { return true }
+	reconciler.probeMaintenance = func(context.Context, Endpoints) bool { return true }
 
 	err = client.Delete(t.Context(), byotMachine)
 	require.NoError(t, err)
@@ -472,7 +472,7 @@ func TestByotMachineReconcileDeleteResetsClaimedHostWhenNodeNotInMaintenance(t *
 	reconciler := NewByotMachineReconciler(client)
 	// Node is NOT in maintenance mode: config is applied, so the probe
 	// must return false, forcing a reset attempt.
-	reconciler.probeMaintenance = func(context.Context, []string) bool { return false }
+	reconciler.probeMaintenance = func(context.Context, Endpoints) bool { return false }
 
 	err = client.Delete(t.Context(), byotMachine)
 	require.NoError(t, err)
@@ -603,7 +603,7 @@ func TestResetCredentialCandidatesInsecureOnly(t *testing.T) {
 func TestAttemptResetWithoutCredentials(t *testing.T) {
 	t.Parallel()
 
-	err := attemptReset(t.Context(), [][]byte{}, []string{"203.0.113.10"})
+	err := attemptReset(t.Context(), [][]byte{}, Endpoints{"203.0.113.10"})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNoResetCredentials)
 }
@@ -640,8 +640,8 @@ func TestNudgeKubeletAfterSplitReadoptFailsNonFatal(t *testing.T) {
 	// warning but never reverts adoption.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"),
 		true, false,
-		func(context.Context, []string, []byte, string) (bool, error) { return true, nil },
-		func(context.Context, []string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return true, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			return errTestKubeletNotDefined
 		})
 
@@ -660,8 +660,8 @@ func TestNudgeKubeletAfterSplitReadoptSucceeds(t *testing.T) {
 
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"),
 		true, false,
-		func(context.Context, []string, []byte, string) (bool, error) { return true, nil },
-		func(context.Context, []string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return true, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			return nil
 		})
 
@@ -678,12 +678,12 @@ func TestNudgeKubeletAfterSplitReadoptSkipsWhenNotBundleMatch(t *testing.T) {
 	// Fresh maintenance-mode adoption (bundleMatch=false): no kubelet restart
 	// nudge is issued, the kubelet starts on boot.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, nil, false, false,
-		func(context.Context, []string, []byte, string) (bool, error) {
+		func(context.Context, Endpoints, []byte, string) (bool, error) {
 			t.Fatal("running probe must not be called when bundleMatch is false")
 
 			return false, nil
 		},
-		func(context.Context, []string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when bundleMatch is false")
 
 			return nil
@@ -700,12 +700,12 @@ func TestNudgeKubeletAfterSplitReadoptSkipsWhenAlreadyReady(t *testing.T) {
 	// Re-apply on an already-adopted machine (wasReady=true): no nudge, the
 	// kubelet picks up the updated config without a restart.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, true,
-		func(context.Context, []string, []byte, string) (bool, error) {
+		func(context.Context, Endpoints, []byte, string) (bool, error) {
 			t.Fatal("running probe must not be called when the machine was already ready")
 
 			return false, nil
 		},
-		func(context.Context, []string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when the machine was already ready")
 
 			return nil
@@ -726,8 +726,8 @@ func TestNudgeKubeletAfterSplitReadoptSkipsFreshAdoption(t *testing.T) {
 	// race that previously recorded a spurious
 	// KubeletRestartNudge=False/RestartFailed right after a first adoption.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, false,
-		func(context.Context, []string, []byte, string) (bool, error) { return false, nil },
-		func(context.Context, []string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return false, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when the kubelet is not yet running")
 
 			return nil
@@ -745,8 +745,8 @@ func TestNudgeKubeletAfterSplitReadoptSkipsOnRunningProbeError(t *testing.T) {
 	// nudge is skipped without recording a condition. The kubelet registers
 	// on boot regardless.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, false,
-		func(context.Context, []string, []byte, string) (bool, error) { return false, errTestKubeletNotDefined },
-		func(context.Context, []string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return false, errTestKubeletNotDefined },
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when the running probe fails")
 
 			return nil
@@ -767,8 +767,8 @@ func TestNudgeKubeletAfterSplitReadoptFiresOnRoundTrip(t *testing.T) {
 	// re-register. The previouslyAdopted (config hash) guard could not
 	// distinguish this from a fresh adoption; the running probe can.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, false,
-		func(context.Context, []string, []byte, string) (bool, error) { return true, nil },
-		func(context.Context, []string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return true, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			return nil
 		})
 
@@ -1337,9 +1337,9 @@ func newUpgradeByotMachine(desired string) *infrav1.ByotMachine {
 func upgradeReconciler(
 	t *testing.T,
 	client ctrlclient.Client,
-	versionProbeFn func(context.Context, []string, []byte) (string, error),
-	upgradeFn func(context.Context, []string, []byte, string) (string, error),
-	bootIDFn ...func(context.Context, []string, []byte) (string, error),
+	versionProbeFn func(context.Context, Endpoints, []byte) (string, error),
+	upgradeFn func(context.Context, Endpoints, []byte, string) (string, error),
+	bootIDFn ...func(context.Context, Endpoints, []byte) (string, error),
 ) *ByotMachineReconciler {
 	t.Helper()
 
@@ -1353,7 +1353,7 @@ func upgradeReconciler(
 		// Default: boot-id read permission-denied → InFlight uses the
 		// reachability + version-change fallback (exercises the path a
 		// credential without boot-id read permission takes).
-		reconciler.bootIDAuthenticated = func(context.Context, []string, []byte) (string, error) {
+		reconciler.bootIDAuthenticated = func(context.Context, Endpoints, []byte) (string, error) {
 			return "", errBootIDUnauthorized
 		}
 	}
@@ -1363,12 +1363,12 @@ func upgradeReconciler(
 
 // scriptedVersionProbe returns scripted tags (or errors) in order, one per
 // call, failing the test if called more times than scripted.
-func scriptedVersionProbe(t *testing.T, results ...any) func(context.Context, []string, []byte) (string, error) {
+func scriptedVersionProbe(t *testing.T, results ...any) func(context.Context, Endpoints, []byte) (string, error) {
 	t.Helper()
 
 	var calls int
 
-	return func(context.Context, []string, []byte) (string, error) {
+	return func(context.Context, Endpoints, []byte) (string, error) {
 		require.Less(t, calls, len(results), "versionProbe called more than scripted")
 
 		value := results[calls]
@@ -1439,7 +1439,7 @@ func TestEnsureTalosVersionMismatchUpgradeAndComplete(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ []string, _ []byte, image string) (string, error) {
+		func(_ context.Context, _ Endpoints, _ []byte, image string) (string, error) {
 			upgrades++
 
 			assert.Equal(t, testInstallerV1139, image)
@@ -1494,12 +1494,12 @@ func TestEnsureTalosVersionSameRefAlreadyAppliedSkipsUpgrade(t *testing.T) {
 	var upgrades int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, []string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			t.Fatal("version probe must not run on a deduped upgrade")
 
 			return "", nil
 		},
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			upgrades++
 
 			return "", nil
@@ -1555,8 +1555,8 @@ func TestEnsureTalosVersionProbeFailureStopsAtThreshold(t *testing.T) {
 	client := upgradeTestClient(t, byotMachine)
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, []string, []byte) (string, error) { return "", assert.AnError },
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) { return "", assert.AnError },
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1578,8 +1578,8 @@ func TestEnsureTalosVersionUpgradeFailureStopsAtThreshold(t *testing.T) {
 	client := upgradeTestClient(t, byotMachine)
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, []string, []byte) (string, error) { return "", assert.AnError },
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) { return "", assert.AnError },
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1607,7 +1607,7 @@ func TestEnsureTalosVersionUpgradeRPCErrorFailsAndResets(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8"),
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			upgrades++
 
 			return "", assert.AnError
@@ -1647,7 +1647,7 @@ func TestEnsureTalosVersionUpgradeRPCErrorResetFailureRetries(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8"),
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", assert.AnError
 		},
 	)
@@ -1677,12 +1677,12 @@ func TestEnsureTalosVersionOptOutSkipsUpgrade(t *testing.T) {
 	var probed int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, []string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			probed++
 
 			return "", nil
 		},
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1710,12 +1710,12 @@ func TestEnsureTalosVersionSkipsWhenNotReady(t *testing.T) {
 	var probed int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, []string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			probed++
 
 			return "", nil
 		},
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1751,12 +1751,12 @@ func TestEnsureTalosVersionRetriggerAfterFailure(t *testing.T) {
 	)
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, []string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			probed++
 
 			return "v1.13.8", nil
 		},
-		func(context.Context, []string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			upgrades++
 
 			return "", nil
@@ -1804,10 +1804,10 @@ func TestEnsureTalosVersionBootIDGateComplete(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"), // pre-upgrade probe + post-reboot refresh in the boot-id gate
-		func(_ context.Context, _ []string, _ []byte, _ string) (string, error) {
+		func(_ context.Context, _ Endpoints, _ []byte, _ string) (string, error) {
 			return preReboot, nil // capture pre-reboot boot-id
 		},
-		func(context.Context, []string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			return postReboot, nil // live boot-id differs → complete
 		},
 	)
@@ -1925,8 +1925,8 @@ func gateCluster(ready bool) *clusterv1.Cluster {
 // (dialing 127.0.0.1, refused) instead of looping on the gate.
 func gateReconciler(client ctrlclient.Client) *ByotMachineReconciler {
 	r := NewByotMachineReconciler(client)
-	r.probeMaintenance = func(context.Context, []string) bool { return true }
-	r.probeAuthenticated = func(context.Context, []string, []byte) bool { return false }
+	r.probeMaintenance = func(context.Context, Endpoints) bool { return true }
+	r.probeAuthenticated = func(context.Context, Endpoints, []byte) bool { return false }
 
 	return r
 }
@@ -2068,7 +2068,7 @@ func TestSyncHostTalosVersionMirrorsAfterUpgrade(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ []string, _ []byte, _ string) (string, error) { return "", nil },
+		func(_ context.Context, _ Endpoints, _ []byte, _ string) (string, error) { return "", nil },
 	)
 
 	machine := newOwningMachine("test-bootstrap")
@@ -2120,7 +2120,7 @@ func TestReconcileAdoptedUpgradesBeforeLinking(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ []string, _ []byte, image string) (string, error) {
+		func(_ context.Context, _ Endpoints, _ []byte, image string) (string, error) {
 			upgrades++
 
 			assert.Equal(t, testInstallerV1139, image)

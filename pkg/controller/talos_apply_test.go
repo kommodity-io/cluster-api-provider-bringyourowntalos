@@ -87,7 +87,7 @@ func TestInjectCertSANsAddsWhenAbsent(t *testing.T) {
 
 	config := []byte("machine:\n  kubelet:\n    image: kubelet:v1.35.0\n")
 
-	out, err := injectCertSANs(config, "130.226.165.252")
+	out, err := injectCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "130.226.165.252")
@@ -99,7 +99,7 @@ func TestInjectCertSANsPreservesExistingSANs(t *testing.T) {
 
 	config := []byte("machine:\n  certSANs:\n    - 10.10.53.50\n    - 127.0.0.1\n")
 
-	out, err := injectCertSANs(config, "130.226.165.252")
+	out, err := injectCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "10.10.53.50")
@@ -112,7 +112,7 @@ func TestInjectCertSANsIdempotent(t *testing.T) {
 
 	config := []byte("machine:\n  certSANs:\n    - 10.10.53.50\n    - 130.226.165.252\n")
 
-	out, err := injectCertSANs(config, "130.226.165.252")
+	out, err := injectCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "10.10.53.50")
@@ -126,7 +126,7 @@ func TestInjectCertSANsPreservesEmptyList(t *testing.T) {
 
 	config := []byte("machine:\n  certSANs: []\n  kubelet:\n    image: kubelet:v1.35.0\n")
 
-	out, err := injectCertSANs(config, "130.226.165.252")
+	out, err := injectCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "130.226.165.252")
@@ -140,7 +140,7 @@ func TestInjectCertSANsPreservesMultiDoc(t *testing.T) {
 		"---\napiVersion: v1alpha1\nkind: HostnameConfig\n" +
 		"auto: \"off\"\nhostname: prd-cph04-controlplane-112ba5-wvrqq\n")
 
-	out, err := injectCertSANs(config, "130.226.165.252")
+	out, err := injectCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	rendered := string(out)
@@ -155,7 +155,7 @@ func TestInjectCertSANsSkipsNonMachineDocs(t *testing.T) {
 	config := []byte("---\napiVersion: v1alpha1\nkind: VolumeConfig\nname: STATE\n" +
 		"---\nversion: v1alpha1\nmachine:\n  certSANs: []\n")
 
-	out, err := injectCertSANs(config, "130.226.165.252")
+	out, err := injectCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	rendered := string(out)
@@ -168,7 +168,7 @@ func TestInjectClusterAPIServerCertSANsAddsWhenAbsent(t *testing.T) {
 
 	config := []byte("cluster:\n  network:\n    podSubnets:\n      - 10.244.0.0/16\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252", "172.16.16.2"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252", "172.16.16.2"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "130.226.165.252")
@@ -181,7 +181,7 @@ func TestInjectClusterAPIServerCertSANsPreservesExistingSANs(t *testing.T) {
 
 	config := []byte("cluster:\n  apiServer:\n    certSANs:\n      - 10.10.53.50\n      - 127.0.0.1\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "10.10.53.50")
@@ -194,7 +194,7 @@ func TestInjectClusterAPIServerCertSANsIdempotent(t *testing.T) {
 
 	config := []byte("cluster:\n  apiServer:\n    certSANs:\n      - 10.10.53.50\n      - 130.226.165.252\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "10.10.53.50")
@@ -206,7 +206,7 @@ func TestInjectClusterAPIServerCertSANsPreservesEmptyList(t *testing.T) {
 
 	config := []byte("cluster:\n  apiServer:\n    certSANs: []\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "130.226.165.252")
@@ -217,7 +217,7 @@ func TestInjectClusterAPIServerCertSANsCreatesApiServerWhenMissing(t *testing.T)
 
 	config := []byte("cluster:\n  network:\n    podSubnets:\n      - 10.244.0.0/16\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	assert.Contains(t, string(out), "certSANs:")
@@ -232,7 +232,7 @@ func TestInjectClusterAPIServerCertSANsPreservesMultiDoc(t *testing.T) {
 		"---\napiVersion: v1alpha1\nkind: HostnameConfig\n" +
 		"auto: \"off\"\nhostname: prd-cph04-controlplane-112ba5-wvrqq\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	rendered := string(out)
@@ -247,7 +247,7 @@ func TestInjectClusterAPIServerCertSANsSkipsNonClusterDocs(t *testing.T) {
 	config := []byte("---\napiVersion: v1alpha1\nkind: VolumeConfig\nname: STATE\n" +
 		"---\nversion: v1alpha1\ncluster:\n  apiServer:\n    certSANs: []\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252"})
 	require.NoError(t, err)
 
 	rendered := string(out)
@@ -260,7 +260,7 @@ func TestInjectClusterAPIServerCertSANsMultipleIPs(t *testing.T) {
 
 	config := []byte("cluster:\n  apiServer:\n    certSANs: []\n")
 
-	out, err := injectClusterAPIServerCertSANs(config, []string{"130.226.165.252", "172.16.16.2"})
+	out, err := injectClusterAPIServerCertSANs(config, Endpoints{"130.226.165.252", "172.16.16.2"})
 	require.NoError(t, err)
 
 	rendered := string(out)

@@ -322,7 +322,7 @@ func TestDiscoverHostFailsOnUnreachable(t *testing.T) {
 	t.Parallel()
 
 	// 127.0.0.1 refuses the Talos API: discovery must fail fast.
-	_, err := discoverHost(t.Context(), "127.0.0.1")
+	_, err := discoverHost(t.Context(), Endpoints{"127.0.0.1"}, "127.0.0.1")
 	require.Error(t, err)
 
 	assert.True(t, strings.Contains(err.Error(), "version discovery") ||
