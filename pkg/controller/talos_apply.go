@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
+
 	"strings"
 	"time"
 
@@ -24,10 +24,6 @@ import (
 )
 
 const (
-	// talosAPIPort is the secure Talos machine API port. In maintenance mode
-	// it accepts ApplyConfiguration with unverified TLS.
-	talosAPIPort = "50000"
-
 	// applyTimeout bounds a single ApplyConfiguration attempt.
 	applyTimeout = 2 * time.Minute
 
@@ -63,20 +59,34 @@ const (
 	talosLabelEphemeral = "EPHEMERAL"
 )
 
+// Endpoints is a non-empty list of machine addresses passed as Talos client
+// endpoints. The Talos gRPC client round-robins across endpoints, so a NAT'd
+// host reachable via its internal IP connects even when the public IP is
+// not directly reachable. The zero value is invalid; build it via
+// machineEndpoints or hostEndpoints which guarantee at least one address.
+type Endpoints []string
+
+// String formats the endpoints for log/error messages.
+func (e Endpoints) String() string {
+	return fmt.Sprintf("%v", []string(e))
+}
+
 // applyMachineConfig applies the given Talos machine configuration to the
-// machine at publicIP. When talosConfig is nil, the machine is assumed to run
-// in maintenance mode and an unverified TLS client is used; otherwise the
-// talosconfig's client credentials authenticate the request.
-func applyMachineConfig(ctx context.Context, publicIP string, machineConfig []byte, talosConfig []byte) error {
+// machine at the given addresses. When talosConfig is nil, the machine is
+// assumed to run in maintenance mode and an unverified TLS client is used;
+// otherwise the talosconfig's client credentials authenticate the request.
+// All machine addresses are passed as endpoints so the gRPC client can reach
+// the node via any address, matching cabpt's talosconfigForMachines.
+func applyMachineConfig(ctx context.Context, endpoints Endpoints, machineConfig []byte, talosConfig []byte) error {
 	var (
 		client *talosclient.Client
 		err    error
 	)
 
 	if talosConfig != nil {
-		client, err = authenticatedClient(ctx, publicIP, talosConfig)
+		client, err = authenticatedClient(ctx, endpoints, talosConfig)
 	} else {
-		client, err = maintenanceClient(ctx, publicIP)
+		client, err = maintenanceClient(ctx, endpoints)
 	}
 
 	if err != nil {
@@ -85,7 +95,7 @@ func applyMachineConfig(ctx context.Context, publicIP string, machineConfig []by
 
 	defer client.Close() //nolint:errcheck
 
-	ctx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), applyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
 	_, err = client.ApplyConfiguration(ctx, &machineapi.ApplyConfigurationRequest{
@@ -93,7 +103,7 @@ func applyMachineConfig(ctx context.Context, publicIP string, machineConfig []by
 		Mode: machineapi.ApplyConfigurationRequest_AUTO,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to apply machine configuration on %s: %w", publicIP, err)
+		return fmt.Errorf("failed to apply machine configuration on %s: %w", endpoints, err)
 	}
 
 	return nil
@@ -101,15 +111,13 @@ func applyMachineConfig(ctx context.Context, publicIP string, machineConfig []by
 
 // maintenanceClient builds a client for a machine in maintenance mode, which
 // performs no client authentication. Intentional for adoption only.
-func maintenanceClient(ctx context.Context, publicIP string) (*talosclient.Client, error) {
+func maintenanceClient(ctx context.Context, endpoints Endpoints) (*talosclient.Client, error) {
 	//nolint:gosec // Maintenance mode has no PKI material; apply must skip verification.
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 
-	endpoint := net.JoinHostPort(publicIP, talosAPIPort)
-
-	client, err := talosclient.New(ctx, talosclient.WithTLSConfig(tlsConfig), talosclient.WithEndpoints(endpoint))
+	client, err := talosclient.New(ctx, talosclient.WithTLSConfig(tlsConfig), talosclient.WithEndpoints(endpoints...))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Talos maintenance client for %s: %w", endpoint, err)
+		return nil, fmt.Errorf("failed to create Talos maintenance client for %s: %w", endpoints, err)
 	}
 
 	return client, nil
@@ -117,41 +125,41 @@ func maintenanceClient(ctx context.Context, publicIP string) (*talosclient.Clien
 
 // authenticatedClient builds an mTLS client for a machine already booted with
 // a machine configuration, using credentials from the given talosconfig.
-func authenticatedClient(ctx context.Context, publicIP string, talosConfig []byte) (*talosclient.Client, error) {
+// All machine addresses are passed as endpoints so the gRPC client can reach
+// the node via any address, matching cabpt's talosconfigForMachines.
+func authenticatedClient(ctx context.Context, endpoints Endpoints, talosConfig []byte) (*talosclient.Client, error) {
 	config, err := clientconfig.FromBytes(talosConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse talosconfig: %w", err)
 	}
 
-	endpoint := net.JoinHostPort(publicIP, talosAPIPort)
-
 	client, err := talosclient.New(
 		ctx,
 		talosclient.WithConfig(config),
-		talosclient.WithEndpoints(endpoint),
+		talosclient.WithEndpoints(endpoints...),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create authenticated Talos client for %s: %w", endpoint, err)
+		return nil, fmt.Errorf("failed to create authenticated Talos client for %s: %w", endpoints, err)
 	}
 
 	return client, nil
 }
 
 // versionProbeAuthenticated returns the live Talos version tag of the machine
-// at publicIP, queried over the cluster talosconfig (mTLS). Used by the
-// post-adoption upgrade path: after the bootstrap config is applied the host
-// carries the cluster PKI bundle, so only the authenticated client is accepted.
-func versionProbeAuthenticated(ctx context.Context, publicIP string, talosConfig []byte) (string, error) {
-	return versionProbeWithClient(ctx, publicIP, func(ctx context.Context) (*talosclient.Client, error) {
-		return authenticatedClient(ctx, publicIP, talosConfig)
+// at the given addresses, queried over the cluster talosconfig (mTLS). Used by
+// the post-adoption upgrade path: after the bootstrap config is applied the
+// host carries the cluster PKI bundle, so only the authenticated client is
+// accepted.
+func versionProbeAuthenticated(ctx context.Context, endpoints Endpoints, talosConfig []byte) (string, error) {
+	return versionProbeWithClient(ctx, func(ctx context.Context) (*talosclient.Client, error) {
+		return authenticatedClient(ctx, endpoints, talosConfig)
 	})
 }
 
-// versionProbeWithClient runs the Version RPC against the machine at publicIP
-// using the given client builder and returns the reported tag.
+// versionProbeWithClient runs the Version RPC against the machine using the
+// given client builder and returns the reported tag.
 func versionProbeWithClient(
 	ctx context.Context,
-	publicIP string,
 	buildClient func(context.Context) (*talosclient.Client, error),
 ) (string, error) {
 	client, err := buildClient(ctx)
@@ -161,21 +169,21 @@ func versionProbeWithClient(
 
 	defer client.Close() //nolint:errcheck
 
-	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	resp, err := client.Version(probeCtx)
 	if err != nil {
-		return "", fmt.Errorf("version probe failed on %s: %w", publicIP, err)
+		return "", fmt.Errorf("version probe failed: %w", err)
 	}
 
 	if len(resp.GetMessages()) == 0 {
-		return "", fmt.Errorf("version probe returned no messages on %s: %w", publicIP, ErrVersionProbeEmpty)
+		return "", fmt.Errorf("version probe returned no messages: %w", ErrVersionProbeEmpty)
 	}
 
 	info := resp.GetMessages()[0].GetVersion()
 	if info == nil {
-		return "", fmt.Errorf("version probe returned no version info on %s: %w", publicIP, ErrVersionProbeNoInfo)
+		return "", fmt.Errorf("version probe returned no version info: %w", ErrVersionProbeNoInfo)
 	}
 
 	return info.GetTag(), nil
@@ -206,9 +214,9 @@ var errNoSystemDisk = errors.New("no system disk found")
 // version-change completion check when this is returned at capture time.
 var errBootIDUnauthorized = errors.New("boot-id read permission denied")
 
-// upgradeMachine performs a Talos lifecycle upgrade of the machine at
-// publicIP to the given installer image ref, over the cluster talosconfig
-// (mTLS). It runs synchronously in one reconcile:
+// upgradeMachine performs a Talos lifecycle upgrade of the machine at the
+// given addresses to the given installer image ref, over the cluster
+// talosconfig (mTLS). It runs synchronously in one reconcile:
 //
 //  1. Pull the installer image into the CRI containerd store
 //     (ImageClient.Pull stream, drained to completion).
@@ -222,8 +230,8 @@ var errBootIDUnauthorized = errors.New("boot-id read permission denied")
 // client is Reader-only. Returns the captured pre-reboot boot-id (empty when
 // the read failed or was permission-denied) so the caller can stash it on
 // status for the InFlight poll.
-func upgradeMachine(ctx context.Context, publicIP string, talosConfig []byte, image string) (string, error) {
-	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+func upgradeMachine(ctx context.Context, endpoints Endpoints, talosConfig []byte, image string) (string, error) {
+	client, err := authenticatedClient(ctx, endpoints, talosConfig)
 	if err != nil {
 		return "", err
 	}
@@ -238,17 +246,17 @@ func upgradeMachine(ctx context.Context, publicIP string, talosConfig []byte, im
 		Namespace: common.ContainerdNamespace_NS_SYSTEM,
 	}
 
-	pullErr := pullInstallerImage(ctx, client, publicIP, containerdInst, image)
+	pullErr := pullInstallerImage(ctx, client, containerdInst, image)
 	if pullErr != nil {
-		return "", fmt.Errorf("failed to pull installer image %s on %s: %w", image, publicIP, pullErr)
+		return "", fmt.Errorf("failed to pull installer image %s: %w", image, pullErr)
 	}
 
-	upgradeErr := runLifecycleUpgrade(ctx, client, publicIP, containerdInst, image)
+	upgradeErr := runLifecycleUpgrade(ctx, client, containerdInst, image)
 	if upgradeErr != nil {
-		return "", fmt.Errorf("failed to upgrade machine %s to %s: %w", publicIP, image, upgradeErr)
+		return "", fmt.Errorf("failed to upgrade machine to %s: %w", image, upgradeErr)
 	}
 
-	bootID, bootErr := readBootID(ctx, client, publicIP)
+	bootID, bootErr := readBootID(ctx, client)
 	if bootErr != nil && !errors.Is(bootErr, errBootIDUnauthorized) {
 		// Non-permission read failure: proceed with an empty boot-id (the
 		// InFlight poll falls back to reachability + version-change). Install
@@ -259,10 +267,10 @@ func upgradeMachine(ctx context.Context, publicIP string, talosConfig []byte, im
 	// Reboot is best-effort: install already succeeded (exit 0). A reboot
 	// failure proceeds to InFlight anyway; the host may reboot on its own or
 	// an operator nudges it, and the InFlight poll detects the new version.
-	rebootErr := rebootMachine(ctx, client, publicIP)
+	rebootErr := rebootMachine(ctx, client)
 	if rebootErr != nil {
 		log.FromContext(ctx).Info("Talos upgrade install succeeded but reboot RPC failed; proceeding to InFlight",
-			"byotMachine", "", "publicIP", publicIP, "err", rebootErr)
+			"err", rebootErr)
 	}
 
 	return bootID, nil
@@ -274,11 +282,10 @@ func upgradeMachine(ctx context.Context, publicIP string, talosConfig []byte, im
 func pullInstallerImage(
 	ctx context.Context,
 	client *talosclient.Client,
-	publicIP string,
 	inst *common.ContainerdInstance,
 	image string,
 ) error {
-	pullCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), imagePullTimeout)
+	pullCtx, cancel := context.WithTimeout(ctx, imagePullTimeout)
 	defer cancel()
 
 	stream, err := client.ImageClient.Pull(pullCtx, &machineapi.ImageServicePullRequest{
@@ -313,11 +320,10 @@ func pullInstallerImage(
 func runLifecycleUpgrade(
 	ctx context.Context,
 	client *talosclient.Client,
-	publicIP string,
 	inst *common.ContainerdInstance,
 	image string,
 ) error {
-	upgradeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), upgradeTimeout)
+	upgradeCtx, cancel := context.WithTimeout(ctx, upgradeTimeout)
 	defer cancel()
 
 	stream, err := client.LifecycleClient.Upgrade(upgradeCtx, &machineapi.LifecycleServiceUpgradeRequest{
@@ -364,8 +370,8 @@ func runLifecycleUpgrade(
 // Read RPC. Returns errBootIDUnauthorized when the client credentials lack
 // read permission, so the caller can distinguish a hard failure from a
 // degraded-but-proceedable one.
-func readBootID(ctx context.Context, client *talosclient.Client, publicIP string) (string, error) {
-	readCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+func readBootID(ctx context.Context, client *talosclient.Client) (string, error) {
+	readCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	reader, err := client.Read(readCtx, "/proc/sys/kernel/random/boot_id")
@@ -394,40 +400,41 @@ func readBootID(ctx context.Context, client *talosclient.Client, publicIP string
 // rebootMachine issues a Reboot RPC (unary). It returns immediately; the
 // machine reboots after. Default reboot mode. Best-effort in the upgrade
 // sequence — install already succeeded by the time this is called.
-func rebootMachine(ctx context.Context, client *talosclient.Client, publicIP string) error {
-	rebootCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), rebootTimeout)
+func rebootMachine(ctx context.Context, client *talosclient.Client) error {
+	rebootCtx, cancel := context.WithTimeout(ctx, rebootTimeout)
 	defer cancel()
 
 	return client.Reboot(rebootCtx)
 }
 
-// bootIDAuthenticated returns the live boot-id of the machine at publicIP,
-// queried over the cluster talosconfig (mTLS). Used by the InFlight upgrade
-// poll to detect a reboot-and-back (completion gate). Returns
-// errBootIDUnauthorized when the credentials cannot read boot-id; the caller
-// falls back to a reachability + version-change completion check.
-func bootIDAuthenticated(ctx context.Context, publicIP string, talosConfig []byte) (string, error) {
-	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+// bootIDAuthenticated returns the live boot-id of the machine at the given
+// addresses, queried over the cluster talosconfig (mTLS). Used by the
+// InFlight upgrade poll to detect a reboot-and-back (completion gate).
+// Returns errBootIDUnauthorized when the credentials cannot read boot-id;
+// the caller falls back to a reachability + version-change completion check.
+func bootIDAuthenticated(ctx context.Context, endpoints Endpoints, talosConfig []byte) (string, error) {
+	client, err := authenticatedClient(ctx, endpoints, talosConfig)
 	if err != nil {
 		return "", err
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	return readBootID(ctx, client, publicIP)
+	return readBootID(ctx, client)
 }
 
-// probeMaintenance reports whether the machine at publicIP answers the Talos
-// machine API in maintenance mode (unverified TLS, no client authentication).
-func probeMaintenance(ctx context.Context, publicIP string) bool {
-	client, err := maintenanceClient(ctx, publicIP)
+// probeMaintenance reports whether the machine at the given addresses
+// answers the Talos machine API in maintenance mode (unverified TLS, no
+// client authentication).
+func probeMaintenance(ctx context.Context, endpoints Endpoints) bool {
+	client, err := maintenanceClient(ctx, endpoints)
 	if err != nil {
 		return false
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	_, err = client.Version(probeCtx)
@@ -435,19 +442,19 @@ func probeMaintenance(ctx context.Context, publicIP string) bool {
 	return err == nil
 }
 
-// probeAuthenticated reports whether the machine at publicIP answers the
-// Talos machine API using the credentials from the given talosconfig. Used by
-// the join preflight to determine which PKI bundle a configured machine
-// carries.
-func probeAuthenticated(ctx context.Context, publicIP string, talosConfig []byte) bool {
-	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+// probeAuthenticated reports whether the machine at the given addresses
+// answers the Talos machine API using the credentials from the given
+// talosconfig. Used by the join preflight to determine which PKI bundle a
+// configured machine carries.
+func probeAuthenticated(ctx context.Context, endpoints Endpoints, talosConfig []byte) bool {
+	client, err := authenticatedClient(ctx, endpoints, talosConfig)
 	if err != nil {
 		return false
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	_, err = client.Version(probeCtx)
@@ -459,20 +466,20 @@ func probeAuthenticated(ctx context.Context, publicIP string, talosConfig []byte
 // given talosconfig credentials. Used after bundle-match re-adoption: when a
 // node was split with splitPolicy=None, Cluster API deletes its Node object
 // in the workload cluster, and a restarted kubelet is what re-registers it.
-func restartService(ctx context.Context, publicIP string, talosConfig []byte, serviceID string) error {
-	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+func restartService(ctx context.Context, endpoints Endpoints, talosConfig []byte, serviceID string) error {
+	client, err := authenticatedClient(ctx, endpoints, talosConfig)
 	if err != nil {
 		return err
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	restartCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), resetTimeout)
+	restartCtx, cancel := context.WithTimeout(ctx, resetTimeout)
 	defer cancel()
 
 	_, err = client.ServiceRestart(restartCtx, serviceID)
 	if err != nil {
-		return fmt.Errorf("failed to restart service %s on %s: %w", serviceID, publicIP, err)
+		return fmt.Errorf("failed to restart service %s: %w", serviceID, err)
 	}
 
 	return nil
@@ -480,20 +487,20 @@ func restartService(ctx context.Context, publicIP string, talosConfig []byte, se
 
 // serviceRunning reports whether the given Talos service is currently in the
 // Running state on the machine.
-func serviceRunning(ctx context.Context, publicIP string, talosConfig []byte, serviceID string) (bool, error) {
-	client, err := authenticatedClient(ctx, publicIP, talosConfig)
+func serviceRunning(ctx context.Context, endpoints Endpoints, talosConfig []byte, serviceID string) (bool, error) {
+	client, err := authenticatedClient(ctx, endpoints, talosConfig)
 	if err != nil {
 		return false, err
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	probeCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	services, err := client.ServiceInfo(probeCtx, serviceID)
 	if err != nil {
-		return false, fmt.Errorf("failed to inspect service %s on %s: %w", serviceID, publicIP, err)
+		return false, fmt.Errorf("failed to inspect service %s: %w", serviceID, err)
 	}
 
 	for _, svc := range services {
@@ -509,16 +516,16 @@ func serviceRunning(ctx context.Context, publicIP string, talosConfig []byte, se
 // reboots it into maintenance mode. When talosConfig is nil, an unverified
 // TLS client is used (maintenance mode); otherwise the machine's current
 // configuration credentials authenticate the request.
-func resetMachine(ctx context.Context, publicIP string, talosConfig []byte) error {
+func resetMachine(ctx context.Context, endpoints Endpoints, talosConfig []byte) error {
 	var (
 		client *talosclient.Client
 		err    error
 	)
 
 	if talosConfig != nil {
-		client, err = authenticatedClient(ctx, publicIP, talosConfig)
+		client, err = authenticatedClient(ctx, endpoints, talosConfig)
 	} else {
-		client, err = maintenanceClient(ctx, publicIP)
+		client, err = maintenanceClient(ctx, endpoints)
 	}
 
 	if err != nil {
@@ -527,7 +534,7 @@ func resetMachine(ctx context.Context, publicIP string, talosConfig []byte) erro
 
 	defer client.Close() //nolint:errcheck
 
-	resetCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), resetTimeout)
+	resetCtx, cancel := context.WithTimeout(ctx, resetTimeout)
 	defer cancel()
 
 	err = client.ResetGeneric(resetCtx, &machineapi.ResetRequest{
@@ -539,7 +546,7 @@ func resetMachine(ctx context.Context, publicIP string, talosConfig []byte) erro
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("failed to reset machine %s: %w", publicIP, err)
+		return fmt.Errorf("failed to reset machine: %w", err)
 	}
 
 	return nil
@@ -551,16 +558,16 @@ func resetMachine(ctx context.Context, publicIP string, talosConfig []byte) erro
 // validates the machine config piped on stdin, which requires machine.install
 // .disk or diskSelector. cabpt does not set one, so BYOT detects it here and
 // injects it into the config before apply.
-func detectSystemDisk(ctx context.Context, publicIP string, talosConfig []byte) (string, error) {
+func detectSystemDisk(ctx context.Context, endpoints Endpoints, talosConfig []byte) (string, error) {
 	var (
 		client *talosclient.Client
 		err    error
 	)
 
 	if talosConfig != nil {
-		client, err = authenticatedClient(ctx, publicIP, talosConfig)
+		client, err = authenticatedClient(ctx, endpoints, talosConfig)
 	} else {
-		client, err = maintenanceClient(ctx, publicIP)
+		client, err = maintenanceClient(ctx, endpoints)
 	}
 
 	if err != nil {
@@ -569,12 +576,12 @@ func detectSystemDisk(ctx context.Context, publicIP string, talosConfig []byte) 
 
 	defer client.Close() //nolint:errcheck
 
-	diskCtx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), probeTimeout)
+	diskCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
 	resp, err := client.Disks(diskCtx)
 	if err != nil {
-		return "", fmt.Errorf("failed to query disks on %s: %w", publicIP, err)
+		return "", fmt.Errorf("failed to query disks: %w", err)
 	}
 
 	for _, msg := range resp.GetMessages() {
@@ -583,7 +590,7 @@ func detectSystemDisk(ctx context.Context, publicIP string, talosConfig []byte) 
 		}
 	}
 
-	return "", fmt.Errorf("%w on %s", errNoSystemDisk, publicIP)
+	return "", errNoSystemDisk
 }
 
 // selectSystemDisk picks the install disk from a Talos Disks response, preferring
@@ -636,18 +643,20 @@ func injectInstallDisk(machineConfig []byte, disk string) ([]byte, error) {
 	return encodeMachineConfigDocs(docs)
 }
 
-// injectCertSANs idempotently adds ip to machine.certSANs in the v1alpha1
-// machine-config document, preserving every other document in the stream.
-// If the IP is already present, the config is returned unchanged. Uses the
-// same multi-doc decode/encode helpers as injectInstallDisk to avoid
-// dropping the CABPT HostnameConfig doc.
-func injectCertSANs(machineConfig []byte, ipAddress string) ([]byte, error) {
+// injectCertSANs idempotently adds each IP to machine.certSANs in the
+// v1alpha1 machine-config document, preserving every other document in the
+// stream. Existing operator-provided SANs are preserved. Uses the same
+// multi-doc decode/encode helpers as injectInstallDisk to avoid dropping the
+// CABPT HostnameConfig doc.
+func injectCertSANs(machineConfig []byte, ipAddresses Endpoints) ([]byte, error) {
 	docs, err := decodeMachineConfigDocs(machineConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	setCertSANs(docs, ipAddress)
+	for _, ip := range ipAddresses {
+		setCertSANs(docs, ip)
+	}
 
 	return encodeMachineConfigDocs(docs)
 }
@@ -662,14 +671,56 @@ func setCertSANs(docs []map[string]any, ipAddress string) {
 		}
 
 		sans, _ := machine["certSANs"].([]any)
-		for _, san := range sans {
-			if s, ok := san.(string); ok && s == ipAddress {
-				return
-			}
+		if containsStringAny(sans, ipAddress) {
+			continue
 		}
 
 		machine["certSANs"] = append(sans, ipAddress)
 		doc["machine"] = machine
+	}
+}
+
+// injectClusterAPIServerCertSANs idempotently adds each IP to
+// cluster.apiServer.certSANs in the v1alpha1 machine-config document,
+// preserving every other document in the stream. Existing operator-provided
+// SANs are preserved. Uses the same multi-doc decode/encode helpers as
+// injectInstallDisk to avoid dropping the CABPT HostnameConfig doc.
+func injectClusterAPIServerCertSANs(machineConfig []byte, ipAddresses Endpoints) ([]byte, error) {
+	docs, err := decodeMachineConfigDocs(machineConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, ip := range ipAddresses {
+		setClusterAPIServerCertSANs(docs, ip)
+	}
+
+	return encodeMachineConfigDocs(docs)
+}
+
+// setClusterAPIServerCertSANs appends ip to cluster.apiServer.certSANs in
+// each v1alpha1 doc when not already present. Existing operator-provided
+// SANs are preserved.
+func setClusterAPIServerCertSANs(docs []map[string]any, ipAddress string) {
+	for _, doc := range docs {
+		cluster, _ := doc["cluster"].(map[string]any)
+		if cluster == nil {
+			continue
+		}
+
+		apiServer, _ := cluster["apiServer"].(map[string]any)
+		if apiServer == nil {
+			apiServer = map[string]any{}
+		}
+
+		sans, _ := apiServer["certSANs"].([]any)
+		if containsStringAny(sans, ipAddress) {
+			continue
+		}
+
+		apiServer["certSANs"] = append(sans, ipAddress)
+		cluster["apiServer"] = apiServer
+		doc["cluster"] = cluster
 	}
 }
 
@@ -744,4 +795,15 @@ func encodeMachineConfigDocs(docs []map[string]any) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// containsStringAny reports whether values contains ipAddress as a string.
+func containsStringAny(values []any, ipAddress string) bool {
+	for _, v := range values {
+		if s, ok := v.(string); ok && s == ipAddress {
+			return true
+		}
+	}
+
+	return false
 }

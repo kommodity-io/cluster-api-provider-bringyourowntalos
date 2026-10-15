@@ -63,20 +63,18 @@ type DiscoveryResult struct {
 	Identity          *infrav1.HostIdentity
 }
 
-// discoverHost runs the maintenance-mode discovery surface against publicIP:
-// Version, Memory, Disks, CPU + GPU (COSI hardware resources), Platform
-// (COSI KernelCmdline), NUMA (LS /sys/devices/system/node), LS
-// /sys/class/net, and IP addresses (COSI AddressStatus, classified against
-// publicIP). It reuses the insecure maintenance client.
-func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error) {
-	client, err := maintenanceClient(ctx, publicIP)
+// discoverHost runs maintenance-mode discovery (Version, Memory, Disks,
+// CPU, GPU, Platform, NUMA, NICs, IPs) over all endpoints via the insecure
+// client. publicIP classifies which discovered address is external.
+func discoverHost(ctx context.Context, endpoints Endpoints, publicIP string) (DiscoveryResult, error) {
+	client, err := maintenanceClient(ctx, endpoints)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	ctx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), applyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
 	result := DiscoveryResult{}
