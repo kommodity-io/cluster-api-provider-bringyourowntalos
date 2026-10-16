@@ -380,3 +380,56 @@ func TestClaimHostLostRaceRequeuesOnConflict(t *testing.T) {
 	assert.Zero(t, result.RequeueAfter)
 	assert.Empty(t, machine.Status.ResolvedHost) // claim not finalized
 }
+
+func TestClaimHostSetsResolvedInternalIP(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	machine := newClaimingByotMachine(testHostName)
+	host := newAvailableByotHost(testHostName, testHostPublicIP)
+	host.Status.Hardware = &infrav1.HostHardware{
+		InternalIP: "172.16.16.2",
+	}
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}, &infrav1.ByotHost{}).
+		Build()
+
+	r := NewByotMachineReconciler(client)
+	patchHelper, err := patch.NewHelper(machine, client)
+	require.NoError(t, err)
+
+	_, _, err = r.claimHost(t.Context(), machine, patchHelper)
+	require.NoError(t, err)
+
+	assert.Equal(t, "172.16.16.2", machine.Status.ResolvedInternalIP)
+}
+
+func TestClaimHostInternalIPEmptyWhenNoHardware(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	machine := newClaimingByotMachine(testHostName)
+	host := newAvailableByotHost(testHostName, testHostPublicIP)
+
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}, &infrav1.ByotHost{}).
+		Build()
+
+	r := NewByotMachineReconciler(client)
+	patchHelper, err := patch.NewHelper(machine, client)
+	require.NoError(t, err)
+
+	_, _, err = r.claimHost(t.Context(), machine, patchHelper)
+	require.NoError(t, err)
+
+	assert.Empty(t, machine.Status.ResolvedInternalIP)
+}

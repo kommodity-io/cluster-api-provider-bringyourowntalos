@@ -54,11 +54,11 @@ type ByotHostReconciler struct {
 
 	// Discover runs the maintenance discovery surface. Defaults to
 	// discoverHost; injectable for tests.
-	Discover func(context.Context, string) (DiscoveryResult, error)
+	Discover func(context.Context, Endpoints, string) (DiscoveryResult, error)
 
 	// ProbeMaintenance reports maintenance liveness. Defaults to
 	// probeMaintenance; injectable for tests.
-	ProbeMaintenance func(context.Context, string) bool
+	ProbeMaintenance func(context.Context, Endpoints) bool
 
 	// LivenessInterval overrides the steady-state probe requeue delay.
 	LivenessInterval time.Duration
@@ -186,7 +186,7 @@ func (r *ByotHostReconciler) reconcileProbing(
 	patchHelper *patch.Helper,
 	host *infrav1.ByotHost,
 ) (ctrl.Result, error) {
-	result, err := r.Discover(ctx, host.Spec.PublicIP)
+	result, err := r.Discover(ctx, hostEndpoints(host), host.Spec.PublicIP)
 	if err != nil {
 		return r.recordDiscoveryFailure(ctx, patchHelper, host, err)
 	}
@@ -217,7 +217,7 @@ func (r *ByotHostReconciler) reconcileAvailable(
 	patchHelper *patch.Helper,
 	host *infrav1.ByotHost,
 ) (ctrl.Result, error) {
-	if r.ProbeMaintenance(ctx, host.Spec.PublicIP) {
+	if r.ProbeMaintenance(ctx, hostEndpoints(host)) {
 		host.Status.MaintenanceMode = true
 		host.Status.LastProbedAt = nowPtr()
 		host.Status.ProbeFailureCount = 0
@@ -242,7 +242,7 @@ func (r *ByotHostReconciler) reconcileUnavailable(
 	patchHelper *patch.Helper,
 	host *infrav1.ByotHost,
 ) (ctrl.Result, error) {
-	if !r.ProbeMaintenance(ctx, host.Spec.PublicIP) {
+	if !r.ProbeMaintenance(ctx, hostEndpoints(host)) {
 		host.Status.LastProbedAt = nowPtr()
 		applyDiscoveryLabels(host)
 
@@ -255,7 +255,7 @@ func (r *ByotHostReconciler) reconcileUnavailable(
 	}
 
 	// Recovered: re-discover features (they may have changed after an outage).
-	result, err := r.Discover(ctx, host.Spec.PublicIP)
+	result, err := r.Discover(ctx, hostEndpoints(host), host.Spec.PublicIP)
 	if err != nil {
 		return r.recordDiscoveryFailure(ctx, patchHelper, host, err)
 	}
@@ -285,7 +285,7 @@ func (r *ByotHostReconciler) reconcileReleasing(
 	patchHelper *patch.Helper,
 	host *infrav1.ByotHost,
 ) (ctrl.Result, error) {
-	if !r.ProbeMaintenance(ctx, host.Spec.PublicIP) {
+	if !r.ProbeMaintenance(ctx, hostEndpoints(host)) {
 		host.Status.LastProbedAt = nowPtr()
 		applyDiscoveryLabels(host)
 
@@ -297,7 +297,7 @@ func (r *ByotHostReconciler) reconcileReleasing(
 		return ctrl.Result{RequeueAfter: hostProbeRequeue}, nil
 	}
 
-	result, err := r.Discover(ctx, host.Spec.PublicIP)
+	result, err := r.Discover(ctx, hostEndpoints(host), host.Spec.PublicIP)
 	if err != nil {
 		return r.recordDiscoveryFailure(ctx, patchHelper, host, err)
 	}
@@ -422,6 +422,8 @@ func (r *ByotHostReconciler) populateFromDiscovery(host *infrav1.ByotHost, resul
 		Memory:            result.Memory,
 		Disks:             result.Disks,
 		NetworkInterfaces: result.NetworkInterfaces,
+		ExternalIP:        result.ExternalIP,
+		InternalIP:        result.InternalIP,
 		GPUs:              result.GPUs,
 	}
 	host.Status.LastProbedAt = nowPtr()

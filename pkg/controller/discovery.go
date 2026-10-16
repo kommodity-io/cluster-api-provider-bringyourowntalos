@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
+	cosiresource "github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
@@ -18,6 +20,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
+	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	storageapi "github.com/siderolabs/talos/pkg/machinery/api/storage"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -54,22 +57,24 @@ type DiscoveryResult struct {
 	Memory            resource.Quantity
 	Disks             []infrav1.HostDisk
 	NetworkInterfaces []string
+	ExternalIP        string
+	InternalIP        string
 	GPUs              *infrav1.HostGPU
 	Identity          *infrav1.HostIdentity
 }
 
-// discoverHost runs the maintenance-mode discovery surface against publicIP:
-// Version, Memory, Disks, Dmesg (CPU + platform), and LS /sys/class/net. It
-// reuses the insecure maintenance client.
-func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error) {
-	client, err := maintenanceClient(ctx, publicIP)
+// discoverHost runs maintenance-mode discovery (Version, Memory, Disks,
+// CPU, GPU, Platform, NUMA, NICs, IPs) over all endpoints via the insecure
+// client. publicIP classifies which discovered address is external.
+func discoverHost(ctx context.Context, endpoints Endpoints, publicIP string) (DiscoveryResult, error) {
+	client, err := maintenanceClient(ctx, endpoints)
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
 
 	defer client.Close() //nolint:errcheck
 
-	ctx, cancel := context.WithTimeout(talosclient.WithNode(ctx, publicIP), applyTimeout)
+	ctx, cancel := context.WithTimeout(ctx, applyTimeout)
 	defer cancel()
 
 	result := DiscoveryResult{}
@@ -89,19 +94,18 @@ func discoverHost(ctx context.Context, publicIP string) (DiscoveryResult, error)
 		return result, fmt.Errorf("disk discovery: %w", err)
 	}
 
-	dmesg, err := readDmesg(ctx, client)
-	if err != nil {
-		return result, fmt.Errorf("dmesg discovery: %w", err)
-	}
+	discoverCPU(ctx, client.COSI, &result)
+	discoverGPUs(ctx, client.COSI, &result)
+	discoverPlatform(ctx, client.COSI, &result)
 
-	result.CPU = parseCPU(dmesg)
-	result.Platform = parsePlatform(dmesg)
-	result.GPUs = parseGPUs(dmesg)
+	discoverNumaNodes(ctx, client, &result)
 
 	err = discoverNetInterfaces(ctx, client, &result)
 	if err != nil {
 		return result, fmt.Errorf("net discovery: %w", err)
 	}
+
+	discoverAddresses(ctx, client.COSI, publicIP, &result)
 
 	// Identity is best-effort: a host without SMBIOS UUID and without a
 	// physical NIC still completes discovery, just with an empty Identity.
@@ -174,60 +178,20 @@ func diskToHostDisk(disk *storageapi.Disk) infrav1.HostDisk {
 
 func diskDeviceName(disk *storageapi.Disk) string {
 	if name := disk.GetDeviceName(); name != "" {
+		// Talos may return either a bare name ("sda") or a full path
+		// ("/dev/sda"); normalise to the full /dev/ path without doubling.
+		if strings.HasPrefix(name, "/dev/") {
+			return name
+		}
+
 		return "/dev/" + name
 	}
 
 	return disk.GetName()
 }
 
-// readDmesg collects the kernel log buffer into a single string.
-func readDmesg(ctx context.Context, client *talosclient.Client) (string, error) {
-	stream, err := client.Dmesg(ctx, false, false)
-	if err != nil {
-		return "", err
-	}
-
-	var buf strings.Builder
-
-	for {
-		msg, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-
-		if err != nil {
-			return "", err
-		}
-
-		if msg == nil {
-			continue
-		}
-
-		buf.Write(msg.GetBytes())
-		buf.WriteByte('\n')
-	}
-
-	return buf.String(), nil
-}
-
-var (
-	// platformRegexp extracts the Talos platform from the kernel cmdline.
-	platformRegexp = regexp.MustCompile(`talos\.platform=(\S+)`)
-	// cpuCoresRegexp extracts nr_cpu_ids (total logical CPUs).
-	cpuCoresRegexp = regexp.MustCompile(`nr_cpu_ids[=: ]+(\d+)`)
-	// cpuPackagesRegexp extracts the number of CPU packages/sockets.
-	cpuPackagesRegexp = regexp.MustCompile(`(?:packages|sockets)[=: ]+(\d+)`)
-	// numaRegexp extracts NUMA node numbers.
-	numaRegexp = regexp.MustCompile(`Node\s+(\d+)`)
-	// pciDeviceRegexp extracts the PCI address, vendor, device, and class
-	// from a kernel dmesg enumeration line, e.g.
-	//   "pci 0000:01:00.0: [10de:2331] type 00 class 0x030200 PCIe Endpoint".
-	pciDeviceRegexp = regexp.MustCompile(
-		`pci ([0-9a-f:\.]+): \[([0-9a-f]{4}):([0-9a-f]{4})\] type \d+ class 0x([0-9a-f]{6})`)
-)
-
-// gpuVendorNames maps a PCI vendor id (lowercase hex) to the lowercase label
-// value used for byot.io/gpu-vendor.
+// gpuVendorNames maps a PCI vendor id (lowercase hex, without 0x prefix) to
+// the lowercase label value used for byot.io/gpu-vendor.
 //
 //nolint:gochecknoglobals // static vendor table
 var gpuVendorNames = map[string]string{
@@ -236,14 +200,15 @@ var gpuVendorNames = map[string]string{
 	"8086": "intel",
 }
 
-// pciDisplayClassBase is the PCI base class for display controllers (0x03).
-const pciDisplayClassBase = 0x03
+// pciDisplayClassID is the PCI base class for display controllers (0x03).
+// Talos PCIDevice resources expose class_id as a hex string like "0x03".
+const pciDisplayClassID = "0x03"
 
-// gpuModelTable maps vendor:device (lowercase hex) to the normalized model
-// family and per-GPU HBM in bytes. Derived from the pci.ids database
-// (https://pci-ids.ucw.cz). Only datacenter GPUs (Hopper, Blackwell, Ampere
-// compute) are listed; workstation/consumer SKUs are excluded. HBM is taken
-// from the product name where present, otherwise from vendor specs.
+// gpuModelTable maps vendor:device (lowercase hex, without 0x prefix) to the
+// normalized model family and per-GPU HBM in bytes. Derived from the pci.ids
+// database (https://pci-ids.ucw.cz). Only datacenter GPUs (Hopper, Blackwell,
+// Ampere compute) are listed; workstation/consumer SKUs are excluded. HBM is
+// taken from the product name where present, otherwise from vendor specs.
 //
 //nolint:gochecknoglobals // static device table
 var gpuModelTable = map[string]struct {
@@ -305,67 +270,114 @@ var gpuModelTable = map[string]struct {
 	"1002:75a3": {"mi355x", 288 << 30},
 }
 
-// parseGPUs scans the kernel dmesg log for PCI display-class devices from a
-// known GPU vendor and returns an aggregated HostGPU summary. It is
-// best-effort: a parse anomaly is logged by the caller and skipped, and a
-// host with no GPU returns nil. Mixed (vendor,device) pairs collapse to a
-// count+vendor summary with Mixed=true and no model.
-func parseGPUs(dmesg string) *infrav1.HostGPU {
-	counts := countGPUPairs(dmesg)
+// platformRegexp extracts the Talos platform from the kernel cmdline string.
+var platformRegexp = regexp.MustCompile(`talos\.platform=(\S+)`)
+
+// discoverCPU populates CPU topology from Talos COSI Processor resources.
+// Each Processor resource represents one physical socket. CoreCount is
+// per-socket; total cores = sum across all processors. Defaults to a
+// single-CPU, single-package host when no Processor resources are available.
+func discoverCPU(ctx context.Context, cosi state.CoreState, result *DiscoveryResult) {
+	cpu := infrav1.HostCPU{
+		Cores:     1,
+		Packages:  1,
+		NumaNodes: 1,
+	}
+
+	procs, err := safe.StateList[*hardware.Processor](ctx, cosi, cosiresource.NewMetadata(
+		hardware.NamespaceName, hardware.ProcessorType, "", cosiresource.VersionUndefined))
+	if err != nil {
+		log.FromContext(ctx).Error(err, "listing Processor resources from COSI")
+
+		result.CPU = cpu
+
+		return
+	}
+
+	var totalCores int32
+
+	sockets := map[string]struct{}{}
+
+	for proc := range procs.All() {
+		spec := proc.TypedSpec()
+		// Skip unpopulated sockets: Talos creates a Processor resource for
+		// every SMBIOS type-4 entry, but zeroes Socket/CoreCount when the
+		// socket is empty. An empty socket must not inflate Packages.
+		if spec.Socket == "" {
+			continue
+		}
+
+		totalCores += int32(spec.CoreCount) //nolint:gosec // bounded hardware core count
+		sockets[spec.Socket] = struct{}{}
+	}
+
+	if len(sockets) > 0 {
+		cpu.Packages = int32(len(sockets)) //nolint:gosec // bounded socket count
+	}
+
+	if totalCores > 0 {
+		cpu.Cores = totalCores
+	}
+
+	result.CPU = cpu
+}
+
+// discoverGPUs populates the GPU summary from Talos COSI PCIDevice resources.
+// Display-class (0x03) devices from known GPU vendors are counted by
+// (vendor, device) pair. Homogeneous hosts get model + HBM from the model
+// table; mixed hosts collapse to count+vendor with Mixed=true. A host with no
+// GPU leaves result.GPUs nil. Best-effort: a COSI error is logged and GPUs are
+// left nil.
+func discoverGPUs(ctx context.Context, cosi state.CoreState, result *DiscoveryResult) {
+	devs, err := safe.StateList[*hardware.PCIDevice](ctx, cosi, cosiresource.NewMetadata(
+		hardware.NamespaceName, hardware.PCIDeviceType, "", cosiresource.VersionUndefined))
+	if err != nil {
+		log.FromContext(ctx).Error(err, "listing PCIDevice resources from COSI")
+
+		return
+	}
+
+	counts := map[pairKey]int32{}
+
+	for dev := range devs.All() {
+		spec := dev.TypedSpec()
+
+		// Talos reports class_id as "0x03" for display controllers.
+		if !strings.EqualFold(spec.ClassID, pciDisplayClassID) {
+			continue
+		}
+
+		vendor := strings.TrimPrefix(strings.ToLower(spec.VendorID), "0x")
+		if _, ok := gpuVendorNames[vendor]; !ok {
+			continue
+		}
+
+		device := strings.TrimPrefix(strings.ToLower(spec.ProductID), "0x")
+		counts[pairKey{vendor: vendor, device: device}]++
+	}
 
 	if len(counts) == 0 {
-		return nil
+		return
 	}
 
 	gpu := &infrav1.HostGPU{}
 
-	for _, pairCount := range counts {
-		gpu.Count += pairCount
+	for _, c := range counts {
+		gpu.Count += c
 	}
 
 	if len(counts) == 1 {
 		populateHomogeneousGPU(gpu, counts)
-
-		return gpu
+	} else {
+		populateMixedGPU(gpu, counts)
 	}
 
-	populateMixedGPU(gpu, counts)
-
-	return gpu
+	result.GPUs = gpu
 }
 
 // pairKey identifies a (vendor, device) PCI pair.
 type pairKey struct {
 	vendor, device string
-}
-
-// countGPUPairs tallies display-class PCI devices from known GPU vendors in
-// the dmesg log, keyed by (vendor, device).
-func countGPUPairs(dmesg string) map[pairKey]int32 {
-	counts := map[pairKey]int32{}
-
-	for _, match := range pciDeviceRegexp.FindAllStringSubmatch(dmesg, -1) {
-		vendor := match[2]
-		device := match[3]
-
-		class, err := strconv.ParseUint(match[4], 16, 32)
-		if err != nil {
-			continue
-		}
-
-		// Display class is 0x03xx; the base class is the high byte.
-		if class>>16 != pciDisplayClassBase {
-			continue
-		}
-
-		if _, ok := gpuVendorNames[vendor]; !ok {
-			continue
-		}
-
-		counts[pairKey{vendor, device}]++
-	}
-
-	return counts
 }
 
 // populateHomogeneousGPU fills a single-pair summary: vendor, model, device
@@ -405,59 +417,90 @@ func populateMixedGPU(gpu *infrav1.HostGPU, counts map[pairKey]int32) {
 	gpu.Mixed = true
 }
 
-// parseCPU extracts CPU topology from the kernel dmesg log. Missing fields
-// default to 1 (a single-CPU, single-package, single-NUMA host).
-//
-//nolint:gosec // straightforward integer parsing of bounded hardware fields
-func parseCPU(dmesg string) infrav1.HostCPU {
-	cpu := infrav1.HostCPU{
-		Cores:     1,
-		Packages:  1,
-		NumaNodes: 1,
+// discoverPlatform extracts the Talos platform from the KernelCmdline COSI
+// resource. Best-effort: a COSI error is logged and platform is left empty.
+func discoverPlatform(ctx context.Context, cosi state.CoreState, result *DiscoveryResult) {
+	kernelCmdline, err := safe.StateGetByID[*runtime.KernelCmdline](ctx, cosi, runtime.KernelCmdlineID)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "fetching KernelCmdline from COSI")
+
+		return
 	}
 
-	if m := cpuCoresRegexp.FindStringSubmatch(dmesg); m != nil {
-		v, err := strconv.Atoi(m[1])
-		if err == nil && v > 0 {
-			cpu.Cores = int32(v)
-		}
-	}
-
-	if m := cpuPackagesRegexp.FindStringSubmatch(dmesg); m != nil {
-		v, err := strconv.Atoi(m[1])
-		if err == nil && v > 0 {
-			cpu.Packages = int32(v)
-		}
-	}
-
-	if nodes := distinctNumaNodes(dmesg); nodes > 0 {
-		cpu.NumaNodes = int32(nodes)
-	}
-
-	return cpu
+	result.Platform = parsePlatform(kernelCmdline.TypedSpec().Cmdline)
 }
 
-// distinctNumaNodes counts distinct NUMA node numbers in the dmesg log.
-func distinctNumaNodes(dmesg string) int {
-	seen := map[int]struct{}{}
-
-	for _, m := range numaRegexp.FindAllStringSubmatch(dmesg, -1) {
-		n, err := strconv.Atoi(m[1])
-		if err == nil {
-			seen[n] = struct{}{}
-		}
-	}
-
-	return len(seen)
-}
-
-// parsePlatform extracts the Talos platform from the kernel cmdline in dmesg.
-func parsePlatform(dmesg string) string {
-	if m := platformRegexp.FindStringSubmatch(dmesg); m != nil {
+// parsePlatform extracts the Talos platform from a kernel cmdline string.
+func parsePlatform(cmdline string) string {
+	if m := platformRegexp.FindStringSubmatch(cmdline); m != nil {
 		return m[1]
 	}
 
 	return ""
+}
+
+// discoverNumaNodes counts NUMA nodes by listing /sys/devices/system/node and
+// counting entries matching node\d+. Best-effort: errors are logged and
+// NumaNodes is left at its default (1).
+func discoverNumaNodes(ctx context.Context, client *talosclient.Client, result *DiscoveryResult) {
+	stream, err := client.LS(ctx, &machineapi.ListRequest{Root: "/sys/devices/system/node"})
+	if err != nil {
+		log.FromContext(ctx).Error(err, "listing /sys/devices/system/node for NUMA discovery")
+
+		return
+	}
+
+	count := 0
+
+	for {
+		info, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+
+		if err != nil {
+		log.FromContext(ctx).Error(err, "reading NUMA node directory listing")
+
+		return
+		}
+
+		if info == nil {
+			continue
+		}
+
+		name := info.GetRelativeName()
+		if name == "" {
+			name = info.GetName()
+		}
+
+		if isNumaNodeDir(name) {
+			count++
+		}
+	}
+
+	if count > 0 {
+		result.CPU.NumaNodes = int32(count)
+	}
+}
+
+// isNumaNodeDir returns true for names like "node0", "node1", etc.
+func isNumaNodeDir(name string) bool {
+	if !strings.HasPrefix(name, "node") {
+		return false
+	}
+
+	rest := name[len("node"):]
+	if rest == "" {
+		return false
+	}
+
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+
+	return true
 }
 
 func discoverNetInterfaces(
@@ -491,8 +534,8 @@ func discoverNetInterfaces(
 			name = info.GetName()
 		}
 
-		// Skip the loopback interface; only external interfaces matter.
-		if name == "" || name == "lo" {
+		// Skip loopback and the directory itself (LS returns "." for the root).
+		if name == "" || name == "lo" || name == "." {
 			continue
 		}
 
@@ -503,6 +546,67 @@ func discoverNetInterfaces(
 	result.NetworkInterfaces = ifaces
 
 	return nil
+}
+
+// discoverAddresses populates ExternalIP and InternalIP from Talos COSI
+// AddressStatus resources. ExternalIP is the IPv4 address matching publicIP;
+// InternalIP is the first RFC1918 IPv4 address that is not the external IP.
+// Loopback and link-local addresses are skipped. Best-effort: a COSI error
+// is logged and both fields are left empty.
+func discoverAddresses(
+	ctx context.Context,
+	cosi state.CoreState,
+	publicIP string,
+	result *DiscoveryResult,
+) {
+	addrs, err := safe.StateList[*network.AddressStatus](ctx, cosi, cosiresource.NewMetadata(
+		network.NamespaceName, network.AddressStatusType, "", cosiresource.VersionUndefined))
+	if err != nil {
+		log.FromContext(ctx).Error(err, "listing AddressStatus resources from COSI")
+
+		return
+	}
+
+	for addr := range addrs.All() {
+		spec := addr.TypedSpec()
+
+		// IPv4 only.
+		if spec.Family != nethelpers.FamilyInet4 {
+			continue
+		}
+
+		// Skip loopback and link-local scopes.
+		if spec.Scope == nethelpers.ScopeLink || spec.LinkName == "lo" {
+			continue
+		}
+
+		ipStr := spec.Address.Addr().String()
+		if ipStr == "" {
+			continue
+		}
+
+		if ipStr == publicIP {
+			result.ExternalIP = ipStr
+
+			continue
+		}
+
+		// First RFC1918 address wins as internal IP.
+		if result.InternalIP == "" && isRFC1918(ipStr) {
+			result.InternalIP = ipStr
+		}
+	}
+}
+
+// isRFC1918 reports whether ipStr is a private IPv4 address (10/8, 172.16/12,
+// 192.168/16).
+func isRFC1918(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+
+	return ip.IsPrivate()
 }
 
 // discoverIdentity fetches the reboot-stable hardware identity of the host:
@@ -601,14 +705,32 @@ func diskTypeLabel(typeName string) string {
 }
 
 // systemDisk returns the system disk from a discovery result, or nil.
+// When multiple disks report SystemDisk, md (RAID) devices are preferred
+// over raw block devices to avoid installing onto a RAID member.
 func systemDisk(disks []infrav1.HostDisk) *infrav1.HostDisk {
-	for i := range disks {
-		if disks[i].SystemDisk {
-			return &disks[i]
+	var fallback *infrav1.HostDisk
+
+	for idx := range disks {
+		if !disks[idx].SystemDisk {
+			continue
+		}
+
+		if isRAIDDevice(disks[idx].Name) {
+			return &disks[idx]
+		}
+
+		if fallback == nil {
+			fallback = &disks[idx]
 		}
 	}
 
-	return nil
+	return fallback
+}
+
+// isRAIDDevice reports whether the device name looks like a Linux md RAID
+// array (e.g. /dev/md127, /dev/md0).
+func isRAIDDevice(name string) bool {
+	return strings.HasPrefix(name, "/dev/md") || strings.HasPrefix(name, "md")
 }
 
 // applyDiscoveryLabels syncs the controller-managed byot.io/ labels on host

@@ -81,6 +81,12 @@ type ByotMachineSpec struct {
 	// (already applied); bump generation to force a same-ref reinstall.
 	// +optional
 	DesiredTalosVersion *string `json:"desiredTalosVersion,omitempty"`
+	// InstallDisk overrides auto-detection of the system install disk. When
+	// set (e.g. /dev/md127), it is injected as machine.install.disk directly,
+	// skipping the Talos storage API query. When empty, the controller
+	// auto-detects the system disk, preferring md (RAID) devices.
+	// +optional
+	InstallDisk *string `json:"installDisk,omitempty"`
 }
 
 // ByotMachineStatus defines the observed state of ByotMachine.
@@ -99,6 +105,12 @@ type ByotMachineStatus struct {
 	// adoption target.
 	// +optional
 	ResolvedPublicIP string `json:"resolvedPublicIP,omitempty"`
+	// ResolvedInternalIP is the discovered internal (RFC1918) IPv4 address
+	// of the claimed ByotHost, copied from host status at claim time. Empty
+	// when discovery found no private IPv4 address. Used to populate the
+	// MachineInternalIP entry in status.addresses.
+	// +optional
+	ResolvedInternalIP string `json:"resolvedInternalIP,omitempty"`
 
 	// LastAppliedConfigSHA records the SHA256 hash of the last machine
 	// configuration applied. When the bootstrap data changes, the controller

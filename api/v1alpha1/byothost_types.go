@@ -50,9 +50,10 @@ type HostClaimRef struct {
 	UID string `json:"uid"`
 }
 
-// HostCPU holds discovered CPU topology, parsed from the kernel dmesg log.
+// HostCPU holds discovered CPU topology, queried from Talos COSI Processor
+// resources and /sys/devices/system/node for NUMA.
 type HostCPU struct {
-	// Cores is the total number of logical CPUs (nr_cpu_ids).
+	// Cores is the total number of physical CPU cores across all sockets.
 	Cores int32 `json:"cores"`
 	// Packages is the number of physical CPU packages.
 	Packages int32 `json:"packages"`
@@ -124,15 +125,24 @@ type HostHardware struct {
 	// machine identity is in status.identity.hardwareAddr.
 	// +optional
 	NetworkInterfaces []string `json:"networkInterfaces,omitempty"`
+	// ExternalIP is the discovered IPv4 address matching spec.publicIP (the
+	// operator-provided adoption target). Empty when the public IP is not
+	// bound to any interface (e.g. NAT without the public IP on the host).
+	// +optional
+	ExternalIP string `json:"externalIP,omitempty"`
+	// InternalIP is the first discovered RFC1918 IPv4 address that is not
+	// the external IP. Empty when no private IPv4 address is found.
+	// +optional
+	InternalIP string `json:"internalIP,omitempty"`
 	// GPUs is the discovered GPU summary (count, vendor, model, memory).
 	// Nil when no GPU is present. Mixed models collapse to count+vendor only.
 	// +optional
 	GPUs *HostGPU `json:"gpus,omitempty"`
 }
 
-// HostGPU is the aggregated GPU summary discovered from the PCI bus via the
-// kernel dmesg log. Nodes are assumed homogeneous; a mixed-GPU host keeps
-// count/vendor but omits model and sets Mixed=true.
+// HostGPU is the aggregated GPU summary discovered from the PCI bus via
+// Talos COSI PCIDevice resources. Nodes are assumed homogeneous; a mixed-GPU
+// host keeps count/vendor but omits model and sets Mixed=true.
 type HostGPU struct {
 	// Vendor is the lowercase GPU vendor (nvidia, amd, intel). Omitted when
 	// the host has GPUs from more than one vendor.

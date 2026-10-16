@@ -39,6 +39,9 @@ const (
 
 	// testHostPublicIP is the example address used for resolved hosts in tests.
 	testHostPublicIP = "203.0.113.10"
+
+	// testHostInternalIP is the example RFC1918 address for resolved hosts.
+	testHostInternalIP = "10.0.0.5"
 )
 
 func clusterKey(obj metav1.Object) types.NamespacedName {
@@ -259,7 +262,7 @@ func TestByotMachineReconcileDoesNotReadoptOnFailedUpgrade(t *testing.T) {
 
 	reconciler := NewByotMachineReconciler(client)
 
-	reconciler.applyMachineConfig = func(_ context.Context, _ string, _ []byte, _ []byte) error {
+	reconciler.applyMachineConfig = func(_ context.Context, _ Endpoints, _ []byte, _ []byte) error {
 		applied++
 
 		return nil
@@ -414,7 +417,7 @@ func TestByotMachineReconcileDeleteReleasesClaimedNeverAdoptedHostWithoutReset(t
 	reconciler := NewByotMachineReconciler(client)
 	// The host is genuinely in maintenance mode (no config applied):
 	// the probe confirms this, so the reset is skipped.
-	reconciler.probeMaintenance = func(context.Context, string) bool { return true }
+	reconciler.probeMaintenance = func(context.Context, Endpoints) bool { return true }
 
 	err = client.Delete(t.Context(), byotMachine)
 	require.NoError(t, err)
@@ -472,7 +475,7 @@ func TestByotMachineReconcileDeleteResetsClaimedHostWhenNodeNotInMaintenance(t *
 	reconciler := NewByotMachineReconciler(client)
 	// Node is NOT in maintenance mode: config is applied, so the probe
 	// must return false, forcing a reset attempt.
-	reconciler.probeMaintenance = func(context.Context, string) bool { return false }
+	reconciler.probeMaintenance = func(context.Context, Endpoints) bool { return false }
 
 	err = client.Delete(t.Context(), byotMachine)
 	require.NoError(t, err)
@@ -603,7 +606,7 @@ func TestResetCredentialCandidatesInsecureOnly(t *testing.T) {
 func TestAttemptResetWithoutCredentials(t *testing.T) {
 	t.Parallel()
 
-	err := attemptReset(t.Context(), [][]byte{}, "203.0.113.10")
+	err := attemptReset(t.Context(), [][]byte{}, Endpoints{"203.0.113.10"})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNoResetCredentials)
 }
@@ -640,8 +643,8 @@ func TestNudgeKubeletAfterSplitReadoptFailsNonFatal(t *testing.T) {
 	// warning but never reverts adoption.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"),
 		true, false,
-		func(context.Context, string, []byte, string) (bool, error) { return true, nil },
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return true, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			return errTestKubeletNotDefined
 		})
 
@@ -660,8 +663,8 @@ func TestNudgeKubeletAfterSplitReadoptSucceeds(t *testing.T) {
 
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"),
 		true, false,
-		func(context.Context, string, []byte, string) (bool, error) { return true, nil },
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return true, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			return nil
 		})
 
@@ -678,12 +681,12 @@ func TestNudgeKubeletAfterSplitReadoptSkipsWhenNotBundleMatch(t *testing.T) {
 	// Fresh maintenance-mode adoption (bundleMatch=false): no kubelet restart
 	// nudge is issued, the kubelet starts on boot.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, nil, false, false,
-		func(context.Context, string, []byte, string) (bool, error) {
+		func(context.Context, Endpoints, []byte, string) (bool, error) {
 			t.Fatal("running probe must not be called when bundleMatch is false")
 
 			return false, nil
 		},
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when bundleMatch is false")
 
 			return nil
@@ -700,12 +703,12 @@ func TestNudgeKubeletAfterSplitReadoptSkipsWhenAlreadyReady(t *testing.T) {
 	// Re-apply on an already-adopted machine (wasReady=true): no nudge, the
 	// kubelet picks up the updated config without a restart.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, true,
-		func(context.Context, string, []byte, string) (bool, error) {
+		func(context.Context, Endpoints, []byte, string) (bool, error) {
 			t.Fatal("running probe must not be called when the machine was already ready")
 
 			return false, nil
 		},
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when the machine was already ready")
 
 			return nil
@@ -726,8 +729,8 @@ func TestNudgeKubeletAfterSplitReadoptSkipsFreshAdoption(t *testing.T) {
 	// race that previously recorded a spurious
 	// KubeletRestartNudge=False/RestartFailed right after a first adoption.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, false,
-		func(context.Context, string, []byte, string) (bool, error) { return false, nil },
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return false, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when the kubelet is not yet running")
 
 			return nil
@@ -745,8 +748,8 @@ func TestNudgeKubeletAfterSplitReadoptSkipsOnRunningProbeError(t *testing.T) {
 	// nudge is skipped without recording a condition. The kubelet registers
 	// on boot regardless.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, false,
-		func(context.Context, string, []byte, string) (bool, error) { return false, errTestKubeletNotDefined },
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return false, errTestKubeletNotDefined },
+		func(context.Context, Endpoints, []byte, string) error {
 			t.Fatal("restart must not be called when the running probe fails")
 
 			return nil
@@ -767,8 +770,8 @@ func TestNudgeKubeletAfterSplitReadoptFiresOnRoundTrip(t *testing.T) {
 	// re-register. The previouslyAdopted (config hash) guard could not
 	// distinguish this from a fresh adoption; the running probe can.
 	nudgeKubeletAfterReadopt(t.Context(), byotMachine, []byte("talosconfig"), true, false,
-		func(context.Context, string, []byte, string) (bool, error) { return true, nil },
-		func(context.Context, string, []byte, string) error {
+		func(context.Context, Endpoints, []byte, string) (bool, error) { return true, nil },
+		func(context.Context, Endpoints, []byte, string) error {
 			return nil
 		})
 
@@ -1016,7 +1019,9 @@ func workloadClientBuilder(t *testing.T) *fake.ClientBuilder {
 	scheme := runtime.NewScheme()
 	require.NoError(t, corev1.AddToScheme(scheme))
 
-	return fake.NewClientBuilder().WithScheme(scheme)
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&corev1.Node{})
 }
 
 func TestUpdateNodeProviderIDPatchesNodeAndSetsFlag(t *testing.T) {
@@ -1306,6 +1311,253 @@ func TestUpdateNodeProviderIDReturnsErrorOnPatchFailure(t *testing.T) {
 	assert.False(t, updated.Status.NodeUpdated)
 }
 
+func TestUpdateNodeProviderIDPatchesAddressesWithInternalIP(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Status.ResolvedInternalIP = testHostInternalIP
+	machine := newOwningMachine("test-bootstrap")
+	node := newWorkloadNode(testMachineName, "")
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+	assertHasNodeAddress(t, patched, corev1.NodeInternalIP, testHostInternalIP)
+}
+
+func TestUpdateNodeProviderIDPatchesExternalIPPreservingInternalIP(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Status.ResolvedInternalIP = testHostInternalIP
+	machine := newOwningMachine("test-bootstrap")
+
+	node := newWorkloadNode(testMachineName, "")
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeInternalIP, Address: testHostInternalIP},
+		{Type: corev1.NodeHostName, Address: "test-machine"},
+	}
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+	assertHasNodeAddress(t, patched, corev1.NodeInternalIP, testHostInternalIP)
+	assertHasNodeAddress(t, patched, corev1.NodeHostName, "test-machine")
+}
+
+func TestUpdateNodeProviderIDPatchesAddressesWhenProviderIDSet(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	machine := newOwningMachine("test-bootstrap")
+
+	// providerID already set by a prior run, but addresses missing.
+	node := newWorkloadNode(testMachineName, infrav1.ProviderIDPrefix+"203.0.113.10")
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+}
+
+func TestUpdateNodeProviderIDNoopWhenProviderIDAndAddressesSet(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Status.ResolvedInternalIP = testHostInternalIP
+	machine := newOwningMachine("test-bootstrap")
+
+	node := newWorkloadNode(testMachineName, infrav1.ProviderIDPrefix+"203.0.113.10")
+	node.Status.Addresses = []corev1.NodeAddress{
+		{Type: corev1.NodeExternalIP, Address: "203.0.113.10"},
+		{Type: corev1.NodeInternalIP, Address: testHostInternalIP},
+	}
+
+	patchCalls := 0
+	workload := workloadClientBuilder(t).WithObjects(node).
+		WithInterceptorFuncs(patchCountInterceptor(&patchCalls)).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.Zero(t, patchCalls)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+}
+
+// TestUpdateNodeProviderIDPatchesOnlyExternalIPWhenNoInternalIP is the test
+// for case 9: resolvedInternalIP empty (no RFC1918 discovered) -> only
+// ExternalIP patched.
+func TestUpdateNodeProviderIDPatchesOnlyExternalIPWhenNoInternalIP(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	// ResolvedInternalIP intentionally left empty.
+	machine := newOwningMachine("test-bootstrap")
+	node := newWorkloadNode(testMachineName, "")
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+
+	for _, addr := range patched.Status.Addresses {
+		assert.NotEqual(t, corev1.NodeInternalIP, addr.Type,
+			"must not patch InternalIP when resolvedInternalIP is empty")
+	}
+}
+
+// assertHasNodeAddress asserts that a Node's status.addresses contains an
+// entry of the given type with the given address.
+func assertHasNodeAddress(
+	t *testing.T, node *corev1.Node, addrType corev1.NodeAddressType, address string,
+) {
+	t.Helper()
+
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == addrType && addr.Address == address {
+			return
+		}
+	}
+
+	t.Fatalf("Node %s missing address %s=%s; have %v",
+		node.Name, addrType, address, node.Status.Addresses)
+}
+
+// patchCountInterceptor returns interceptor.Funcs whose Patch and
+// SubResourcePatch both increment *calls, for asserting no patches issued.
+func patchCountInterceptor(calls *int) interceptor.Funcs {
+	return interceptor.Funcs{
+		Patch: func(
+			context.Context,
+			ctrlclient.WithWatch,
+			ctrlclient.Object,
+			ctrlclient.Patch,
+			...ctrlclient.PatchOption,
+		) error {
+			*calls++
+
+			return nil
+		},
+		SubResourcePatch: func(
+			_ context.Context,
+			_ ctrlclient.Client,
+			_ string,
+			_ ctrlclient.Object,
+			_ ctrlclient.Patch,
+			_ ...ctrlclient.SubResourcePatchOption,
+		) error {
+			*calls++
+
+			return nil
+		},
+	}
+}
+
 const (
 	// testInstallerV1139 is the desired installer image ref for upgrade tests.
 	testInstallerV1139 = "ghcr.io/siderolabs/installer:v1.13.9"
@@ -1337,9 +1589,9 @@ func newUpgradeByotMachine(desired string) *infrav1.ByotMachine {
 func upgradeReconciler(
 	t *testing.T,
 	client ctrlclient.Client,
-	versionProbeFn func(context.Context, string, []byte) (string, error),
-	upgradeFn func(context.Context, string, []byte, string) (string, error),
-	bootIDFn ...func(context.Context, string, []byte) (string, error),
+	versionProbeFn func(context.Context, Endpoints, []byte) (string, error),
+	upgradeFn func(context.Context, Endpoints, []byte, string) (string, error),
+	bootIDFn ...func(context.Context, Endpoints, []byte) (string, error),
 ) *ByotMachineReconciler {
 	t.Helper()
 
@@ -1353,7 +1605,7 @@ func upgradeReconciler(
 		// Default: boot-id read permission-denied → InFlight uses the
 		// reachability + version-change fallback (exercises the path a
 		// credential without boot-id read permission takes).
-		reconciler.bootIDAuthenticated = func(context.Context, string, []byte) (string, error) {
+		reconciler.bootIDAuthenticated = func(context.Context, Endpoints, []byte) (string, error) {
 			return "", errBootIDUnauthorized
 		}
 	}
@@ -1363,12 +1615,12 @@ func upgradeReconciler(
 
 // scriptedVersionProbe returns scripted tags (or errors) in order, one per
 // call, failing the test if called more times than scripted.
-func scriptedVersionProbe(t *testing.T, results ...any) func(context.Context, string, []byte) (string, error) {
+func scriptedVersionProbe(t *testing.T, results ...any) func(context.Context, Endpoints, []byte) (string, error) {
 	t.Helper()
 
 	var calls int
 
-	return func(context.Context, string, []byte) (string, error) {
+	return func(context.Context, Endpoints, []byte) (string, error) {
 		require.Less(t, calls, len(results), "versionProbe called more than scripted")
 
 		value := results[calls]
@@ -1439,7 +1691,7 @@ func TestEnsureTalosVersionMismatchUpgradeAndComplete(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ string, _ []byte, image string) (string, error) {
+		func(_ context.Context, _ Endpoints, _ []byte, image string) (string, error) {
 			upgrades++
 
 			assert.Equal(t, testInstallerV1139, image)
@@ -1494,12 +1746,12 @@ func TestEnsureTalosVersionSameRefAlreadyAppliedSkipsUpgrade(t *testing.T) {
 	var upgrades int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			t.Fatal("version probe must not run on a deduped upgrade")
 
 			return "", nil
 		},
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			upgrades++
 
 			return "", nil
@@ -1555,8 +1807,8 @@ func TestEnsureTalosVersionProbeFailureStopsAtThreshold(t *testing.T) {
 	client := upgradeTestClient(t, byotMachine)
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) { return "", assert.AnError },
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) { return "", assert.AnError },
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1578,8 +1830,8 @@ func TestEnsureTalosVersionUpgradeFailureStopsAtThreshold(t *testing.T) {
 	client := upgradeTestClient(t, byotMachine)
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) { return "", assert.AnError },
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) { return "", assert.AnError },
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1607,7 +1859,7 @@ func TestEnsureTalosVersionUpgradeRPCErrorFailsAndResets(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8"),
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			upgrades++
 
 			return "", assert.AnError
@@ -1647,7 +1899,7 @@ func TestEnsureTalosVersionUpgradeRPCErrorResetFailureRetries(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8"),
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", assert.AnError
 		},
 	)
@@ -1677,12 +1929,12 @@ func TestEnsureTalosVersionOptOutSkipsUpgrade(t *testing.T) {
 	var probed int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			probed++
 
 			return "", nil
 		},
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1710,12 +1962,12 @@ func TestEnsureTalosVersionSkipsWhenNotReady(t *testing.T) {
 	var probed int
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			probed++
 
 			return "", nil
 		},
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			return "", nil
 		},
 	)
@@ -1751,12 +2003,12 @@ func TestEnsureTalosVersionRetriggerAfterFailure(t *testing.T) {
 	)
 
 	reconciler := upgradeReconciler(t, client,
-		func(context.Context, string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			probed++
 
 			return "v1.13.8", nil
 		},
-		func(context.Context, string, []byte, string) (string, error) {
+		func(context.Context, Endpoints, []byte, string) (string, error) {
 			upgrades++
 
 			return "", nil
@@ -1804,10 +2056,10 @@ func TestEnsureTalosVersionBootIDGateComplete(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"), // pre-upgrade probe + post-reboot refresh in the boot-id gate
-		func(_ context.Context, _ string, _ []byte, _ string) (string, error) {
+		func(_ context.Context, _ Endpoints, _ []byte, _ string) (string, error) {
 			return preReboot, nil // capture pre-reboot boot-id
 		},
-		func(context.Context, string, []byte) (string, error) {
+		func(context.Context, Endpoints, []byte) (string, error) {
 			return postReboot, nil // live boot-id differs → complete
 		},
 	)
@@ -1925,8 +2177,8 @@ func gateCluster(ready bool) *clusterv1.Cluster {
 // (dialing 127.0.0.1, refused) instead of looping on the gate.
 func gateReconciler(client ctrlclient.Client) *ByotMachineReconciler {
 	r := NewByotMachineReconciler(client)
-	r.probeMaintenance = func(context.Context, string) bool { return true }
-	r.probeAuthenticated = func(context.Context, string, []byte) bool { return false }
+	r.probeMaintenance = func(context.Context, Endpoints) bool { return true }
+	r.probeAuthenticated = func(context.Context, Endpoints, []byte) bool { return false }
 
 	return r
 }
@@ -2068,7 +2320,7 @@ func TestSyncHostTalosVersionMirrorsAfterUpgrade(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ string, _ []byte, _ string) (string, error) { return "", nil },
+		func(_ context.Context, _ Endpoints, _ []byte, _ string) (string, error) { return "", nil },
 	)
 
 	machine := newOwningMachine("test-bootstrap")
@@ -2120,7 +2372,7 @@ func TestReconcileAdoptedUpgradesBeforeLinking(t *testing.T) {
 
 	reconciler := upgradeReconciler(t, client,
 		scriptedVersionProbe(t, "v1.13.8", "v1.13.9"),
-		func(_ context.Context, _ string, _ []byte, image string) (string, error) {
+		func(_ context.Context, _ Endpoints, _ []byte, image string) (string, error) {
 			upgrades++
 
 			assert.Equal(t, testInstallerV1139, image)
@@ -2163,4 +2415,31 @@ func TestReconcileAdoptedUpgradesBeforeLinking(t *testing.T) {
 	patched = &corev1.Node{}
 	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
 	assert.Equal(t, infrav1.ProviderIDPrefix+testHostPublicIP, patched.Spec.ProviderID)
+}
+
+func TestMarkAdoptedSetsExternalAndInternalIP(t *testing.T) {
+	t.Parallel()
+
+	machine := newByotMachine(testHostPublicIP)
+	machine.Status.ResolvedInternalIP = "172.16.16.2"
+
+	markAdopted(machine, "abc123")
+
+	require.Len(t, machine.Status.Addresses, 2)
+	assert.Equal(t, clusterv1.MachineExternalIP, machine.Status.Addresses[0].Type)
+	assert.Equal(t, testHostPublicIP, machine.Status.Addresses[0].Address)
+	assert.Equal(t, clusterv1.MachineInternalIP, machine.Status.Addresses[1].Type)
+	assert.Equal(t, "172.16.16.2", machine.Status.Addresses[1].Address)
+}
+
+func TestMarkAdoptedOmitsInternalIPWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	machine := newByotMachine(testHostPublicIP)
+
+	markAdopted(machine, "abc123")
+
+	require.Len(t, machine.Status.Addresses, 1)
+	assert.Equal(t, clusterv1.MachineExternalIP, machine.Status.Addresses[0].Type)
+	assert.Equal(t, testHostPublicIP, machine.Status.Addresses[0].Address)
 }
