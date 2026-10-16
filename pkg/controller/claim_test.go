@@ -449,14 +449,14 @@ func TestClaimHostCustomRequeueAfterBootstrapFlowsThrough(t *testing.T) {
 		WithStatusSubresource(&infrav1.ByotMachine{}).
 		Build()
 
-	r := NewByotMachineReconciler(client)
+	reconciler := NewByotMachineReconciler(client)
 	custom := 42 * time.Second
-	r.RequeueAfterBootstrap = custom
+	reconciler.RequeueAfterBootstrap = custom
 
 	patchHelper, err := patch.NewHelper(machine, client)
 	require.NoError(t, err)
 
-	result, handled, err := r.claimHost(t.Context(), machine, patchHelper)
+	result, handled, err := reconciler.claimHost(t.Context(), machine, patchHelper)
 	require.NoError(t, err)
 	assert.True(t, handled)
 	assert.Equal(t, custom, result.RequeueAfter)

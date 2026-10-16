@@ -2507,6 +2507,7 @@ func TestEnsureTalosVersionCustomUpgradeThresholdStopsEarly(t *testing.T) {
 		},
 	)
 	reconciler.UpgradeThreshold = 3
+	reconciler.resetAdoptedHost = func(_ context.Context, _ *infrav1.ByotMachine) error { return nil }
 
 	updated := driveUpgradeUntilStopped(t, reconciler, client, byotMachine)
 
@@ -2542,8 +2543,8 @@ func TestEnsureTalosVersionCustomRequeueAfterUpgradeFlowsThrough(t *testing.T) {
 func TestByotMachineSetOptionsAppliesNonZeroOnly(t *testing.T) {
 	t.Parallel()
 
-	r := &ByotMachineReconciler{}
-	r.SetOptions(ByotMachineOptions{
+	reconciler := &ByotMachineReconciler{}
+	reconciler.SetOptions(ByotMachineOptions{
 		RequeueAfterBootstrap:   42 * time.Second,
 		RequeueAfterResetIssued: 0, // zero: kept as default
 		RequeueAfterNodeLink:    7 * time.Second,
@@ -2552,16 +2553,16 @@ func TestByotMachineSetOptionsAppliesNonZeroOnly(t *testing.T) {
 		UpgradeThreshold:        3,
 	})
 
-	assert.Equal(t, 42*time.Second, r.RequeueAfterBootstrap)
-	assert.Zero(t, r.RequeueAfterResetIssued)
-	assert.Equal(t, 7*time.Second, r.RequeueAfterNodeLink)
-	assert.Equal(t, 99*time.Second, r.RequeueAfterUpgrade)
-	assert.Zero(t, r.VersionProbeThreshold)
-	assert.Equal(t, int32(3), r.UpgradeThreshold)
+	assert.Equal(t, 42*time.Second, reconciler.RequeueAfterBootstrap)
+	assert.Zero(t, reconciler.RequeueAfterResetIssued)
+	assert.Equal(t, 7*time.Second, reconciler.RequeueAfterNodeLink)
+	assert.Equal(t, 99*time.Second, reconciler.RequeueAfterUpgrade)
+	assert.Zero(t, reconciler.VersionProbeThreshold)
+	assert.Equal(t, int32(3), reconciler.UpgradeThreshold)
 
 	// Accessors return defaults for zero-valued fields.
-	assert.Equal(t, requeueAfterResetIssued, r.requeueAfterResetIssued())
-	assert.Equal(t, versionProbeThreshold, r.versionProbeThreshold())
+	assert.Equal(t, requeueAfterResetIssued, reconciler.requeueAfterResetIssued())
+	assert.Equal(t, versionProbeThreshold, reconciler.versionProbeThreshold())
 }
 
 func TestByotMachineReconcileCustomRequeueAfterResetIssuedFlowsThrough(t *testing.T) {

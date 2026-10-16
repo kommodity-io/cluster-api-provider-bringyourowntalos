@@ -580,20 +580,20 @@ func TestByotHostReconcileCustomFailureThresholdFlipsAfterCustomCount(t *testing
 func TestByotHostSetOptionsAppliesNonZeroOnly(t *testing.T) {
 	t.Parallel()
 
-	r := &ByotHostReconciler{}
-	r.SetOptions(ByotHostOptions{
+	reconciler := &ByotHostReconciler{}
+	reconciler.SetOptions(ByotHostOptions{
 		LivenessInterval: 99 * time.Second,
 		// ProbeRequeue zero: kept as default (zero)
 		ClaimedRequeue:   7 * time.Minute,
 		FailureThreshold: 0,
 	})
 
-	assert.Equal(t, 99*time.Second, r.LivenessInterval)
-	assert.Zero(t, r.ProbeRequeue)
-	assert.Equal(t, 7*time.Minute, r.ClaimedRequeue)
-	assert.Zero(t, r.FailureThreshold)
+	assert.Equal(t, 99*time.Second, reconciler.LivenessInterval)
+	assert.Zero(t, reconciler.ProbeRequeue)
+	assert.Equal(t, 7*time.Minute, reconciler.ClaimedRequeue)
+	assert.Zero(t, reconciler.FailureThreshold)
 
 	// Accessors return defaults for zero-valued fields.
-	assert.Equal(t, hostProbeRequeue, r.probeRequeue())
-	assert.Equal(t, int32(hostFailureThreshold), r.failureThreshold())
+	assert.Equal(t, hostProbeRequeue, reconciler.probeRequeue())
+	assert.Equal(t, int32(hostFailureThreshold), reconciler.failureThreshold())
 }
