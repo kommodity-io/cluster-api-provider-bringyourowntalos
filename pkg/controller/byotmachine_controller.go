@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -15,11 +17,15 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"k8s.io/client-go/tools/clientcmd"
+	cloudproviderapi "k8s.io/cloud-provider/api"
+
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/finalizers"
+	"sigs.k8s.io/cluster-api/util/kubeconfig"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -174,6 +180,19 @@ type ByotMachineReconciler struct {
 	// tests. updateNodeProviderID skips when it is nil and falls back to the
 	// nodeLinkRetriggerAnnotation path in ensureNodeLinked.
 	getWorkloadClient func(ctx context.Context, cluster ctrlclient.ObjectKey) (ctrlclient.Client, error)
+
+	// ipDirectClient is a seam over the DNS-deadlock fallback path,
+	// injectable in tests. When ClusterCache returns
+	// ErrClusterNotConnected, updateNodeProviderID uses it to build a
+	// one-shot uncached client from the <cluster>-kubeconfig secret with
+	// the server URL hostname replaced by the ByotMachine's
+	// ResolvedPublicIP. nil in production (the real implementation is
+	// called directly); set by tests to inject a fake workload client.
+	ipDirectClient func(
+		ctx context.Context,
+		clusterKey ctrlclient.ObjectKey,
+		byotMachine *infrav1.ByotMachine,
+	) (ctrlclient.Client, error)
 
 	// upgrade seams, injectable in tests; default to the real helpers.
 	// See ensureTalosVersion. The pre-upgrade and in-flight probes run over
@@ -1307,10 +1326,24 @@ func (r *ByotMachineReconciler) linkNode(
 // errWorkloadNodePending signals the workload Node is not registered yet;
 // the kubelet registers it on boot. updateNodeProviderID requeues on it.
 var errWorkloadNodePending = errors.New("workload node not registered")
-// updateNodeProviderID patches Node spec.providerID and status.addresses
-// (ExternalIP always, InternalIP when missing) so CAPI can link the Machine
-// and downstream consumers can discover the external address. No CCM in byot,
-// so the controller owns both. Gated by status.nodeUpdated.
+
+// errRequeueKubeconfigPending signals the cluster kubeconfig secret is
+// not yet created by CAPI; the controller requeues until it appears.
+var errRequeueKubeconfigPending = errors.New("kubeconfig secret not yet available")
+// updateNodeProviderID patches Node spec.providerID, status.addresses
+// (ExternalIP always, InternalIP when missing), and removes the
+// uninitialized taint so CAPI can link the Machine and downstream
+// consumers can discover the external address. No CCM in byot, so the
+// controller owns both. Gated by status.nodeUpdated.
+//
+// When ClusterCache returns ErrClusterNotConnected (the cluster DNS
+// endpoint is not yet resolvable — the chicken-and-egg deadlock during
+// first control-plane bootstrap), the controller falls back to a
+// one-shot uncached client built from the <cluster>-kubeconfig secret.
+// The server URL's hostname is replaced with the ByotMachine's
+// ResolvedPublicIP (port preserved); the kube-apiserver serving cert
+// already includes the IP in its certSANs (injected by injectHostCertSANs).
+// If the kubeconfig secret is not yet available the controller requeues.
 func (r *ByotMachineReconciler) updateNodeProviderID(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -1332,16 +1365,13 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 		Name:      machine.Spec.ClusterName,
 	}
 
-	workloadClient, err := r.getWorkloadClient(ctx, clusterKey)
-
-	if errors.Is(err, clustercache.ErrClusterNotConnected) {
-		// Workload API not up yet (control-plane bootstrap race). Requeue;
-		// ensureNodeLinked's retrigger also compensates.
-		return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
-	}
-
+	workloadClient, err := r.resolveWorkloadClient(ctx, clusterKey, byotMachine)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to get workload cluster client for %s: %w", clusterKey, err)
+		if errors.Is(err, errRequeueKubeconfigPending) {
+			return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
+		}
+
+		return ctrl.Result{}, err
 	}
 
 	_, pErr := r.patchWorkloadNode(ctx, workloadClient, byotMachine, *byotMachine.Spec.ProviderID)
@@ -1367,10 +1397,92 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 	return ctrl.Result{}, nil
 }
 
-// patchWorkloadNode patches the Node's spec.providerID and status.addresses
-// via patch.NewHelper. The kubelet only advertises interface-bound IPs, so
-// NAT'd hosts need the controller to patch ExternalIP. Returns alreadySet
-// when no patch was needed.
+// resolveWorkloadClient returns the workload cluster client from
+// ClusterCache, or falls back to an IP-direct uncached client when DNS
+// is not yet resolvable (ErrClusterNotConnected). The fallback reads
+// the <cluster>-kubeconfig secret and overrides the server URL hostname
+// with the ByotMachine's ResolvedPublicIP.
+func (r *ByotMachineReconciler) resolveWorkloadClient(
+	ctx context.Context,
+	clusterKey ctrlclient.ObjectKey,
+	byotMachine *infrav1.ByotMachine,
+) (ctrlclient.Client, error) {
+	workloadClient, err := r.getWorkloadClient(ctx, clusterKey)
+	if err == nil {
+		return workloadClient, nil
+	}
+
+	if !errors.Is(err, clustercache.ErrClusterNotConnected) {
+		return nil, fmt.Errorf("failed to get workload cluster client for %s: %w", clusterKey, err)
+	}
+
+	ipDirect := r.ipDirectClient
+	if ipDirect == nil {
+		ipDirect = r.buildIPDirectClient
+	}
+
+	fallbackClient, fErr := ipDirect(ctx, clusterKey, byotMachine)
+	if fErr != nil {
+		if apierrors.IsNotFound(fErr) {
+			// Kubeconfig secret not yet created by CAPI; requeue.
+			return nil, errRequeueKubeconfigPending
+		}
+
+		return nil, fmt.Errorf("failed to build IP-direct client for %s: %w", clusterKey, fErr)
+	}
+
+	return fallbackClient, nil
+}
+
+// buildIPDirectClient builds a one-shot uncached Kubernetes client by
+// reading the <cluster>-kubeconfig secret from the management cluster,
+// parsing it into a rest.Config, and overriding the server URL hostname
+// with the ByotMachine's ResolvedPublicIP (preserving the port). Returns
+// an error if the kubeconfig secret is not yet available (caller
+// requeues). The kube-apiserver serving cert already includes the IP in
+// its certSANs (injected by injectHostCertSANs), so TLS validation
+// succeeds. This is the production implementation; tests inject a fake
+// via the ipDirectClient seam.
+func (r *ByotMachineReconciler) buildIPDirectClient(
+	ctx context.Context,
+	clusterKey ctrlclient.ObjectKey,
+	byotMachine *infrav1.ByotMachine,
+) (ctrlclient.Client, error) {
+	kubeconfigBytes, err := kubeconfig.FromSecret(ctx, r.Client, clusterKey)
+	if err != nil {
+		return nil, fmt.Errorf("kubeconfig secret for %s not available: %w", clusterKey, err)
+	}
+
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse kubeconfig for %s: %w", clusterKey, err)
+	}
+
+	serverURL, err := url.Parse(restConfig.Host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse server URL %q: %w", restConfig.Host, err)
+	}
+
+	// Replace the DNS hostname with the resolved public IP, preserving port.
+	if serverURL.Port() != "" {
+		serverURL.Host = net.JoinHostPort(byotMachine.Status.ResolvedPublicIP, serverURL.Port())
+	} else {
+		serverURL.Host = byotMachine.Status.ResolvedPublicIP
+	}
+
+	restConfig.Host = serverURL.String()
+
+	return ctrlclient.New(restConfig, ctrlclient.Options{Scheme: r.Scheme})
+}
+
+// patchWorkloadNode patches the Node's spec.providerID, status.addresses,
+// and removes the uninitialized taint — all via patch.NewHelper so spec
+// and status subresources are patched in one call. The kubelet only
+// advertises interface-bound IPs, so NAT'd hosts need the controller to
+// patch ExternalIP. With --cloud-provider=external kubelet sets the
+// node.cloudprovider.kubernetes.io/uninitialized taint at registration;
+// BYOT removes it here as the de-facto CCM InitializeNode. Returns
+// alreadySet when no patch was needed.
 func (r *ByotMachineReconciler) patchWorkloadNode(
 	ctx context.Context,
 	workloadClient ctrlclient.Client,
@@ -1382,30 +1494,21 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 		return false, err
 	}
 
-	providerIDMismatch, externalIPMissing, internalIPMissing := needsNodePatch(
+	providerIDMismatch, externalIPMissing, internalIPMissing, uninitializedTaintPresent := needsNodePatch(
 		node, providerID, byotMachine.Status.ResolvedPublicIP, byotMachine.Status.ResolvedInternalIP)
 
-	// Both providerID and addresses already correct — no patch needed.
-	if !providerIDMismatch && !externalIPMissing && !internalIPMissing {
+	// All fields already correct — no patch needed.
+	if !providerIDMismatch && !externalIPMissing && !internalIPMissing && !uninitializedTaintPresent {
 		return true, nil
 	}
 
-	// Use patch.NewHelper so spec (providerID) and status (addresses) are
-	// patched in one call, routed to their respective subresources.
 	patchHelper, err := patch.NewHelper(node, workloadClient)
 	if err != nil {
 		return false, fmt.Errorf("failed to create patch helper for workload Node %s: %w", byotMachine.Name, err)
 	}
 
-	if providerIDMismatch {
-		// Patch the Node providerID. Usually a cloud-controller-manager does
-		// this, but byot has no CCM.
-		node.Spec.ProviderID = providerID
-	}
-
-	if externalIPMissing || internalIPMissing {
-		applyNodeAddresses(node, byotMachine, externalIPMissing, internalIPMissing)
-	}
+	applyNodePatch(node, byotMachine, providerID,
+		providerIDMismatch, externalIPMissing, internalIPMissing, uninitializedTaintPresent)
 
 	err = patchHelper.Patch(ctx, node)
 	if err != nil {
@@ -1413,6 +1516,27 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 	}
 
 	return !providerIDMismatch, nil
+}
+
+// applyNodePatch mutates the Node in-place, setting providerID, addresses,
+// and removing the uninitialized taint — all in one strategic-merge patch.
+func applyNodePatch(
+	node *corev1.Node,
+	byotMachine *infrav1.ByotMachine,
+	providerID string,
+	providerIDMismatch, externalIPMissing, internalIPMissing, uninitializedTaintPresent bool,
+) {
+	if providerIDMismatch {
+		node.Spec.ProviderID = providerID
+	}
+
+	if externalIPMissing || internalIPMissing {
+		applyNodeAddresses(node, byotMachine, externalIPMissing, internalIPMissing)
+	}
+
+	if uninitializedTaintPresent {
+		node.Spec.Taints = removeUninitializedTaint(node.Spec.Taints)
+	}
 }
 
 // getWorkloadNode fetches the workload Node named after the ByotMachine.
@@ -1452,18 +1576,49 @@ func applyNodeAddresses(
 }
 
 // needsNodePatch reports which Node fields need patching: providerID
-// mismatch, missing ExternalIP, or missing InternalIP (false when
-// resolvedInternalIP is empty).
+// mismatch, missing ExternalIP, missing InternalIP (false when
+// resolvedInternalIP is empty), and the presence of the
+// node.cloudprovider.kubernetes.io/uninitialized taint (set by kubelet
+// with --cloud-provider=external at registration; BYOT removes it as
+// the de-facto CCM InitializeNode).
 func needsNodePatch(
 	node *corev1.Node,
 	providerID, resolvedPublicIP, resolvedInternalIP string,
-) (bool, bool, bool) {
+) (bool, bool, bool, bool) {
 	mismatch := node.Spec.ProviderID != providerID
 	extMissing := !hasNodeAddress(node, corev1.NodeExternalIP, resolvedPublicIP)
 	intMissing := resolvedInternalIP != "" &&
 		!hasNodeAddress(node, corev1.NodeInternalIP, resolvedInternalIP)
+	uninitializedTaintPresent := hasUninitializedTaint(node)
 
-	return mismatch, extMissing, intMissing
+	return mismatch, extMissing, intMissing, uninitializedTaintPresent
+}
+
+// hasUninitializedTaint reports whether the Node carries the
+// node.cloudprovider.kubernetes.io/uninitialized taint set by kubelet
+// when running with --cloud-provider=external.
+func hasUninitializedTaint(node *corev1.Node) bool {
+	for i := range node.Spec.Taints {
+		if node.Spec.Taints[i].Key == cloudproviderapi.TaintExternalCloudProvider {
+			return true
+		}
+	}
+
+	return false
+}
+
+// removeUninitializedTaint returns a copy of the Node's taints with the
+// node.cloudprovider.kubernetes.io/uninitialized taint removed.
+func removeUninitializedTaint(taints []corev1.Taint) []corev1.Taint {
+	filtered := make([]corev1.Taint, 0, len(taints))
+
+	for i := range taints {
+		if taints[i].Key != cloudproviderapi.TaintExternalCloudProvider {
+			filtered = append(filtered, taints[i])
+		}
+	}
+
+	return filtered
 }
 
 // hasNodeAddress reports whether the Node already has the given address.

@@ -10,6 +10,8 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.32.6
 	k8s.io/apimachinery v0.32.6
+	k8s.io/client-go v0.32.3
+	k8s.io/cloud-provider v0.32.3
 	sigs.k8s.io/cluster-api v1.10.10
 	sigs.k8s.io/controller-runtime v0.20.4
 )
@@ -283,7 +285,6 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	honnef.co/go/tools v0.7.0 // indirect
 	k8s.io/apiextensions-apiserver v0.32.3 // indirect
-	k8s.io/client-go v0.32.3 // indirect
 	k8s.io/cluster-bootstrap v0.32.3 // indirect
 	k8s.io/component-base v0.32.3 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
