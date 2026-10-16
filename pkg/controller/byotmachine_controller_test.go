@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -967,7 +968,7 @@ func TestNodeLinkRetriggerSelfFilterCreateDeleteGeneric(t *testing.T) {
 // Machine, with an empty providerID (the host-registry default: the kubelet
 // self-reports none because the IP is resolved at claim time).
 //
-//nolint:unparam // test builder: name always the owning Machine name by design
+
 func newWorkloadNode(name string, providerID string) *corev1.Node {
 	return &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -1152,6 +1153,9 @@ func TestUpdateNodeProviderIDNoopWhenNoClusterCache(t *testing.T) {
 	assert.False(t, updated.Status.NodeUpdated)
 }
 
+// TestUpdateNodeProviderIDRequeuesWhenClusterNotConnected verifies that
+// when ClusterCache returns ErrClusterNotConnected and the kubeconfig
+// secret is not yet available, the IP-direct fallback requeues.
 func TestUpdateNodeProviderIDRequeuesWhenClusterNotConnected(t *testing.T) {
 	t.Parallel()
 
@@ -1510,6 +1514,204 @@ func TestUpdateNodeProviderIDPatchesOnlyExternalIPWhenNoInternalIP(t *testing.T)
 		assert.NotEqual(t, corev1.NodeInternalIP, addr.Type,
 			"must not patch InternalIP when resolvedInternalIP is empty")
 	}
+}
+
+// TestUpdateNodeProviderIDFallsBackToIPDirectOnClusterNotConnected verifies
+// that when ClusterCache returns ErrClusterNotConnected, the controller
+// falls back to the ipDirectClient seam and patches the workload Node.
+func TestUpdateNodeProviderIDFallsBackToIPDirectOnClusterNotConnected(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	byotMachine.Status.ResolvedInternalIP = testHostInternalIP
+	machine := newOwningMachine("test-bootstrap")
+	node := newWorkloadNode(testMachineName, "")
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return nil, clustercache.ErrClusterNotConnected
+	}
+	reconciler.ipDirectClient = func(
+		context.Context, types.NamespacedName, *infrav1.ByotMachine,
+	) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+	assertHasNodeAddress(t, patched, corev1.NodeInternalIP, testHostInternalIP)
+}
+
+// TestUpdateNodeProviderIDRemovesUninitializedTaint verifies that the
+// node.cloudprovider.kubernetes.io/uninitialized taint is removed in the
+// same patch as providerID and addresses.
+func TestUpdateNodeProviderIDRemovesUninitializedTaint(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	machine := newOwningMachine("test-bootstrap")
+	node := newWorkloadNodeWithTaints(testMachineName, "", corev1.Taint{
+		Key:    cloudproviderapi.TaintExternalCloudProvider,
+		Effect: corev1.TaintEffectNoSchedule,
+	})
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+
+	for _, taint := range patched.Spec.Taints {
+		assert.NotEqual(t, cloudproviderapi.TaintExternalCloudProvider, taint.Key,
+			"uninitialized taint must be removed")
+	}
+
+	assert.Empty(t, patched.Spec.Taints, "no taints should remain")
+}
+
+// TestUpdateNodeProviderIDPreservesExistingTaints verifies that only the
+// uninitialized taint is removed; other taints (e.g. node-role control-plane)
+// are preserved.
+func TestUpdateNodeProviderIDPreservesExistingTaints(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	machine := newOwningMachine("test-bootstrap")
+
+	controlPlaneTaint := corev1.Taint{
+		Key:    "node-role.kubernetes.io/control-plane",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	uninitializedTaint := corev1.Taint{
+		Key:    cloudproviderapi.TaintExternalCloudProvider,
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	node := newWorkloadNodeWithTaints(testMachineName, "", controlPlaneTaint, uninitializedTaint)
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+
+	assert.Len(t, patched.Spec.Taints, 1, "only the control-plane taint should remain")
+	assert.Equal(t, controlPlaneTaint.Key, patched.Spec.Taints[0].Key)
+}
+
+// TestUpdateNodeProviderIDNoTaintRemovalWhenAlreadyAbsent verifies that
+// when the Node has no uninitialized taint, the patch proceeds normally
+// for providerID and addresses without taint removal.
+func TestUpdateNodeProviderIDNoTaintRemovalWhenAlreadyAbsent(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine("203.0.113.10", "hash")
+	machine := newOwningMachine("test-bootstrap")
+
+	// Node with a control-plane taint but NO uninitialized taint.
+	controlPlaneTaint := corev1.Taint{
+		Key:    "node-role.kubernetes.io/control-plane",
+		Effect: corev1.TaintEffectNoSchedule,
+	}
+	node := newWorkloadNodeWithTaints(testMachineName, "", controlPlaneTaint)
+
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(newTestScheme(t)).
+		WithObjects(byotMachine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+	patchHelper, err := patch.NewHelper(byotMachine, mgmtClient)
+	require.NoError(t, err)
+
+	result, err := reconciler.updateNodeProviderID(t.Context(), patchHelper, byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	updated := &infrav1.ByotMachine{}
+	require.NoError(t, mgmtClient.Get(t.Context(), clusterKey(byotMachine), updated))
+	assert.True(t, updated.Status.NodeUpdated)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, infrav1.ProviderIDPrefix+"203.0.113.10", patched.Spec.ProviderID)
+	assertHasNodeAddress(t, patched, corev1.NodeExternalIP, "203.0.113.10")
+
+	// Control-plane taint preserved (not removed — only uninitialized
+	// taint would be removed, and it was absent).
+	assert.Len(t, patched.Spec.Taints, 1)
+	assert.Equal(t, controlPlaneTaint.Key, patched.Spec.Taints[0].Key)
+}
+
+// newWorkloadNodeWithTaints builds a workload Node with the given taints.
+func newWorkloadNodeWithTaints(name string, providerID string, taints ...corev1.Taint) *corev1.Node {
+	node := newWorkloadNode(name, providerID)
+	node.Spec.Taints = taints
+
+	return node
 }
 
 // assertHasNodeAddress asserts that a Node's status.addresses contains an
