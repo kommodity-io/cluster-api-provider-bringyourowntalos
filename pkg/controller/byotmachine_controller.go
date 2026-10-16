@@ -181,13 +181,9 @@ type ByotMachineReconciler struct {
 	// nodeLinkRetriggerAnnotation path in ensureNodeLinked.
 	getWorkloadClient func(ctx context.Context, cluster ctrlclient.ObjectKey) (ctrlclient.Client, error)
 
-	// ipDirectClient is a seam over the DNS-deadlock fallback path,
-	// injectable in tests. When ClusterCache returns
-	// ErrClusterNotConnected, updateNodeProviderID uses it to build a
-	// one-shot uncached client from the <cluster>-kubeconfig secret with
-	// the server URL hostname replaced by the ByotMachine's
-	// ResolvedPublicIP. nil in production (the real implementation is
-	// called directly); set by tests to inject a fake workload client.
+	// ipDirectClient is the DNS-deadlock fallback seam, injectable in
+	// tests. nil in production (buildIPDirectClient called directly);
+	// set by tests to inject a fake workload client.
 	ipDirectClient func(
 		ctx context.Context,
 		clusterKey ctrlclient.ObjectKey,
@@ -1330,20 +1326,9 @@ var errWorkloadNodePending = errors.New("workload node not registered")
 // errRequeueKubeconfigPending signals the cluster kubeconfig secret is
 // not yet created by CAPI; the controller requeues until it appears.
 var errRequeueKubeconfigPending = errors.New("kubeconfig secret not yet available")
-// updateNodeProviderID patches Node spec.providerID, status.addresses
-// (ExternalIP always, InternalIP when missing), and removes the
-// uninitialized taint so CAPI can link the Machine and downstream
-// consumers can discover the external address. No CCM in byot, so the
-// controller owns both. Gated by status.nodeUpdated.
-//
-// When ClusterCache returns ErrClusterNotConnected (the cluster DNS
-// endpoint is not yet resolvable — the chicken-and-egg deadlock during
-// first control-plane bootstrap), the controller falls back to a
-// one-shot uncached client built from the <cluster>-kubeconfig secret.
-// The server URL's hostname is replaced with the ByotMachine's
-// ResolvedPublicIP (port preserved); the kube-apiserver serving cert
-// already includes the IP in its certSANs (injected by injectHostCertSANs).
-// If the kubeconfig secret is not yet available the controller requeues.
+// updateNodeProviderID patches Node providerID, addresses, and removes
+// the uninitialized taint. On ErrClusterNotConnected it falls back to
+// an IP-direct uncached client from the <cluster>-kubeconfig secret.
 func (r *ByotMachineReconciler) updateNodeProviderID(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -1397,11 +1382,9 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 	return ctrl.Result{}, nil
 }
 
-// resolveWorkloadClient returns the workload cluster client from
-// ClusterCache, or falls back to an IP-direct uncached client when DNS
-// is not yet resolvable (ErrClusterNotConnected). The fallback reads
-// the <cluster>-kubeconfig secret and overrides the server URL hostname
-// with the ByotMachine's ResolvedPublicIP.
+// resolveWorkloadClient returns the workload client from ClusterCache,
+// falling back to an IP-direct uncached client when DNS is not yet
+// resolvable (ErrClusterNotConnected).
 func (r *ByotMachineReconciler) resolveWorkloadClient(
 	ctx context.Context,
 	clusterKey ctrlclient.ObjectKey,
@@ -1434,15 +1417,9 @@ func (r *ByotMachineReconciler) resolveWorkloadClient(
 	return fallbackClient, nil
 }
 
-// buildIPDirectClient builds a one-shot uncached Kubernetes client by
-// reading the <cluster>-kubeconfig secret from the management cluster,
-// parsing it into a rest.Config, and overriding the server URL hostname
-// with the ByotMachine's ResolvedPublicIP (preserving the port). Returns
-// an error if the kubeconfig secret is not yet available (caller
-// requeues). The kube-apiserver serving cert already includes the IP in
-// its certSANs (injected by injectHostCertSANs), so TLS validation
-// succeeds. This is the production implementation; tests inject a fake
-// via the ipDirectClient seam.
+// buildIPDirectClient builds a one-shot uncached client from the
+// <cluster>-kubeconfig secret with the server hostname replaced by
+// ResolvedPublicIP (port preserved). Tests inject via ipDirectClient.
 func (r *ByotMachineReconciler) buildIPDirectClient(
 	ctx context.Context,
 	clusterKey ctrlclient.ObjectKey,
@@ -1475,14 +1452,9 @@ func (r *ByotMachineReconciler) buildIPDirectClient(
 	return ctrlclient.New(restConfig, ctrlclient.Options{Scheme: r.Scheme})
 }
 
-// patchWorkloadNode patches the Node's spec.providerID, status.addresses,
-// and removes the uninitialized taint — all via patch.NewHelper so spec
-// and status subresources are patched in one call. The kubelet only
-// advertises interface-bound IPs, so NAT'd hosts need the controller to
-// patch ExternalIP. With --cloud-provider=external kubelet sets the
-// node.cloudprovider.kubernetes.io/uninitialized taint at registration;
-// BYOT removes it here as the de-facto CCM InitializeNode. Returns
-// alreadySet when no patch was needed.
+// patchWorkloadNode patches providerID, addresses, and removes the
+// uninitialized taint in one call. No CCM in byot — the controller owns
+// all three. Returns alreadySet when no patch was needed.
 func (r *ByotMachineReconciler) patchWorkloadNode(
 	ctx context.Context,
 	workloadClient ctrlclient.Client,
@@ -1576,11 +1548,8 @@ func applyNodeAddresses(
 }
 
 // needsNodePatch reports which Node fields need patching: providerID
-// mismatch, missing ExternalIP, missing InternalIP (false when
-// resolvedInternalIP is empty), and the presence of the
-// node.cloudprovider.kubernetes.io/uninitialized taint (set by kubelet
-// with --cloud-provider=external at registration; BYOT removes it as
-// the de-facto CCM InitializeNode).
+// mismatch, missing ExternalIP/InternalIP, and the presence of the
+// uninitialized taint (TaintExternalCloudProvider).
 func needsNodePatch(
 	node *corev1.Node,
 	providerID, resolvedPublicIP, resolvedInternalIP string,
