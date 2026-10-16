@@ -120,7 +120,7 @@ const TalosVersionReadyCondition clusterv1.ConditionType = "TalosVersionReady"
 // nodeLinkRetriggerSelfFilter is a watch predicate that drops Update events
 // whose only change is the nodeLinkRetriggerAnnotation. The ByotMachine
 // reconciler bumps that annotation to retrigger the owning CAPI Machine's
-// node-link, then requeues after requeueAfterNodeLink.
+// node-link, then requeues after r.requeueAfterNodeLink().
 type nodeLinkRetriggerSelfFilter struct{}
 
 func (nodeLinkRetriggerSelfFilter) Create(event.CreateEvent) bool   { return true }
@@ -203,6 +203,29 @@ type ByotMachineReconciler struct {
 	// cluster talosconfig.
 	probeMaintenance   func(ctx context.Context, endpoints Endpoints) bool
 	probeAuthenticated func(ctx context.Context, endpoints Endpoints, talosConfig []byte) bool
+
+	// RequeueAfterBootstrap overrides the delay while waiting for bootstrap
+	// data or an available host.
+	RequeueAfterBootstrap time.Duration
+
+	// RequeueAfterResetIssued overrides the delay while waiting for a machine
+	// to come back in maintenance mode after a reset.
+	RequeueAfterResetIssued time.Duration
+
+	// RequeueAfterNodeLink overrides the delay between node-link retrigger
+	// attempts after adoption.
+	RequeueAfterNodeLink time.Duration
+
+	// RequeueAfterUpgrade overrides the in-flight upgrade poll cadence.
+	RequeueAfterUpgrade time.Duration
+
+	// VersionProbeThreshold overrides the consecutive pre-upgrade Version RPC
+	// failure count before the upgrade is abandoned as VersionProbeFailed.
+	VersionProbeThreshold int32
+
+	// UpgradeThreshold overrides the consecutive post-upgrade Version RPC
+	// failure count before the upgrade is abandoned as UpgradeFailed.
+	UpgradeThreshold int32
 }
 
 // NewByotMachineReconciler creates a new ByotMachineReconciler.
@@ -267,6 +290,45 @@ func (r *ByotMachineReconciler) SetClusterCache(cache clustercache.ClusterCache)
 	r.getWorkloadClient = cache.GetClient
 }
 
+// ByotMachineOptions configures ByotMachineReconciler tunables. Zero values
+// keep defaults; SetOptions assigns only non-zero fields.
+type ByotMachineOptions struct {
+	RequeueAfterBootstrap   time.Duration
+	RequeueAfterResetIssued time.Duration
+	RequeueAfterNodeLink    time.Duration
+	RequeueAfterUpgrade     time.Duration
+	VersionProbeThreshold   int32
+	UpgradeThreshold        int32
+}
+
+// SetOptions applies non-zero options to the reconciler, preserving defaults
+// for zero-valued fields. Mirrors the SetClusterCache setter pattern.
+func (r *ByotMachineReconciler) SetOptions(opts ByotMachineOptions) {
+	if opts.RequeueAfterBootstrap > 0 {
+		r.RequeueAfterBootstrap = opts.RequeueAfterBootstrap
+	}
+
+	if opts.RequeueAfterResetIssued > 0 {
+		r.RequeueAfterResetIssued = opts.RequeueAfterResetIssued
+	}
+
+	if opts.RequeueAfterNodeLink > 0 {
+		r.RequeueAfterNodeLink = opts.RequeueAfterNodeLink
+	}
+
+	if opts.RequeueAfterUpgrade > 0 {
+		r.RequeueAfterUpgrade = opts.RequeueAfterUpgrade
+	}
+
+	if opts.VersionProbeThreshold > 0 {
+		r.VersionProbeThreshold = opts.VersionProbeThreshold
+	}
+
+	if opts.UpgradeThreshold > 0 {
+		r.UpgradeThreshold = opts.UpgradeThreshold
+	}
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ByotMachineReconciler) SetupWithManager(
 	manager ctrl.Manager,
@@ -324,6 +386,54 @@ func (r *ByotMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return result, nil
+}
+
+func (r *ByotMachineReconciler) requeueAfterBootstrap() time.Duration {
+	if r.RequeueAfterBootstrap > 0 {
+		return r.RequeueAfterBootstrap
+	}
+
+	return requeueAfterBootstrap
+}
+
+func (r *ByotMachineReconciler) requeueAfterResetIssued() time.Duration {
+	if r.RequeueAfterResetIssued > 0 {
+		return r.RequeueAfterResetIssued
+	}
+
+	return requeueAfterResetIssued
+}
+
+func (r *ByotMachineReconciler) requeueAfterNodeLink() time.Duration {
+	if r.RequeueAfterNodeLink > 0 {
+		return r.RequeueAfterNodeLink
+	}
+
+	return requeueAfterNodeLink
+}
+
+func (r *ByotMachineReconciler) requeueAfterUpgrade() time.Duration {
+	if r.RequeueAfterUpgrade > 0 {
+		return r.RequeueAfterUpgrade
+	}
+
+	return requeueAfterUpgrade
+}
+
+func (r *ByotMachineReconciler) versionProbeThreshold() int32 {
+	if r.VersionProbeThreshold > 0 {
+		return r.VersionProbeThreshold
+	}
+
+	return versionProbeThreshold
+}
+
+func (r *ByotMachineReconciler) upgradeThreshold() int32 {
+	if r.UpgradeThreshold > 0 {
+		return r.UpgradeThreshold
+	}
+
+	return upgradeThreshold
 }
 
 func (r *ByotMachineReconciler) adopt(ctx context.Context, byotMachine *infrav1.ByotMachine) (ctrl.Result, error) {
@@ -442,7 +552,7 @@ func (r *ByotMachineReconciler) awaitClusterTalosConfig(
 	if errors.Is(err, ErrClusterTalosConfigNotReady) {
 		logger.Info("Waiting for cluster talosconfig", "byotMachine", byotMachine.Name)
 
-		return nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
+		return nil, &ctrl.Result{RequeueAfter: r.requeueAfterBootstrap()}, nil
 	}
 
 	return talosConfig, nil, err
@@ -476,7 +586,7 @@ func (r *ByotMachineReconciler) preflightJoin(
 		logger := log.FromContext(ctx)
 		logger.Info("Waiting for cluster talosconfig", "byotMachine", byotMachine.Name)
 
-		return nil, false, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
+		return nil, false, &ctrl.Result{RequeueAfter: r.requeueAfterBootstrap()}, nil
 	}
 
 	if err != nil {
@@ -675,7 +785,7 @@ func (r *ByotMachineReconciler) recordUpgradeProbeFailure(
 		return ctrl.Result{}, true, nil
 	}
 
-	return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
+	return ctrl.Result{RequeueAfter: r.requeueAfterUpgrade()}, true, nil
 }
 
 // upgradeProbeAndIssue runs the pre-upgrade Version probe over the cluster
@@ -685,7 +795,7 @@ func (r *ByotMachineReconciler) recordUpgradeProbeFailure(
 // status for the InFlight completion gate. The version-match short-circuit is
 // gone (custom installer tags break it); dedup is gen+ref based at the
 // ensureTalosVersion entry. Probe failures accumulate up to
-// versionProbeThreshold before the controller stops with VersionProbeFailed.
+// r.versionProbeThreshold() before the controller stops with VersionProbeFailed.
 func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -707,7 +817,7 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 	tag, err := r.versionProbeAuthenticated(ctx, endpoints, talosConfig)
 	if err != nil {
 		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine,
-			versionProbeThreshold, "VersionProbeFailed", err, false)
+			r.versionProbeThreshold(), "VersionProbeFailed", err, false)
 	}
 
 	byotMachine.Status.CurrentTalosVersion = tag
@@ -749,7 +859,7 @@ func (r *ByotMachineReconciler) upgradeProbeAndIssue(
 	log.FromContext(ctx).Info("Talos upgrade issued",
 		"byotMachine", byotMachine.Name, "addresses", endpoints, "desired", desired)
 
-	return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
+	return ctrl.Result{RequeueAfter: r.requeueAfterUpgrade()}, true, nil
 }
 
 // finalizeUpgradeFailure marks the upgrade Failed and removes the node from
@@ -791,7 +901,7 @@ func (r *ByotMachineReconciler) finalizeUpgradeFailure(
 		log.FromContext(ctx).Info("upgrade-failure host reset failed; retrying",
 			"byotMachine", byotMachine.Name, "error", resetErr.Error())
 
-		return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, true, nil
+		return ctrl.Result{RequeueAfter: r.requeueAfterResetIssued()}, true, nil
 	}
 
 	clearHelper, err := patch.NewHelper(byotMachine, r.Client)
@@ -833,7 +943,7 @@ func (r *ByotMachineReconciler) resetAdoptedHostImpl(ctx context.Context, byotMa
 // is permission-denied, it falls back to a reachability + version-change
 // check: the Version RPC is reachable AND the live tag differs from the
 // pre-upgrade CurrentTalosVersion. Probe failures accumulate up to
-// upgradeThreshold before the controller stops with UpgradeFailed.
+// r.upgradeThreshold() before the controller stops with UpgradeFailed.
 func (r *ByotMachineReconciler) upgradeInFlight(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -874,7 +984,8 @@ func (r *ByotMachineReconciler) upgradeInFlightBootIDGate(
 ) (ctrl.Result, bool, error) {
 	liveBootID, bootErr := r.bootIDAuthenticated(ctx, endpoints, talosConfig)
 	if bootErr != nil && !errors.Is(bootErr, errBootIDUnauthorized) {
-		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, upgradeThreshold, "UpgradeFailed", bootErr, true)
+		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine,
+			r.upgradeThreshold(), "UpgradeFailed", bootErr, true)
 	}
 
 	// Permission-denied on the live read: degrade to the version-change
@@ -903,7 +1014,7 @@ func (r *ByotMachineReconciler) upgradeInFlightBootIDGate(
 		return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade poll: %w", err)
 	}
 
-	return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
+	return ctrl.Result{RequeueAfter: r.requeueAfterUpgrade()}, true, nil
 }
 
 // upgradeInFlightVersionFallback drives the InFlight poll when no boot-id is
@@ -922,7 +1033,8 @@ func (r *ByotMachineReconciler) upgradeInFlightVersionFallback(
 
 	tag, probeErr := r.versionProbeAuthenticated(ctx, endpoints, talosConfig)
 	if probeErr != nil {
-		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine, upgradeThreshold, "UpgradeFailed", probeErr, true)
+		return r.recordUpgradeProbeFailure(ctx, patchHelper, byotMachine,
+			r.upgradeThreshold(), "UpgradeFailed", probeErr, true)
 	}
 
 	byotMachine.Status.CurrentTalosVersion = tag
@@ -934,7 +1046,7 @@ func (r *ByotMachineReconciler) upgradeInFlightVersionFallback(
 			return ctrl.Result{}, true, fmt.Errorf("failed to patch ByotMachine on upgrade poll: %w", err)
 		}
 
-		return ctrl.Result{RequeueAfter: requeueAfterUpgrade}, true, nil
+		return ctrl.Result{RequeueAfter: r.requeueAfterUpgrade()}, true, nil
 	}
 
 	return r.markUpgradeComplete(ctx, patchHelper, byotMachine)
@@ -1225,7 +1337,7 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 	if errors.Is(err, clustercache.ErrClusterNotConnected) {
 		// Workload API not up yet (control-plane bootstrap race). Requeue;
 		// ensureNodeLinked's retrigger also compensates.
-		return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
+		return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
 	}
 
 	if err != nil {
@@ -1236,7 +1348,7 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 	if pErr != nil {
 		if errors.Is(pErr, errWorkloadNodePending) {
 			// Node not registered yet; the kubelet registers on boot. Requeue.
-			return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
+			return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
 		}
 
 		return ctrl.Result{}, pErr
@@ -1436,7 +1548,7 @@ func (r *ByotMachineReconciler) ensureNodeLinked(
 	log.FromContext(ctx).Info("Retriggering Machine node-link",
 		"byotMachine", byotMachine.Name, "machine", machine.Name)
 
-	return ctrl.Result{RequeueAfter: requeueAfterNodeLink}, nil
+	return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
 }
 
 // nudgeKubeletAfterReadopt restarts the kubelet so a Node deleted during a
@@ -1537,7 +1649,7 @@ func (r *ByotMachineReconciler) reconcileDelete(
 				"publicIP", byotMachine.Status.ResolvedPublicIP,
 				"error", err.Error())
 
-			return ctrl.Result{RequeueAfter: requeueAfterResetIssued}, nil
+			return ctrl.Result{RequeueAfter: r.requeueAfterResetIssued()}, nil
 		}
 
 		logger.Info("Host reset to maintenance and released",
@@ -1632,14 +1744,14 @@ func (r *ByotMachineReconciler) adoptionInputs(
 	if machine == nil {
 		logger.Info("Waiting for Machine controller to set OwnerReference", "byotMachine", byotMachine.Name)
 
-		return nil, nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
+		return nil, nil, &ctrl.Result{RequeueAfter: r.requeueAfterBootstrap()}, nil
 	}
 
 	machineConfig, err := r.bootstrapData(ctx, machine)
 	if errors.Is(err, ErrBootstrapDataNotReady) {
 		logger.Info("Waiting for bootstrap data", "byotMachine", byotMachine.Name, "machine", machine.Name)
 
-		return nil, nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
+		return nil, nil, &ctrl.Result{RequeueAfter: r.requeueAfterBootstrap()}, nil
 	}
 
 	if err != nil {
@@ -1779,7 +1891,7 @@ func (r *ByotMachineReconciler) preflightForeignMachine(
 	if errors.Is(err, ErrClusterTalosConfigNotReady) {
 		logger.Info("Waiting for referenced talosconfig secret", "byotMachine", byotMachine.Name)
 
-		return nil, &ctrl.Result{RequeueAfter: requeueAfterBootstrap}, nil
+		return nil, &ctrl.Result{RequeueAfter: r.requeueAfterBootstrap()}, nil
 	}
 
 	if err != nil {
@@ -1857,7 +1969,7 @@ func (r *ByotMachineReconciler) awaitControlPlaneReady(
 	log.FromContext(ctx).Info("Waiting for control plane to be Ready before adopting worker",
 		"byotMachine", byotMachine.Name, "cluster", machine.Spec.ClusterName)
 
-	return ctrl.Result{RequeueAfter: requeueAfterBootstrap}, true, nil
+	return ctrl.Result{RequeueAfter: r.requeueAfterBootstrap()}, true, nil
 }
 
 // clusterControlPlaneReady reports whether the Cluster's control plane is

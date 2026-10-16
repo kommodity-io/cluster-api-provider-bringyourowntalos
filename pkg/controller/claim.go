@@ -48,7 +48,7 @@ func (r *ByotMachineReconciler) claimHost(
 			log.FromContext(ctx).Info("Waiting for an available ByotHost",
 				"byotMachine", byotMachine.Name)
 
-			return ctrl.Result{RequeueAfter: requeueAfterBootstrap}, true, nil
+			return ctrl.Result{RequeueAfter: r.requeueAfterBootstrap()}, true, nil
 		}
 
 		return ctrl.Result{}, true, err

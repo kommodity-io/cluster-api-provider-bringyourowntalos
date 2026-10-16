@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	"github.com/stretchr/testify/assert"
@@ -450,4 +451,149 @@ func hostCandidate(name string, fd *string, phase infrav1.HostPhase, claimUID st
 	}
 
 	return host
+}
+
+func TestByotHostReconcileCustomProbeRequeueFlowsThroughDiscoveryFailure(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, infrav1.AddToScheme(scheme))
+
+	host := newByotHost("203.0.113.10")
+	custom := 42 * time.Second
+
+	reconciler := newHostReconciler(t,
+		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
+		func(context.Context, Endpoints, string) (DiscoveryResult, error) {
+			return DiscoveryResult{}, errTestUnreachable
+		},
+		func(context.Context, Endpoints) bool { return false },
+	)
+	reconciler.ProbeRequeue = custom
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
+	require.NoError(t, err)
+	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+func TestByotHostReconcileCustomProbeRequeueFlowsThroughUnavailableStillDown(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, infrav1.AddToScheme(scheme))
+
+	host := newByotHost("203.0.113.10")
+	host.Status.Phase = infrav1.HostPhaseUnavailable
+	custom := 42 * time.Second
+
+	reconciler := newHostReconciler(t,
+		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
+		func(context.Context, Endpoints, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
+		func(context.Context, Endpoints) bool { return false },
+	)
+	reconciler.ProbeRequeue = custom
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
+	require.NoError(t, err)
+	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+func TestByotHostReconcileCustomClaimedRequeueFlowsThrough(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, infrav1.AddToScheme(scheme))
+
+	host := newByotHost("203.0.113.10")
+	host.Status.Phase = infrav1.HostPhaseClaimed
+	custom := 42 * time.Second
+
+	reconciler := newHostReconciler(t,
+		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
+		func(context.Context, Endpoints, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
+		func(context.Context, Endpoints) bool { return true },
+	)
+	reconciler.ClaimedRequeue = custom
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
+	require.NoError(t, err)
+	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+func TestByotHostReconcileCustomLivenessIntervalFlowsThroughAvailable(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, infrav1.AddToScheme(scheme))
+
+	host := newByotHost("203.0.113.10")
+	host.Status.Phase = infrav1.HostPhaseAvailable
+	custom := 99 * time.Second
+
+	reconciler := newHostReconciler(t,
+		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
+		func(context.Context, Endpoints, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
+		func(context.Context, Endpoints) bool { return true },
+	)
+	reconciler.LivenessInterval = custom
+
+	result, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
+	require.NoError(t, err)
+	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+func TestByotHostReconcileCustomFailureThresholdFlipsAfterCustomCount(t *testing.T) {
+	t.Parallel()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, infrav1.AddToScheme(scheme))
+
+	host := newByotHost("203.0.113.10")
+	host.Status.Phase = infrav1.HostPhaseAvailable
+
+	reconciler := newHostReconciler(t,
+		fake.NewClientBuilder().WithScheme(scheme).WithObjects(host),
+		func(context.Context, Endpoints, string) (DiscoveryResult, error) { return fakeDiscovery(), nil },
+		func(context.Context, Endpoints) bool { return false },
+	)
+	reconciler.FailureThreshold = 5
+
+	// Four failures: below custom threshold 5 -> stays Available.
+	for range 4 {
+		_, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
+		require.NoError(t, err)
+	}
+
+	updated := &infrav1.ByotHost{}
+	require.NoError(t, reconciler.Client.Get(t.Context(), clusterKey(host), updated))
+	assert.Equal(t, infrav1.HostPhaseAvailable, updated.Status.Phase)
+	assert.Equal(t, int32(4), updated.Status.ProbeFailureCount)
+
+	// Fifth failure: threshold reached -> Unavailable.
+	_, err := reconciler.Reconcile(t.Context(), reconcile.Request{NamespacedName: clusterKey(host)})
+	require.NoError(t, err)
+
+	require.NoError(t, reconciler.Client.Get(t.Context(), clusterKey(host), updated))
+	assert.Equal(t, infrav1.HostPhaseUnavailable, updated.Status.Phase)
+}
+
+func TestByotHostSetOptionsAppliesNonZeroOnly(t *testing.T) {
+	t.Parallel()
+
+	reconciler := &ByotHostReconciler{}
+	reconciler.SetOptions(ByotHostOptions{
+		LivenessInterval: 99 * time.Second,
+		// ProbeRequeue zero: kept as default (zero)
+		ClaimedRequeue:   7 * time.Minute,
+		FailureThreshold: 0,
+	})
+
+	assert.Equal(t, 99*time.Second, reconciler.LivenessInterval)
+	assert.Zero(t, reconciler.ProbeRequeue)
+	assert.Equal(t, 7*time.Minute, reconciler.ClaimedRequeue)
+	assert.Zero(t, reconciler.FailureThreshold)
+
+	// Accessors return defaults for zero-valued fields.
+	assert.Equal(t, hostProbeRequeue, reconciler.probeRequeue())
+	assert.Equal(t, int32(hostFailureThreshold), reconciler.failureThreshold())
 }
