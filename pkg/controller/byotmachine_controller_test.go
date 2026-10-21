@@ -3165,8 +3165,8 @@ func TestSyncNodeLabelsRequeuesWhenNodeNotFound(t *testing.T) {
 	}
 
 	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
-	require.ErrorIs(t, err, errWorkloadNodePending)
-	assert.Zero(t, result.RequeueAfter)
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterNodeLink, result.RequeueAfter)
 }
 
 func TestSyncNodeLabelsSkipsWhenNoClusterCache(t *testing.T) {

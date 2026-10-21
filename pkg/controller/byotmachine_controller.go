@@ -605,11 +605,7 @@ func (r *ByotMachineReconciler) reconcileAdopted(
 		return result, err
 	}
 
-	if result.Requeue || result.RequeueAfter > 0 {
-		return result, nil
-	}
-
-	return r.syncNodeLabels(ctx, byotMachine, machine)
+	return result, nil
 }
 
 // resolveApplyAuth picks the talosconfig to authenticate the configuration
@@ -1400,6 +1396,18 @@ func (r *ByotMachineReconciler) linkNode(
 		return result, nil
 	}
 
+	// Sync labels before ensureNodeLinked: the Node exists once
+	// providerID is set, even if the Machine controller can't link
+	// its nodeRef (DNS-deadlock). Labels patch via IP-direct fallback.
+	labelResult, err := r.syncNodeLabels(ctx, byotMachine, machine)
+	if err != nil {
+		return labelResult, err
+	}
+
+	if labelResult.Requeue || labelResult.RequeueAfter > 0 {
+		return labelResult, nil
+	}
+
 	return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
 }
 
@@ -1751,7 +1759,16 @@ func (r *ByotMachineReconciler) syncNodeLabels(
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, r.patchWorkloadNodeLabels(ctx, workloadClient, byotMachine.Name, host.Labels)
+	err = r.patchWorkloadNodeLabels(ctx, workloadClient, byotMachine.Name, host.Labels)
+	if err != nil {
+		if errors.Is(err, errWorkloadNodePending) {
+			return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
+		}
+
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
 }
 
 // patchWorkloadNodeLabels filters ByoHost labels (strip reserved prefixes,
