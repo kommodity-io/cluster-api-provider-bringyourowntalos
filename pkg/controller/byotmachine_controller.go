@@ -102,16 +102,23 @@ const (
 )
 
 // isReservedLabel reports whether the label key carries a Kubernetes or
-// CAPI reserved prefix that the controller must not overwrite.
+// CAPI reserved domain (or any subdomain of one) that the controller
+// must not overwrite. A label key like node-role.kubernetes.io/control-plane
+// has the DNS prefix node-role.kubernetes.io, a subdomain of kubernetes.io.
 func isReservedLabel(key string) bool {
-	reserved := []string{
-		"kubernetes.io/",
-		"k8s.io/",
-		"cluster.x-k8s.io/",
+	prefix, _, _ := strings.Cut(key, "/")
+	if prefix == "" {
+		return false
 	}
 
-	for _, prefix := range reserved {
-		if strings.HasPrefix(key, prefix) {
+	reservedDomains := []string{
+		"kubernetes.io",
+		"k8s.io",
+		"cluster.x-k8s.io",
+	}
+
+	for _, domain := range reservedDomains {
+		if prefix == domain || strings.HasSuffix(prefix, "."+domain) {
 			return true
 		}
 	}

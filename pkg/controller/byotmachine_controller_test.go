@@ -3288,6 +3288,22 @@ func TestFilterHostLabelsStripsReserved(t *testing.T) {
 	assert.Equal(t, "A100", result["byot.io/gpu-model"])
 }
 
+func TestFilterHostLabelsStripsReservedSubdomains(t *testing.T) {
+	t.Parallel()
+
+	result := filterHostLabels(map[string]string{
+		"byot.io/gpu-model":                       "A100",
+		"node-role.kubernetes.io/control-plane":  "",
+		"topology.kubernetes.io/zone":             "eu-cph",
+		"node-restriction.kubernetes.io/isolated": "",
+		"node-role.k8s.io/worker":                 "",
+		"machineset.cluster.x-k8s.io/name":        "ms-1",
+	})
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, "A100", result["byot.io/gpu-model"])
+}
+
 func TestFilterHostLabelsSkipsInvalid(t *testing.T) {
 	t.Parallel()
 
