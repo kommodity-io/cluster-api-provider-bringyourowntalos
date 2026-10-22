@@ -102,16 +102,23 @@ const (
 )
 
 // isReservedLabel reports whether the label key carries a Kubernetes or
-// CAPI reserved prefix that the controller must not overwrite.
+// CAPI reserved domain (or any subdomain of one) that the controller
+// must not overwrite. A label key like node-role.kubernetes.io/control-plane
+// has the DNS prefix node-role.kubernetes.io, a subdomain of kubernetes.io.
 func isReservedLabel(key string) bool {
-	reserved := []string{
-		"kubernetes.io/",
-		"k8s.io/",
-		"cluster.x-k8s.io/",
+	prefix, _, _ := strings.Cut(key, "/")
+	if prefix == "" {
+		return false
 	}
 
-	for _, prefix := range reserved {
-		if strings.HasPrefix(key, prefix) {
+	reservedDomains := []string{
+		"kubernetes.io",
+		"k8s.io",
+		"cluster.x-k8s.io",
+	}
+
+	for _, domain := range reservedDomains {
+		if prefix == domain || strings.HasSuffix(prefix, "."+domain) {
 			return true
 		}
 	}
@@ -1378,9 +1385,9 @@ func injectHostCertSANs(machineConfig []byte, endpoints Endpoints) ([]byte, erro
 	return injectClusterAPIServerCertSANs(config, endpoints)
 }
 
-// linkNode patches the workload Node's providerID and addresses, then
-// retriggers CAPI's node-link until nodeRef is set. Both steps are gated
-// by status.nodeUpdated and re-run on requeue.
+// linkNode patches the workload Node's providerID and removes the
+// uninitialized taint, then retriggers CAPI's node-link until nodeRef
+// is set. Both steps are gated by status.nodeUpdated and re-run on requeue.
 func (r *ByotMachineReconciler) linkNode(
 	ctx context.Context,
 	patchHelper *patch.Helper,
@@ -1419,8 +1426,8 @@ var errWorkloadNodePending = errors.New("workload node not registered")
 // not yet created by CAPI; the controller requeues until it appears.
 var errRequeueKubeconfigPending = errors.New("kubeconfig secret not yet available")
 
-// updateNodeProviderID patches Node providerID, addresses, and removes
-// the uninitialized taint. On ErrClusterNotConnected it falls back to
+// updateNodeProviderID patches Node providerID and removes the
+// uninitialized taint. On ErrClusterNotConnected it falls back to
 // an IP-direct uncached client from the <cluster>-kubeconfig secret.
 func (r *ByotMachineReconciler) updateNodeProviderID(
 	ctx context.Context,
@@ -1469,7 +1476,7 @@ func (r *ByotMachineReconciler) updateNodeProviderID(
 		return ctrl.Result{}, fmt.Errorf("failed to patch ByotMachine after Node providerID update: %w", err)
 	}
 
-	log.FromContext(ctx).Info("Patched workload Node providerID and addresses",
+	log.FromContext(ctx).Info("Patched workload Node providerID",
 		"byotMachine", byotMachine.Name, "machine", machine.Name)
 
 	return ctrl.Result{}, nil
@@ -1545,9 +1552,9 @@ func (r *ByotMachineReconciler) buildIPDirectClient(
 	return ctrlclient.New(restConfig, ctrlclient.Options{Scheme: r.Scheme})
 }
 
-// patchWorkloadNode patches providerID, addresses, and removes the
-// uninitialized taint in one call. No CCM in byot — the controller owns
-// all three. Returns alreadySet when no patch was needed.
+// patchWorkloadNode patches providerID and removes the uninitialized
+// taint in one call. No CCM in byot — kubelet owns Node addresses.
+// Returns alreadySet when no patch was needed.
 func (r *ByotMachineReconciler) patchWorkloadNode(
 	ctx context.Context,
 	workloadClient ctrlclient.Client,
@@ -1559,11 +1566,10 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 		return false, err
 	}
 
-	providerIDMismatch, externalIPMissing, internalIPMissing, uninitializedTaintPresent := needsNodePatch(
-		node, providerID, byotMachine.Status.ResolvedPublicIP, byotMachine.Status.ResolvedInternalIP)
+	providerIDMismatch, uninitializedTaintPresent := needsNodePatch(node, providerID)
 
 	// All fields already correct — no patch needed.
-	if !providerIDMismatch && !externalIPMissing && !internalIPMissing && !uninitializedTaintPresent {
+	if !providerIDMismatch && !uninitializedTaintPresent {
 		return true, nil
 	}
 
@@ -1572,8 +1578,7 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 		return false, fmt.Errorf("failed to create patch helper for workload Node %s: %w", byotMachine.Name, err)
 	}
 
-	applyNodePatch(node, byotMachine, providerID,
-		providerIDMismatch, externalIPMissing, internalIPMissing, uninitializedTaintPresent)
+	applyNodePatch(node, providerID, providerIDMismatch, uninitializedTaintPresent)
 
 	err = patchHelper.Patch(ctx, node)
 	if err != nil {
@@ -1583,20 +1588,15 @@ func (r *ByotMachineReconciler) patchWorkloadNode(
 	return !providerIDMismatch, nil
 }
 
-// applyNodePatch mutates the Node in-place, setting providerID, addresses,
-// and removing the uninitialized taint — all in one strategic-merge patch.
+// applyNodePatch mutates the Node in-place, setting providerID and
+// removing the uninitialized taint.
 func applyNodePatch(
 	node *corev1.Node,
-	byotMachine *infrav1.ByotMachine,
 	providerID string,
-	providerIDMismatch, externalIPMissing, internalIPMissing, uninitializedTaintPresent bool,
+	providerIDMismatch, uninitializedTaintPresent bool,
 ) {
 	if providerIDMismatch {
 		node.Spec.ProviderID = providerID
-	}
-
-	if externalIPMissing || internalIPMissing {
-		applyNodeAddresses(node, byotMachine, externalIPMissing, internalIPMissing)
 	}
 
 	if uninitializedTaintPresent {
@@ -1623,38 +1623,11 @@ func getWorkloadNode(
 	return node, nil
 }
 
-// applyNodeAddresses upserts ExternalIP and InternalIP into the Node's
-// address list, preserving kubelet-managed entries of other types.
-func applyNodeAddresses(
-	node *corev1.Node,
-	byotMachine *infrav1.ByotMachine,
-	externalIPMissing, internalIPMissing bool,
-) {
-	if externalIPMissing {
-		node.Status.Addresses = upsertNodeAddress(
-			node.Status.Addresses, corev1.NodeExternalIP, byotMachine.Status.ResolvedPublicIP)
-	}
-
-	if internalIPMissing {
-		node.Status.Addresses = upsertNodeAddress(
-			node.Status.Addresses, corev1.NodeInternalIP, byotMachine.Status.ResolvedInternalIP)
-	}
-}
-
-// needsNodePatch reports which Node fields need patching: providerID
-// mismatch, missing ExternalIP/InternalIP, and the presence of the
-// uninitialized taint (TaintExternalCloudProvider).
-func needsNodePatch(
-	node *corev1.Node,
-	providerID, resolvedPublicIP, resolvedInternalIP string,
-) (bool, bool, bool, bool) {
-	mismatch := node.Spec.ProviderID != providerID
-	extMissing := !hasNodeAddress(node, corev1.NodeExternalIP, resolvedPublicIP)
-	intMissing := resolvedInternalIP != "" &&
-		!hasNodeAddress(node, corev1.NodeInternalIP, resolvedInternalIP)
-	uninitializedTaintPresent := hasUninitializedTaint(node)
-
-	return mismatch, extMissing, intMissing, uninitializedTaintPresent
+// needsNodePatch reports whether the Node needs patching: providerID
+// mismatch and presence of the uninitialized taint
+// (TaintExternalCloudProvider).
+func needsNodePatch(node *corev1.Node, providerID string) (bool, bool) {
+	return node.Spec.ProviderID != providerID, hasUninitializedTaint(node)
 }
 
 // hasUninitializedTaint reports whether the Node carries the
@@ -1682,33 +1655,6 @@ func removeUninitializedTaint(taints []corev1.Taint) []corev1.Taint {
 	}
 
 	return filtered
-}
-
-// hasNodeAddress reports whether the Node already has the given address.
-func hasNodeAddress(node *corev1.Node, addrType corev1.NodeAddressType, address string) bool {
-	for _, addr := range node.Status.Addresses {
-		if addr.Type == addrType && addr.Address == address {
-			return true
-		}
-	}
-
-	return false
-}
-
-// upsertNodeAddress adds or replaces the address of the given type,
-// preserving entries of other types.
-func upsertNodeAddress(
-	addrs []corev1.NodeAddress, addrType corev1.NodeAddressType, address string,
-) []corev1.NodeAddress {
-	for i := range addrs {
-		if addrs[i].Type == addrType {
-			addrs[i].Address = address
-
-			return addrs
-		}
-	}
-
-	return append(addrs, corev1.NodeAddress{Type: addrType, Address: address})
 }
 
 // syncNodeLabels fetches the claimed ByoHost and propagates its labels to
