@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -632,6 +633,7 @@ var (
 	errTestWorkloadGet   = errors.New("workload api down")
 	errTestWorkloadPatch = errors.New("patch forbidden")
 	errTestMustNotCall   = errors.New("workload client must not be called")
+	errTestByoHostGet    = errors.New("byohost get failure")
 )
 
 func TestNudgeKubeletAfterSplitReadoptFailsNonFatal(t *testing.T) {
@@ -2821,4 +2823,608 @@ func TestEnsureNodeLinkedCustomRequeueAfterNodeLinkFlowsThrough(t *testing.T) {
 	result, err := reconciler.ensureNodeLinked(t.Context(), patchHelper, byotMachine, machine)
 	require.NoError(t, err)
 	assert.Equal(t, custom, result.RequeueAfter)
+}
+
+// --- ByoHost label propagation tests ---
+
+// newClaimedByotHostWithLabels builds a claimed ByotHost with the given labels.
+func newClaimedByotHostWithLabels(labels map[string]string) *infrav1.ByotHost {
+	host := newClaimedByotHost(testHostPublicIP)
+	host.Labels = labels
+
+	return host
+}
+
+// newLabelSyncReconciler builds a reconciler wired with a workload client and
+// a management client holding the given objects (byotMachine, byoHost).
+func newLabelSyncReconciler(
+	t *testing.T,
+	byotMachine *infrav1.ByotMachine,
+	machine *clusterv1.Machine,
+	objs ...ctrlclient.Object,
+) (*ByotMachineReconciler, ctrlclient.Client) {
+	t.Helper()
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtObjs := make([]ctrlclient.Object, 0, 2+len(objs))
+	mgmtObjs = append(mgmtObjs, byotMachine, machine)
+	mgmtObjs = append(mgmtObjs, objs...)
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(mgmtObjs...).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	workload := workloadClientBuilder(t).WithObjects(newWorkloadNode(testMachineName, "")).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	return reconciler, workload
+}
+
+func TestPatchWorkloadNodeLabelsAddsByoHostLabels(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{
+		"byot.io/gpu-model": "A100",
+		"site":              "copenhagen",
+	})
+
+	reconciler, workload := newLabelSyncReconciler(t, byotMachine, machine, host)
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, "A100", patched.Labels["byot.io/gpu-model"])
+	assert.Equal(t, "copenhagen", patched.Labels["site"])
+}
+
+func TestPatchWorkloadNodeLabelsPreservesExistingNodeLabels(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{"byot.io/cpu-arch": "arm64"})
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	node := newWorkloadNode(testMachineName, "")
+	node.Labels = map[string]string{"node-role.kubernetes.io/worker": "", "custom.io/foo": "bar"}
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, "arm64", patched.Labels["byot.io/cpu-arch"])
+	assert.Contains(t, patched.Labels, "node-role.kubernetes.io/worker")
+	assert.Equal(t, "bar", patched.Labels["custom.io/foo"])
+}
+
+func TestPatchWorkloadNodeLabelsOverwritesOnCollision(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{"site": "copenhagen"})
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	node := newWorkloadNode(testMachineName, "")
+	node.Labels = map[string]string{"site": "aarhus"}
+	workload := workloadClientBuilder(t).WithObjects(node).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, "copenhagen", patched.Labels["site"])
+}
+
+func TestPatchWorkloadNodeLabelsStripsReservedPrefixes(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{
+		"byot.io/gpu-model":           "A100",
+		"kubernetes.io/hostname":      "node-1",
+		"k8s.io/role":                 "worker",
+		"cluster.x-k8s.io/cluster-name": "test-cluster",
+	})
+
+	reconciler, workload := newLabelSyncReconciler(t, byotMachine, machine, host)
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, "A100", patched.Labels["byot.io/gpu-model"])
+	assert.NotContains(t, patched.Labels, "kubernetes.io/hostname")
+	assert.NotContains(t, patched.Labels, "k8s.io/role")
+	assert.NotContains(t, patched.Labels, "cluster.x-k8s.io/cluster-name")
+}
+
+func TestPatchWorkloadNodeLabelsSkipsInvalidKeepsValid(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{
+		"byot.io/gpu-model": "A100",
+		"UPPER/Invalid Key": "bad",
+		"valid.io/key":      strings.Repeat("a", 63),
+	})
+
+	reconciler, workload := newLabelSyncReconciler(t, byotMachine, machine, host)
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, "A100", patched.Labels["byot.io/gpu-model"])
+	assert.Equal(t, strings.Repeat("a", 63), patched.Labels["valid.io/key"])
+	assert.NotContains(t, patched.Labels, "UPPER/Invalid Key")
+}
+
+func TestPatchWorkloadNodeLabelsNoPatchWhenAllFilteredOut(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{
+		"kubernetes.io/hostname": "node-1",
+		"k8s.io/role":            "worker",
+	})
+
+	patched := false
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	workload := workloadClientBuilder(t).
+		WithObjects(newWorkloadNode(testMachineName, "")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(
+				context.Context,
+				ctrlclient.WithWatch,
+				ctrlclient.Object,
+				ctrlclient.Patch,
+				...ctrlclient.PatchOption,
+			) error {
+				patched = true
+
+				return nil
+			},
+		}).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.False(t, patched)
+}
+
+func TestPatchWorkloadNodeLabelsNoPatchWhenAlreadyMatching(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{"byot.io/gpu-model": "A100"})
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	node := newWorkloadNode(testMachineName, "")
+	node.Labels = map[string]string{"byot.io/gpu-model": "A100"}
+
+	patched := false
+	workload := workloadClientBuilder(t).
+		WithObjects(node).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(
+				context.Context,
+				ctrlclient.WithWatch,
+				ctrlclient.Object,
+				ctrlclient.Patch,
+				...ctrlclient.PatchOption,
+			) error {
+				patched = true
+
+				return nil
+			},
+		}).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.False(t, patched)
+}
+
+func TestSyncNodeLabelsFallsBackToIPDirectOnClusterNotConnected(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{"site": "copenhagen"})
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	workload := workloadClientBuilder(t).WithObjects(newWorkloadNode(testMachineName, "")).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return nil, clustercache.ErrClusterNotConnected
+	}
+	reconciler.ipDirectClient = func(
+		context.Context, types.NamespacedName, *infrav1.ByotMachine,
+	) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+
+	patched := &corev1.Node{}
+	require.NoError(t, workload.Get(t.Context(), ctrlclient.ObjectKey{Name: testMachineName}, patched))
+	assert.Equal(t, "copenhagen", patched.Labels["site"])
+}
+
+func TestSyncNodeLabelsRequeuesWhenNodeNotFound(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{"site": "copenhagen"})
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	workload := workloadClientBuilder(t).Build() // no Node
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Equal(t, requeueAfterNodeLink, result.RequeueAfter)
+}
+
+func TestSyncNodeLabelsSkipsWhenNoClusterCache(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+	host := newClaimedByotHostWithLabels(map[string]string{"site": "copenhagen"})
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine, host).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient) // getWorkloadClient nil
+
+	patched := false
+	workload := workloadClientBuilder(t).
+		WithObjects(newWorkloadNode(testMachineName, "")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(
+				context.Context,
+				ctrlclient.WithWatch,
+				ctrlclient.Object,
+				ctrlclient.Patch,
+				...ctrlclient.PatchOption,
+			) error {
+				patched = true
+
+				return nil
+			},
+		}).Build()
+	_ = workload
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.False(t, patched)
+}
+
+func TestSyncNodeLabelsSkipsWhenByoHostNotFound(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		Build()
+
+	patched := false
+	workload := workloadClientBuilder(t).
+		WithObjects(newWorkloadNode(testMachineName, "")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(
+				context.Context,
+				ctrlclient.WithWatch,
+				ctrlclient.Object,
+				ctrlclient.Patch,
+				...ctrlclient.PatchOption,
+			) error {
+				patched = true
+
+				return nil
+			},
+		}).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	result, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.NoError(t, err)
+	assert.Zero(t, result.RequeueAfter)
+	assert.False(t, patched)
+}
+
+func TestSyncNodeLabelsRequeuesOnByoHostGetError(t *testing.T) {
+	t.Parallel()
+
+	byotMachine := newAdoptedByotMachine(testHostPublicIP, "hash")
+	machine := newOwningMachine("test-bootstrap")
+
+	scheme := newTestScheme(t)
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+
+	mgmtClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(byotMachine, machine).
+		WithStatusSubresource(&infrav1.ByotMachine{}).
+		WithInterceptorFuncs(getInterceptor(errTestByoHostGet)).
+		Build()
+
+	workload := workloadClientBuilder(t).WithObjects(newWorkloadNode(testMachineName, "")).Build()
+
+	reconciler := NewByotMachineReconciler(mgmtClient)
+	reconciler.getWorkloadClient = func(context.Context, types.NamespacedName) (ctrlclient.Client, error) {
+		return workload, nil
+	}
+
+	_, err := reconciler.syncNodeLabels(t.Context(), byotMachine, machine)
+	require.ErrorIs(t, err, errTestByoHostGet)
+}
+
+// --- Watch predicate tests ---
+
+// makeByoHostForPredicate builds a ByoHost for the label-change predicate tests.
+func makeByoHostForPredicate(labels map[string]string, claimed bool) *infrav1.ByotHost {
+	host := &infrav1.ByotHost{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      testHostName,
+			Namespace: testNamespace,
+			Labels:    labels,
+		},
+	}
+	if claimed {
+		host.Status.ClaimRef = &infrav1.HostClaimRef{
+			Kind: "ByotMachine", Name: testMachineName,
+			Namespace: testNamespace, UID: testMachineUID,
+		}
+	}
+
+	return host
+}
+
+func TestByoHostLabelChangeFilterFiresOnLabelChangeOfClaimedHost(t *testing.T) {
+	t.Parallel()
+
+	oldHost := makeByoHostForPredicate(map[string]string{"site": "copenhagen"}, true)
+	newHost := makeByoHostForPredicate(map[string]string{"site": "aarhus"}, true)
+	assert.True(t, byoHostLabelChangeFilter{}.Update(event.UpdateEvent{
+		ObjectOld: oldHost, ObjectNew: newHost,
+	}))
+}
+
+func TestByoHostLabelChangeFilterDropsPhaseOnlyChange(t *testing.T) {
+	t.Parallel()
+
+	oldHost := makeByoHostForPredicate(map[string]string{"site": "copenhagen"}, true)
+	oldHost.Status.Phase = infrav1.HostPhaseClaimed
+	newHost := makeByoHostForPredicate(map[string]string{"site": "copenhagen"}, true)
+	newHost.Status.Phase = infrav1.HostPhaseReleasing
+	assert.False(t, byoHostLabelChangeFilter{}.Update(event.UpdateEvent{
+		ObjectOld: oldHost, ObjectNew: newHost,
+	}))
+}
+
+func TestByoHostLabelChangeFilterDropsProbeUpdate(t *testing.T) {
+	t.Parallel()
+
+	oldHost := makeByoHostForPredicate(map[string]string{"site": "copenhagen"}, true)
+	oldHost.Status.ProbeFailureCount = 0
+	newHost := makeByoHostForPredicate(map[string]string{"site": "copenhagen"}, true)
+	newHost.Status.ProbeFailureCount = 3
+	assert.False(t, byoHostLabelChangeFilter{}.Update(event.UpdateEvent{
+		ObjectOld: oldHost, ObjectNew: newHost,
+	}))
+}
+
+func TestByoHostLabelChangeFilterDropsUnclaimedHostLabelChange(t *testing.T) {
+	t.Parallel()
+
+	oldHost := makeByoHostForPredicate(map[string]string{"site": "copenhagen"}, false)
+	newHost := makeByoHostForPredicate(map[string]string{"site": "aarhus"}, false)
+	assert.False(t, byoHostLabelChangeFilter{}.Update(event.UpdateEvent{
+		ObjectOld: oldHost, ObjectNew: newHost,
+	}))
+}
+
+func TestByoHostLabelChangeFilterKeepsWhenOldIsNil(t *testing.T) {
+	t.Parallel()
+
+	newHost := makeByoHostForPredicate(map[string]string{"site": "copenhagen"}, true)
+	assert.True(t, byoHostLabelChangeFilter{}.Update(event.UpdateEvent{
+		ObjectNew: newHost,
+	}))
+}
+
+func TestByoHostLabelChangeFilterCreateDeleteGeneric(t *testing.T) {
+	t.Parallel()
+
+	filter := byoHostLabelChangeFilter{}
+	assert.True(t, filter.Create(event.CreateEvent{}))
+	assert.True(t, filter.Delete(event.DeleteEvent{}))
+	assert.True(t, filter.Generic(event.GenericEvent{}))
+}
+
+func TestByoHostToByotMachineMapsClaimedHost(t *testing.T) {
+	t.Parallel()
+
+	host := &infrav1.ByotHost{
+		ObjectMeta: metav1.ObjectMeta{Name: testHostName, Namespace: testNamespace},
+		Status: infrav1.ByotHostStatus{
+			ClaimRef: &infrav1.HostClaimRef{
+				Kind: "ByotMachine", Name: testMachineName,
+				Namespace: testNamespace, UID: testMachineUID,
+			},
+		},
+	}
+
+	reqs := byoHostToByotMachine(t.Context(), host)
+	require.Len(t, reqs, 1)
+	assert.Equal(t, testMachineName, reqs[0].Name)
+	assert.Equal(t, testNamespace, reqs[0].Namespace)
+}
+
+func TestByoHostToByotMachineUnclaimedReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	host := &infrav1.ByotHost{
+		ObjectMeta: metav1.ObjectMeta{Name: testHostName, Namespace: testNamespace},
+	}
+
+	reqs := byoHostToByotMachine(t.Context(), host)
+	assert.Nil(t, reqs)
+}
+
+// --- filterHostLabels unit tests ---
+
+func TestFilterHostLabelsStripsReserved(t *testing.T) {
+	t.Parallel()
+
+	result := filterHostLabels(map[string]string{
+		"byot.io/gpu-model":             "A100",
+		"kubernetes.io/hostname":        "node-1",
+		"k8s.io/role":                   "worker",
+		"cluster.x-k8s.io/cluster-name": "test",
+	})
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, "A100", result["byot.io/gpu-model"])
+}
+
+func TestFilterHostLabelsSkipsInvalid(t *testing.T) {
+	t.Parallel()
+
+	result := filterHostLabels(map[string]string{
+		"byot.io/gpu-model": "A100",
+		"UPPER/Invalid Key": "bad",
+	})
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, "A100", result["byot.io/gpu-model"])
+}
+
+func TestFilterHostLabelsReturnsNilWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	assert.Nil(t, filterHostLabels(nil))
+	assert.Nil(t, filterHostLabels(map[string]string{}))
 }

@@ -9,13 +9,16 @@ import (
 	"maps"
 	"net"
 	"net/url"
+	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	infrav1 "github.com/kommodity-io/cluster-api-provider-bringyourowntalos/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"k8s.io/client-go/tools/clientcmd"
 	cloudproviderapi "k8s.io/cloud-provider/api"
@@ -33,7 +36,9 @@ import (
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -95,6 +100,24 @@ const (
 	// the control-plane Node registering.
 	nodeLinkRetriggerAnnotation = "infrastructure.cluster.x-k8s.io/node-link-retrigger"
 )
+
+// isReservedLabel reports whether the label key carries a Kubernetes or
+// CAPI reserved prefix that the controller must not overwrite.
+func isReservedLabel(key string) bool {
+	reserved := []string{
+		"kubernetes.io/",
+		"k8s.io/",
+		"cluster.x-k8s.io/",
+	}
+
+	for _, prefix := range reserved {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
 
 // MachineAdoptedCondition reports whether the machine configuration has been
 // applied to the adopted machine.
@@ -164,6 +187,53 @@ func withoutNodeLinkRetrigger(annotations map[string]string) map[string]string {
 	}
 
 	return filtered
+}
+
+// byoHostLabelChangeFilter is a watch predicate for the cross-resource
+// ByoHost watch. Only Update events on claimed hosts whose labels changed
+// trigger ByotMachine reconciliation. Create, Delete, and Generic pass
+// through (Create/Delete of claimed hosts are handled by the claim/release
+// flows; Generic is rare and harmless).
+type byoHostLabelChangeFilter struct{}
+
+func (byoHostLabelChangeFilter) Create(event.CreateEvent) bool   { return true }
+func (byoHostLabelChangeFilter) Delete(event.DeleteEvent) bool   { return true }
+func (byoHostLabelChangeFilter) Generic(event.GenericEvent) bool { return true }
+
+// Update fires only when the ByoHost is claimed (claimRef set) and its
+// labels changed between old and new. Phase transitions, probe updates,
+// and status-only changes do not trigger reconciliation.
+func (byoHostLabelChangeFilter) Update(evt event.UpdateEvent) bool {
+	if evt.ObjectOld == nil || evt.ObjectNew == nil {
+		return true
+	}
+
+	newHost, ok := evt.ObjectNew.(*infrav1.ByotHost)
+	if !ok {
+		return true
+	}
+
+	if newHost.Status.ClaimRef == nil {
+		return false
+	}
+
+	return !reflect.DeepEqual(evt.ObjectOld.GetLabels(), evt.ObjectNew.GetLabels())
+}
+
+// byoHostToByotMachine maps a ByoHost event to a ByotMachine reconcile
+// request via status.claimRef. Unclaimed hosts produce no requests.
+func byoHostToByotMachine(_ context.Context, obj ctrlclient.Object) []reconcile.Request {
+	host, ok := obj.(*infrav1.ByotHost)
+	if !ok || host.Status.ClaimRef == nil {
+		return nil
+	}
+
+	return []reconcile.Request{{
+		NamespacedName: ctrlclient.ObjectKey{
+			Name:      host.Status.ClaimRef.Name,
+			Namespace: host.Status.ClaimRef.Namespace,
+		},
+	}}
 }
 
 // ByotMachineReconciler reconciles a ByotMachine object.
@@ -250,9 +320,9 @@ func NewByotMachineReconciler(client ctrlclient.Client) *ByotMachineReconciler {
 		Scheme: client.Scheme(),
 
 		versionProbeAuthenticated: versionProbeAuthenticated,
-		upgradeMachine:           upgradeMachine,
-		bootIDAuthenticated:      bootIDAuthenticated,
-		applyMachineConfig:       applyMachineConfig,
+		upgradeMachine:            upgradeMachine,
+		bootIDAuthenticated:       bootIDAuthenticated,
+		applyMachineConfig:        applyMachineConfig,
 
 		probeMaintenance:   probeMaintenance,
 		probeAuthenticated: probeAuthenticated,
@@ -351,6 +421,11 @@ func (r *ByotMachineReconciler) SetupWithManager(
 ) error {
 	err := ctrl.NewControllerManagedBy(manager).
 		For(&infrav1.ByotMachine{}, builder.WithPredicates(nodeLinkRetriggerSelfFilter{})).
+		Watches(
+			&infrav1.ByotHost{},
+			handler.EnqueueRequestsFromMapFunc(byoHostToByotMachine),
+			builder.WithPredicates(byoHostLabelChangeFilter{}),
+		).
 		WithOptions(options).
 		Complete(r)
 	if err != nil {
@@ -525,7 +600,12 @@ func (r *ByotMachineReconciler) reconcileAdopted(
 		return upgradeResult, nil
 	}
 
-	return r.linkNode(ctx, patchHelper, byotMachine, machine)
+	result, err := r.linkNode(ctx, patchHelper, byotMachine, machine)
+	if err != nil {
+		return result, err
+	}
+
+	return result, nil
 }
 
 // resolveApplyAuth picks the talosconfig to authenticate the configuration
@@ -1316,6 +1396,18 @@ func (r *ByotMachineReconciler) linkNode(
 		return result, nil
 	}
 
+	// Sync labels before ensureNodeLinked: the Node exists once
+	// providerID is set, even if the Machine controller can't link
+	// its nodeRef (DNS-deadlock). Labels patch via IP-direct fallback.
+	labelResult, err := r.syncNodeLabels(ctx, byotMachine, machine)
+	if err != nil {
+		return labelResult, err
+	}
+
+	if labelResult.Requeue || labelResult.RequeueAfter > 0 {
+		return labelResult, nil
+	}
+
 	return r.ensureNodeLinked(ctx, patchHelper, byotMachine, machine)
 }
 
@@ -1326,6 +1418,7 @@ var errWorkloadNodePending = errors.New("workload node not registered")
 // errRequeueKubeconfigPending signals the cluster kubeconfig secret is
 // not yet created by CAPI; the controller requeues until it appears.
 var errRequeueKubeconfigPending = errors.New("kubeconfig secret not yet available")
+
 // updateNodeProviderID patches Node providerID, addresses, and removes
 // the uninitialized taint. On ErrClusterNotConnected it falls back to
 // an IP-direct uncached client from the <cluster>-kubeconfig secret.
@@ -1529,6 +1622,7 @@ func getWorkloadNode(
 
 	return node, nil
 }
+
 // applyNodeAddresses upserts ExternalIP and InternalIP into the Node's
 // address list, preserving kubelet-managed entries of other types.
 func applyNodeAddresses(
@@ -1615,6 +1709,167 @@ func upsertNodeAddress(
 	}
 
 	return append(addrs, corev1.NodeAddress{Type: addrType, Address: address})
+}
+
+// syncNodeLabels fetches the claimed ByoHost and propagates its labels to
+// the workload Node. Runs on every steady-state reconcile after linkNode
+// completes without a requeue, independent of the one-shot nodeUpdated
+// gate. Transient ByoHost Get errors requeue; NotFound skips silently (the
+// release flow handles host deletion). Skips when no workload client is
+// wired (unit tests / standalone), matching updateNodeProviderID's guard.
+func (r *ByotMachineReconciler) syncNodeLabels(
+	ctx context.Context,
+	byotMachine *infrav1.ByotMachine,
+	machine *clusterv1.Machine,
+) (ctrl.Result, error) {
+	if r.getWorkloadClient == nil {
+		return ctrl.Result{}, nil
+	}
+
+	if byotMachine.Status.ResolvedHost == "" {
+		return ctrl.Result{}, nil
+	}
+
+	host := &infrav1.ByotHost{}
+
+	err := r.Client.Get(ctx, ctrlclient.ObjectKey{
+		Name:      byotMachine.Status.ResolvedHost,
+		Namespace: byotMachine.Namespace,
+	}, host)
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{}, nil
+	}
+
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get ByoHost %s for label sync: %w",
+			byotMachine.Status.ResolvedHost, err)
+	}
+
+	clusterKey := ctrlclient.ObjectKey{
+		Namespace: byotMachine.Namespace,
+		Name:      machine.Spec.ClusterName,
+	}
+
+	workloadClient, err := r.resolveWorkloadClient(ctx, clusterKey, byotMachine)
+	if err != nil {
+		if errors.Is(err, errRequeueKubeconfigPending) {
+			return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
+		}
+
+		return ctrl.Result{}, err
+	}
+
+	err = r.patchWorkloadNodeLabels(ctx, workloadClient, byotMachine.Name, host.Labels)
+	if err != nil {
+		if errors.Is(err, errWorkloadNodePending) {
+			return ctrl.Result{RequeueAfter: r.requeueAfterNodeLink()}, nil
+		}
+
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// patchWorkloadNodeLabels filters ByoHost labels (strip reserved prefixes,
+// validate key/value) and strategic-merge patches the surviving set onto
+// the workload Node. Only missing or changed keys are patched — labels the
+// controller did not set are never removed. Empty filtered set or full
+// dedup skips the API call entirely.
+func (r *ByotMachineReconciler) patchWorkloadNodeLabels(
+	ctx context.Context,
+	workloadClient ctrlclient.Client,
+	nodeName string,
+	hostLabels map[string]string,
+) error {
+	filtered := filterHostLabels(hostLabels)
+	if len(filtered) == 0 {
+		return nil
+	}
+
+	node, err := getWorkloadNode(ctx, workloadClient, nodeName)
+	if err != nil {
+		return err
+	}
+
+	toApply := make(map[string]string, len(filtered))
+	for key, value := range filtered {
+		if existing, ok := node.Labels[key]; ok && existing == value {
+			continue
+		}
+
+		toApply[key] = value
+	}
+
+	if len(toApply) == 0 {
+		return nil
+	}
+
+	patchHelper, err := patch.NewHelper(node, workloadClient)
+	if err != nil {
+		return fmt.Errorf("failed to create patch helper for Node labels %s: %w", nodeName, err)
+	}
+
+	if node.Labels == nil {
+		node.Labels = map[string]string{}
+	}
+
+	maps.Copy(node.Labels, toApply)
+
+	err = patchHelper.Patch(ctx, node)
+	if err != nil {
+		return fmt.Errorf("failed to patch workload Node %s labels: %w", nodeName, err)
+	}
+
+	log.FromContext(ctx).Info("Patched workload Node labels from ByoHost",
+		"node", nodeName, "labelCount", len(toApply))
+
+	return nil
+}
+
+// filterHostLabels returns the subset of hostLabels eligible for Node
+// propagation: reserved-prefix labels are stripped, and each surviving
+// key/value is validated against Kubernetes label rules. Invalid entries
+// are skipped silently.
+func filterHostLabels(hostLabels map[string]string) map[string]string {
+	if len(hostLabels) == 0 {
+		return nil
+	}
+
+	result := make(map[string]string, len(hostLabels))
+
+	for key, value := range hostLabels {
+		if isReservedLabel(key) {
+			continue
+		}
+
+		if !isValidLabel(key, value) {
+			continue
+		}
+
+		result[key] = value
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+
+	return result
+}
+
+
+// isValidLabel reports whether the key and value satisfy Kubernetes label
+// syntax rules (key prefix <= 253, name <= 63, value <= 63, valid char sets).
+func isValidLabel(key, value string) bool {
+	if len(validation.IsQualifiedName(key)) > 0 {
+		return false
+	}
+
+	if len(validation.IsValidLabelValue(value)) > 0 {
+		return false
+	}
+
+	return true
 }
 
 // ensureNodeLinked retriggers the owning CAPI Machine's node-link
