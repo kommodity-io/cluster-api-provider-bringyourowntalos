@@ -1,5 +1,6 @@
 CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.3
 GOLANGCI_LINT ?= go tool golangci-lint
+SETUP_ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.1
 
 .PHONY: generate
 generate: ## Generate deepcopy methods and CRDs.
@@ -15,8 +16,16 @@ build: ## Build all packages.
 	go build ./...
 
 .PHONY: test
-test: ## Run unit tests.
+test: ## Run unit tests (skips envtest integration tests).
 	go test ./...
+
+.PHONY: envtest-assets
+envtest-assets: ## Download envtest binaries (etcd + kube-apiserver).
+	$(SETUP_ENVTEST) use
+
+.PHONY: test-integration
+test-integration: envtest-assets ## Run integration tests against a real envtest API server.
+	KUBEBUILDER_ASSETS=$$($(SETUP_ENVTEST) use -p path) go test ./... -run "TestIntegration"
 
 .PHONY: release-assets
 release-assets: generate ## Build the infrastructure-components.yaml release asset consumed by Kommodity.
