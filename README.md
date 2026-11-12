@@ -199,4 +199,10 @@ make lint
 make test
 ```
 
-Requires Cluster API v1.10.x (`v1beta1` contract) and Talos machinery v1.13.x.
+Requires Cluster API v1.10.x (`v1beta1` contract) and Talos machinery v1.14.x.
+
+BYOT v0.12 requires Talos v1.14 on adopted hosts. Talos v1.14 moved
+kube-apiserver settings out of the deprecated v1alpha1 `cluster.apiServer`
+block into the `KubeAPIServerConfig` document, and Talos now hard-rejects
+any config mixing both; hosts running Talos v1.13 or older are not supported
+by this release.

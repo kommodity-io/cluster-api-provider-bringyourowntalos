@@ -1289,7 +1289,7 @@ func (r *ByotMachineReconciler) applyAndMarkAdopted(
 		return ctrl.Result{}, r.recordApplyFailure(ctx, patchHelper, byotMachine, err)
 	}
 	// Inject host IPs into machine.certSANs (apid cert) and
-	// cluster.apiServer.certSANs (kube-apiserver serving cert).
+	// KubeAPIServerConfig.certExtraSANs (kube-apiserver serving cert).
 	endpoints := machineEndpoints(byotMachine)
 
 	machineConfig, err = injectHostCertSANs(machineConfig, endpoints)
@@ -1371,8 +1371,8 @@ func resolveInstallDisk(
 }
 
 // injectHostCertSANs injects all host IPs (internal + external) into both
-// machine.certSANs (the Talos apid certificate) and cluster.apiServer
-// .certSANs (the kube-apiserver serving certificate). The apid cert must
+// machine.certSANs (the Talos apid certificate) and KubeAPIServerConfig
+// .certExtraSANs (the kube-apiserver serving certificate). The apid cert must
 // cover every endpoint the gRPC client round-robins to, not just the public
 // IP, or the TLS handshake fails on NAT'd hosts reached via the internal IP.
 // The API server serving cert covers every address clients may use.

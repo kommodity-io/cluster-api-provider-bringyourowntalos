@@ -681,10 +681,11 @@ func setCertSANs(docs []map[string]any, ipAddress string) {
 }
 
 // injectClusterAPIServerCertSANs idempotently adds each IP to
-// cluster.apiServer.certSANs in the v1alpha1 machine-config document,
-// preserving every other document in the stream. Existing operator-provided
-// SANs are preserved. Uses the same multi-doc decode/encode helpers as
-// injectInstallDisk to avoid dropping the CABPT HostnameConfig doc.
+// certExtraSANs in the KubeAPIServerConfig document, preserving every
+// other document in the stream. Uses the same multi-doc decode/encode
+// helpers as injectInstallDisk to avoid dropping the CABPT HostnameConfig doc.
+// Talos v1.14 rejects the deprecated v1alpha1 cluster.apiServer block when a
+// KubeAPIServerConfig document is present, so it is never created here.
 func injectClusterAPIServerCertSANs(machineConfig []byte, ipAddresses Endpoints) ([]byte, error) {
 	docs, err := decodeMachineConfigDocs(machineConfig)
 	if err != nil {
@@ -692,35 +693,27 @@ func injectClusterAPIServerCertSANs(machineConfig []byte, ipAddresses Endpoints)
 	}
 
 	for _, ip := range ipAddresses {
-		setClusterAPIServerCertSANs(docs, ip)
+		setKubeAPIServerCertExtraSANs(docs, ip)
 	}
 
 	return encodeMachineConfigDocs(docs)
 }
 
-// setClusterAPIServerCertSANs appends ip to cluster.apiServer.certSANs in
-// each v1alpha1 doc when not already present. Existing operator-provided
-// SANs are preserved.
-func setClusterAPIServerCertSANs(docs []map[string]any, ipAddress string) {
+// setKubeAPIServerCertExtraSANs appends ip to certExtraSANs in each
+// KubeAPIServerConfig document when not already present. Worker-style
+// configs without such a document are left untouched.
+func setKubeAPIServerCertExtraSANs(docs []map[string]any, ipAddress string) {
 	for _, doc := range docs {
-		cluster, _ := doc["cluster"].(map[string]any)
-		if cluster == nil {
+		if doc["kind"] != "KubeAPIServerConfig" {
 			continue
 		}
 
-		apiServer, _ := cluster["apiServer"].(map[string]any)
-		if apiServer == nil {
-			apiServer = map[string]any{}
-		}
-
-		sans, _ := apiServer["certSANs"].([]any)
+		sans, _ := doc["certExtraSANs"].([]any)
 		if containsStringAny(sans, ipAddress) {
 			continue
 		}
 
-		apiServer["certSANs"] = append(sans, ipAddress)
-		cluster["apiServer"] = apiServer
-		doc["cluster"] = cluster
+		doc["certExtraSANs"] = append(sans, ipAddress)
 	}
 }
 
