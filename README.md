@@ -34,6 +34,12 @@ Inspired by
 [BYOH](https://github.com/vmware-tanzu/cluster-api-provider-bringyourownhost)
 (unmaintained), without a host agent: Talos already exposes everything needed.
 
+> **Version requirement:** BYOT v0.12 requires Talos v1.14. It drops support
+> for Talos v1.13 and older: the provider now injects kube-apiserver SANs
+> exclusively into the `KubeAPIServerConfig` multi-doc document, which only
+> Talos v1.14+ understands, and never creates the deprecated v1alpha1
+> `cluster.apiServer` block that Talos v1.14 rejects alongside it.
+
 Design decisions: see [docs/PRD.md](docs/PRD.md) and
 [docs/PRD-host-registry.md](docs/PRD-host-registry.md).
 
@@ -199,4 +205,10 @@ make lint
 make test
 ```
 
-Requires Cluster API v1.10.x (`v1beta1` contract) and Talos machinery v1.13.x.
+Requires Cluster API v1.10.x (`v1beta1` contract) and Talos machinery v1.14.x.
+
+BYOT v0.12 requires Talos v1.14 on adopted hosts. Talos v1.14 moved
+kube-apiserver settings out of the deprecated v1alpha1 `cluster.apiServer`
+block into the `KubeAPIServerConfig` document, and Talos now hard-rejects
+any config mixing both; hosts running Talos v1.13 or older are not supported
+by this release.
